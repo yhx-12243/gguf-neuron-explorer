@@ -40,7 +40,7 @@ Find, rank and steer individual MLP neurons of GGUF models on llama.cpp, then sh
   - wiring between neurons and UMAP layouts;
   - an embedding scatter of rollouts;
   - background jobs that share the GPU;
-  - a JP / EN switch.
+  - a JP / EN / ZH switch.
 - **Several GPUs, large models.** `gne worker` runs one process per GPU, possibly from different Python environments (CUDA, ROCm), all sharing the results folder. `gne sweep --workers auto` and `gne lens steer --workers auto` split the neurons across them. Jobs estimated at over 30 minutes stop unless you pass `--yes`. `--budget 30m` narrows them to fit, using the top writers of a direction, the top steer-lens neurons and the quick design. `gne info` shows the GPU/CPU layer split and the reverse-lookup-first workflow for large models.
 - **Agent access.** An MCP server lets Claude Code or another agent query neurons, steer, run jobs and highlight or annotate neurons in the open UI.
 
@@ -300,7 +300,7 @@ The documentation is in Japanese:
 - [docs/measurements.md](docs/measurements.md): timings and throughput.
 - [docs/agent_playbook.md](docs/agent_playbook.md): how to read the results.
 - [docs/setup.md](docs/setup.md): CUDA / ROCm under WSL, one environment per GPU, and workers.
-- [docs/persona_workflow.md](docs/persona_workflow.md): building a persona from neurons, step by step (with the scripts in `examples/persona_neurons/` and the yandere case as the worked example).
+- [docs/persona_workflow.md](docs/persona_workflow.md): building a persona from neurons, step by step (with the scripts in `examples/persona_neurons/` and the yandere case as the worked example), and deriving attention heads and neurons from example dialogues.
 
 ## License
 

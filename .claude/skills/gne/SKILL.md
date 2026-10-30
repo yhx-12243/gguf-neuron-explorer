@@ -27,7 +27,7 @@ dose は既定で rel(その層の残差の大きさに対する比)。0.5 で�
 
 1. **docs を読む。** 実装した本人でも、文脈に入っていなければ道具を忘れる。少なくとも次は読む。
    - `docs/agent_playbook.md`: 何を見てどう判断するか(対照・安い効果・dose・レシピ・方向)。
-   - `docs/persona_workflow.md`: 性格をニューロンで作る手順と、その後わかったこと。
+   - `docs/persona_workflow.md`: 性格をニューロンで作る手順と、その後わかったこと。§5 は、お手本の会話から attention ヘッドとニューロンを導く手順。
    - 数値の根拠は `docs/verification.md`(性格は §12、F91〜F104)と `docs/measurements.md`。
 2. **モデルを確かめる。** `gne info -m <gguf>`(arch・警告・チャットテンプレート)。新しい arch なら `gne verify` と `references/new_model.md`。
 3. **すでにあるものを見る。** MCP なら `model_overview` → `layer_summary(L)`。CLI なら `~/.gne/` の下(`lens/`・`runs/`・`directions/`・`recipes/`・`evals/`)。同じ model_id の結果は使い回される。
@@ -127,6 +127,7 @@ dose は既定で rel(その層の残差の大きさに対する比)。0.5 で�
 | `tsundere_qwen38_27b` | Qwen3.8-27B | 語のニューロン 24 個 | assistant | 2.56、能力そのまま(F103) |
 | `yandere_lfm3_neurons` | LFM3-1.7B | 方向の分解 315 個 | all | 英語 2.1〜2.3・日本語 1.8〜2.0(F97) |
 | `yandere_lfm3_en6` | LFM3-1.7B | 6 個(英語だけ) | assistant | 英語 2.1〜2.3(F99) |
+| `yandere_omni_heads` | LFM3-Omni-2B | attention ヘッド 13 個(2 つの向き)+ ニューロン 2 個、音声で話しかける | gen | 人が会話を読んで選んだ(persona_workflow §5) |
 | `evil`・`alien`(・`alien_gain`) | Qwen3.5-4B | 方向・ニューロン 1 個(gain) | — | §11・§12 |
 
 点は「性格と自然さの小さいほう」の平均(1〜5)。押さないときは 1.00。

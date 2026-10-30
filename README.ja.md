@@ -44,7 +44,7 @@ llama-cpp-python 経由で llama.cpp の上で動くので、手元の量子化�
   - ニューロン同士の配線と UMAP の配置
   - rollout の埋め込みの散布図
   - GPU を譲り合う裏のジョブ
-  - JP / EN の切り替え
+  - JP / EN / ZH の切り替え
 - **複数の GPU・大きなモデル:** `gne worker` を GPU ごとに 1 プロセスずつ立てます。Python の環境は別々（CUDA・ROCm）でもよく、結果の置き場所を共有します。`gne sweep --workers auto`・`gne lens steer --workers auto` は、ニューロンを分けてワーカーに投げます。見積もりが 30 分を超える処理は、`--yes` を付けないと止まります。`--budget 30m` を付けると予算に収まるように絞ります（方向に書き込むニューロンの上位、steer lens の上位、quick 設計を使います）。`gne info` には GPU と CPU に載った層の数と、大きなモデルで逆引きから始める手順が出ます。
 - **エージェントから使う:** MCP サーバーを付けています。Claude Code などのエージェントからニューロンを調べる・押す・ジョブを回すことができます。開いている UI にニューロンを強調したり注釈を貼ったりもできます。
 
@@ -325,7 +325,7 @@ python -m pytest -q
 - [docs/measurements.md](docs/measurements.md): 速度の実測
 - [docs/agent_playbook.md](docs/agent_playbook.md): 結果の読み方
 - [docs/setup.md](docs/setup.md): WSL での CUDA・ROCm、GPU ごとの環境とワーカー
-- [docs/persona_workflow.md](docs/persona_workflow.md): 性格をニューロンで作る手順（`examples/persona_neurons/` のスクリプトと、ヤンデレでたどった道）
+- [docs/persona_workflow.md](docs/persona_workflow.md): 性格をニューロンで作る手順（`examples/persona_neurons/` のスクリプトと、ヤンデレでたどった道）と、お手本の会話から attention ヘッドとニューロンを導く手順
 
 ## ライセンス
 

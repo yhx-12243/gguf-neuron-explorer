@@ -300,7 +300,7 @@ python -m pytest -q
 - [docs/measurements.md](docs/measurements.md)：耗时与吞吐量。
 - [docs/agent_playbook.md](docs/agent_playbook.md)：如何解读结果。
 - [docs/setup.md](docs/setup.md)：WSL 下的 CUDA / ROCm、每个 GPU 一个环境，以及 worker。
-- [docs/persona_workflow.md](docs/persona_workflow.md)：从神经元逐步构建人格（使用 `examples/persona_neurons/` 中的脚本，并以 yandere 案例作为完整示例）。
+- [docs/persona_workflow.md](docs/persona_workflow.md)：从神经元逐步构建人格（使用 `examples/persona_neurons/` 中的脚本，并以病娇案例作为完整示例），并从示例对话中提取注意力头与神经元。
 
 ## 许可证
 
