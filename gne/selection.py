@@ -22,10 +22,10 @@ def parse_neurons(spec: str | None, n_ff: int, *, seed: int = 0) -> np.ndarray:
             continue
         m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", part)
         if not m:
-            raise GneError("BAD_ARGS", f"ニューロンの指定 {spec!r} を読めません", "all / random:384 / 1,5,9-12")
+            raise GneError("BAD_ARGS", f"无法解析神经元指定 {spec!r}", "all / random:384 / 1,5,9-12")
         a, b = int(m.group(1)), int(m.group(2) or m.group(1))
         out.extend(range(a, b + 1))
     arr = np.unique(np.array(out, dtype=np.int64))
     if arr.size and (arr[0] < 0 or arr[-1] >= n_ff):
-        raise GneError("BAD_ARGS", f"ニューロン番号は 0..{n_ff - 1} です")
+        raise GneError("BAD_ARGS", f"神经元编号范围为 0..{n_ff - 1}")
     return arr

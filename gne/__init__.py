@@ -1,3 +1,3 @@
-"""gguf-neuron-explorer: llama.cpp 上で GGUF モデルの MLP ニューロンを調べ、押し、control vector に書き出す。"""
+"""gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推动它们，并导出为 control vector。"""
 
 __version__ = "0.1.0"

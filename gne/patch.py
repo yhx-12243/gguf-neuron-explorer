@@ -92,8 +92,8 @@ def _write(gguf: str | Path, patches: list[Patch], *, forward: bool) -> None:
             f.seek(p.offset)
             cur = f.read(len(p.old))
             if cur not in (p.old, p.new):
-                raise GneError("PATCH_CONFLICT", f"{p.tensor} @ {p.offset}: いまのバイトがパッチの前とも後とも違います",
-                               "作業用コピーに別のパッチが掛かっています(gne patch revert で戻すか、作業用コピーを作り直す)")
+                raise GneError("PATCH_CONFLICT", f"{p.tensor} @ {p.offset}：当前字节既不同于补丁前，也不同于补丁后",
+                               "工作副本上已应用其他补丁（可用 gne patch revert 回退，或重新创建工作副本）")
         for p in patches:
             f.seek(p.offset)
             f.write(p.new if forward else p.old)
@@ -128,10 +128,10 @@ def row_bytes(t) -> int:
         return ne0 * _FLOAT[name]
     lay = LAYOUT.get(name)
     if lay is None:
-        raise GneError("UNSUPPORTED_QUANT", f"{t.name}: 量子化型 {name} はスケールパッチに対応していません",
-                       "対応は configs/quant_layout.yaml の型と F32 / F16 / BF16。再量子化の経路(gne bake)を使ってください")
+        raise GneError("UNSUPPORTED_QUANT", f"{t.name}：量化类型 {name} 不支持缩放补丁",
+                       "支持 configs/quant_layout.yaml 中的类型以及 F32 / F16 / BF16。请使用再量化路径（gne bake）")
     if ne0 % lay["values"]:
-        raise GneError("UNSUPPORTED_QUANT", f"{t.name}: 行の長さ {ne0} がブロック {lay['values']} の倍数ではありません")
+        raise GneError("UNSUPPORTED_QUANT", f"{t.name}：行长 {ne0} 不是块大小 {lay['values']} 的倍数")
     return ne0 // lay["values"] * lay["bytes"]
 
 
@@ -164,7 +164,7 @@ def _rows_patches(t, mm: np.memmap, rows: list[int], k: float) -> list[Patch]:
     out = []
     rows = sorted(set(int(r) for r in rows))
     if rows and not (0 <= rows[0] and rows[-1] < n_rows):
-        raise GneError("BAD_RECIPE", f"{t.name}: 行 {rows[0]}..{rows[-1]} は範囲外です(0..{n_rows - 1})")
+        raise GneError("BAD_RECIPE", f"{t.name}：行 {rows[0]}..{rows[-1]} 超出范围（0..{n_rows - 1}）")
     i = 0
     while i < len(rows):
         j = i
@@ -189,8 +189,8 @@ class Patcher:
     def _t(self, name: str):
         t = self.w.tensor(name)
         if not supported(t.tensor_type):
-            raise GneError("UNSUPPORTED_QUANT", f"{name}: 量子化型 {t.tensor_type.name} はスケールパッチに対応していません",
-                           "対応は configs/quant_layout.yaml の型と F32 / F16 / BF16")
+            raise GneError("UNSUPPORTED_QUANT", f"{name}：量化类型 {t.tensor_type.name} 不支持缩放补丁",
+                           "支持 configs/quant_layout.yaml 中的类型以及 F32 / F16 / BF16")
         return t
 
     def scale_row(self, name: str, row: int | tuple[int, int], k: float) -> PatchSet:
@@ -207,7 +207,7 @@ class Patcher:
         t = self._t(name)
         dims = tuple(reversed(t.shape))
         if len(dims) != 3 or not 0 <= e < dims[0]:
-            raise GneError("BAD_RECIPE", f"{name}: 専門家 {e} のスラブがありません")
+            raise GneError("BAD_RECIPE", f"{name}：不存在专家 {e} 的 slab")
         ps = PatchSet("", self.w.meta.model_id, [{"op": "scale_slab", "tensor": name, "expert": e, "k": k}])
         ps.patches = _rows_patches(t, self.mm, list(range(e * dims[1], (e + 1) * dims[1])), k)
         return ps
@@ -216,9 +216,9 @@ class Patcher:
         """F32 のベクトル(ルーターのバイアス)の要素に delta を足す。"""
         t = self.w.tensor(name)
         if t.tensor_type != GGMLQuantizationType.F32:
-            raise GneError("UNSUPPORTED_QUANT", f"{name}: F32 だけに要素を足せます({t.tensor_type.name})")
+            raise GneError("UNSUPPORTED_QUANT", f"{name}：只能向 F32 元素相加（当前为 {t.tensor_type.name}）")
         if not 0 <= index < t.n_elements:
-            raise GneError("BAD_RECIPE", f"{name}: 要素 {index} は範囲外です")
+            raise GneError("BAD_RECIPE", f"{name}：元素 {index} 超出范围")
         off = t.data_offset + 4 * index
         old = bytes(self.mm[off:off + 4])
         new = (np.frombuffer(old, "<f4") + np.float32(delta)).astype("<f4").tobytes()

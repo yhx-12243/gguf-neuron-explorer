@@ -18,9 +18,9 @@ def fire_ids(session, text: str) -> list[int]:
     e = session.engine
     ids = e.tokenize(text, add_special=True, parse_special=False)
     if len(ids) < 2:
-        raise GneError("BAD_ARGS", "文章が短すぎます(2 トークン以上)")
+        raise GneError("BAD_ARGS", "文本太短（至少需要 2 个 token）")
     if len(ids) > MAX_TOKENS:
-        session.warn(f"{len(ids)} トークンのうち先頭 {MAX_TOKENS} だけを使いました")
+        session.warn(f"{len(ids)} 个 token 中只使用了前 {MAX_TOKENS} 个")
         ids = ids[:MAX_TOKENS]
     return ids
 
@@ -85,9 +85,9 @@ def fire_scores(session, ids: list[int], layers: list[int] | None = None, routes
         raw.append(a[1:])
         kept.append(L)
     if not kept:
-        raise GneError("ARCH_UNSUPPORTED", "ffn_down の入力テンソルを捕捉できませんでした")
+        raise GneError("ARCH_UNSUPPORTED", "无法捕获 ffn_down 的输入张量")
     if any(v == "text_p99" for v in norm_src.values()):
-        session.warn("活性統計が無い層は、この文章の中の層内 p99 で割りました(gne stats act で統計を作ると比べやすくなります)")
+        session.warn("没有激活统计的层使用本文中的层内 p99 归一化（用 gne stats act 生成统计后更便于比较）")
     return kept, scores, raw, norm_src
 
 

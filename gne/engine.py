@@ -192,7 +192,7 @@ class Engine:
         mp.n_gpu_layers = n_gpu_layers
         self.model = C.llama_model_load_from_file(str(self.path).encode(), mp)
         if not self.model:
-            raise RuntimeError(f"モデルを読み込めません: {self.path}")
+            raise RuntimeError(f"无法加载模型：{self.path}")
         self.vocab = C.llama_model_get_vocab(self.model)
         self._loras: dict[str, object] = {}       # LoRA アダプタ(§6.16 gain)。モデルと一緒に解放される
         self.n_layer = C.llama_model_n_layer(self.model)
@@ -261,7 +261,7 @@ class Engine:
             capture.install(p)
         ptr = C.llama_init_from_model(self.model, p)
         if not ptr:
-            raise RuntimeError("llama_context を作れません(VRAM 不足の可能性)")
+            raise RuntimeError("无法创建 llama_context（可能是 VRAM 不足）")
         return _Ctx(ptr, n_batch=n_batch, n_ubatch=n_ubatch, n_seq_max=n_seq_max, capture=capture)
 
     def steer_ctx(self) -> _Ctx:
@@ -308,7 +308,7 @@ class Engine:
                     add_generation_prompt: bool = True, template: str | None = None) -> str:
         tpl = template or self.chat_template
         if not tpl:
-            raise ValueError("GGUF に tokenizer.chat_template がありません(configs/templates で上書きしてください)")
+            raise ValueError("GGUF 中没有 tokenizer.chat_template（请在 configs/templates 中覆盖）")
         if any(isinstance(m.get("content"), list) for m in messages):     # 部品の content(音声は MARKER の文字に)
             from .media import normalize
             messages = normalize(messages)[0]
@@ -324,7 +324,7 @@ class Engine:
         arr = (C.llama_token * max(n, 1))()
         m = C.llama_tokenize(self.vocab, b, len(b), arr, n, add_special, parse_special)
         if m < 0:
-            raise RuntimeError("llama_tokenize に失敗しました")
+            raise RuntimeError("llama_tokenize 失败")
         return list(arr[:m])
 
     def tokenize_prompt(self, text: str) -> list[int]:
@@ -348,8 +348,8 @@ class Engine:
             from .steer import GneError
             path = self.mmproj or find_mmproj(self.path)
             if path is None or not path.exists():
-                raise GneError("NO_MMPROJ", "音声を入れるには mmproj が要ります",
-                               "--mmproj(環境変数 GNE_MMPROJ)で mmproj-*.gguf を渡すか、モデルと同じフォルダに置いてください")
+                raise GneError("NO_MMPROJ", "音频输入需要 mmproj",
+                               "请通过 --mmproj（环境变量 GNE_MMPROJ）传入 mmproj-*.gguf，或将其放在模型同目录下")
             self._media = Media(self, path)
         return self._media
 
@@ -446,7 +446,7 @@ class Engine:
             ptr = buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
             rc = C.llama_set_adapter_cvec(ctx.ptr, ptr, buf.size, self.n_embd, il_start, il_end)
         if rc != 0:
-            raise RuntimeError(f"llama_set_adapter_cvec が失敗しました (rc={rc})")
+            raise RuntimeError(f"llama_set_adapter_cvec 失败（rc={rc}）")
 
     def lora(self, path: str | Path):
         """LoRA アダプタ GGUF を読み込む(同じファイルは 1 回だけ)。"""
@@ -455,7 +455,7 @@ class Engine:
         if a is None:
             a = C.llama_adapter_lora_init(self.model, key.encode())
             if not a:
-                raise RuntimeError(f"LoRA {path} を読み込めません(arch やテンソルの形が合っているか)")
+                raise RuntimeError(f"无法加载 LoRA {path}（请检查 arch 和张量形状是否匹配）")
             self._loras[key] = a
         return a
 
@@ -469,7 +469,7 @@ class Engine:
             sc = (ctypes.c_float * len(ptrs))(*[float(x) for _, x in loras])
             rc = C.llama_set_adapters_lora(ctx.ptr, arr, len(ptrs), sc)
         if rc != 0:
-            raise RuntimeError(f"llama_set_adapters_lora が失敗しました (rc={rc})")
+            raise RuntimeError(f"llama_set_adapters_lora 失败（rc={rc}）")
 
     def clear_memory(self, ctx: _Ctx) -> None:
         C.llama_memory_clear(C.llama_get_memory(ctx.ptr), True)
@@ -509,7 +509,7 @@ class Engine:
                 flat[k * m.n_embd:(k + 1) * m.n_embd] = row
                 non_causal |= nc
             if non_causal and len(items) > ctx.n_ubatch:
-                raise RuntimeError(f"非因果の音声の区間({len(items)})が n_ubatch({ctx.n_ubatch})に収まりません")
+                raise RuntimeError(f"非因果音频区间（{len(items)}）无法放入 n_ubatch（{ctx.n_ubatch}）")
         else:
             b = ctx.batch
         for k, (tok, pos, sid, lg) in enumerate(items):
@@ -530,14 +530,14 @@ class Engine:
         if ctx.capture is not None:
             ctx.capture.end_step()
         if rc != 0:
-            raise RuntimeError(f"llama_decode が失敗しました (rc={rc})")
+            raise RuntimeError(f"llama_decode 失败（rc={rc}）")
 
     def _logits(self, ctx: _Ctx, i: int) -> np.ndarray:
         if ctx.split_logits is not None:
             return ctx.split_logits[i].copy()
         ptr = C.llama_get_logits_ith(ctx.ptr, i)
         if not ptr:
-            raise RuntimeError(f"logits[{i}] がありません")
+            raise RuntimeError(f"缺少 logits[{i}]")
         return np.ctypeslib.as_array(ptr, shape=(self.n_vocab,)).copy()
 
     def prefill(self, ctx: _Ctx, seqs: list[list[int]], *, logits_all: bool = False, pos0: int = 0) -> PrefillResult:
@@ -548,7 +548,7 @@ class Engine:
         pos0: 先頭トークンの位置。1 本のプロンプトを区切って評価するとき(§6.15 の位置別ステアリング)に、
         続きの区間を前の区間の後ろに置くために使う(その間は clear しない)。"""
         if not seqs or any(len(s) == 0 for s in seqs):
-            raise ValueError("空のシーケンスがあります")
+            raise ValueError("存在空序列")
         last = np.empty((len(seqs), self.n_vocab), dtype=np.float32)
         all_logits = [np.empty((len(s), self.n_vocab), dtype=np.float32) for s in seqs] if logits_all else None
         n_tok = sum(len(s) for s in seqs)
@@ -570,7 +570,7 @@ class Engine:
             return PrefillResult(last, all_logits, n_tok)
 
         if len(seqs) > ctx.n_seq_max:
-            raise ValueError(f"シーケンス数 {len(seqs)} が n_seq_max={ctx.n_seq_max} を超えています")
+            raise ValueError(f"序列数 {len(seqs)} 超过 n_seq_max={ctx.n_seq_max}")
         flat = [(t, pos0 + p, si, logits_all or p == len(s) - 1) for si, s in enumerate(seqs) for p, t in enumerate(s)]
         for c0 in range(0, len(flat), ctx.n_batch):
             chunk = flat[c0:c0 + ctx.n_batch]
@@ -589,7 +589,7 @@ class Engine:
         """teacher-forced: i = 0..len−2 について log p(ids[i+1] | ids[:i+1])。1 本のシーケンスを chunk ずつ評価する
         (全位置のロジットを一度に持たないように、行ごとに logsumexp を取って捨てる)。§6.14 の ppl 用。"""
         if ctx.capture is not None:
-            raise ValueError("token_logprobs は steer ctx で使ってください")
+            raise ValueError("token_logprobs 只能用于 steer ctx")
         self.clear_memory(ctx)
         n = len(ids) - 1
         out = np.empty(max(n, 0), dtype=np.float64)
@@ -615,9 +615,9 @@ class Engine:
         control vector はコンテキスト単位なので、schedule を使うときはシーケンスを 1 本にする。
         ban のトークンは選ばない(音声の入力があるとき、音声で返し始めるトークンを禁じる。logprob・top-k も禁じた後)。"""
         if ctx.capture is not None:
-            raise ValueError("generate_greedy は steer ctx で使ってください")
+            raise ValueError("generate_greedy 只能用于 steer ctx")
         if schedule is not None and len(seqs) != 1:
-            raise ValueError("schedule はシーケンス 1 本のときだけ使えます")
+            raise ValueError("schedule 只能用于单个序列")
         if prefilled is None:
             self.clear_memory(ctx)
             prefilled = self.prefill(ctx, seqs)

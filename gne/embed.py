@@ -36,8 +36,8 @@ class Embedder:
     def __init__(self, path: str | Path, *, n_gpu_layers: int = -1, n_ctx: int = 1024):
         import llama_cpp
         if not Path(path).exists():
-            raise GneError("FILE_NOT_FOUND", f"埋め込みモデル {path} がありません",
-                           "GNE_EMBED_MODEL で GGUF の埋め込みモデル(Qwen3-Embedding-0.6B など)を指定してください")
+            raise GneError("FILE_NOT_FOUND", f"找不到嵌入模型 {path}",
+                           "请用 GNE_EMBED_MODEL 指定 GGUF 嵌入模型（如 Qwen3-Embedding-0.6B）")
         self.path = Path(path)
         self.llm = llama_cpp.Llama(model_path=str(path), embedding=True, n_ctx=n_ctx, n_batch=n_ctx, n_ubatch=n_ctx,
                                    n_gpu_layers=n_gpu_layers, verbose=False)
@@ -60,14 +60,14 @@ def embed_run(session, run: str, *, model: str | Path | None = None, seed: int =
     from .sweep import read_rollouts
     path = session.run_path(run)
     if not path.exists():
-        raise GneError("FILE_NOT_FOUND", f"run {path} がありません")
+        raise GneError("FILE_NOT_FOUND", f"找不到 run {path}")
     recs = [r for r in read_rollouts(path) if r.get("kind") in KINDS and r.get("text") is not None]
     if len(recs) < 5:
-        raise GneError("BAD_ARGS", f"run {run} の rollout が少なすぎます({len(recs)} 本)")
+        raise GneError("BAD_ARGS", f"run {run} 的 rollout 太少（{len(recs)} 条）")
     model = Path(model) if model else default_embed_model()
     if model is None:
-        raise GneError("FILE_NOT_FOUND", "埋め込みモデルがありません",
-                       "models/ に Qwen3-Embedding-0.6B-Q8_0.gguf などを置くか、GNE_EMBED_MODEL で指定してください")
+        raise GneError("FILE_NOT_FOUND", "缺少嵌入模型",
+                       "请将 Qwen3-Embedding-0.6B-Q8_0.gguf 等放入 models/，或用 GNE_EMBED_MODEL 指定")
     t0 = time.perf_counter()
     em = Embedder(model)
     try:

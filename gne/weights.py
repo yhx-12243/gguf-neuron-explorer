@@ -35,8 +35,8 @@ def tensor_to_f32(tensor) -> np.ndarray:
         return np.asarray(tensor.data).astype(np.float32)
     if qtype not in gquants._type_traits:
         raise NotImplementedError(
-            f"{tensor.name}: 量子化型 {qtype.name} は gguf-py で dequantize できません。"
-            " F16 / Q8_0 版の GGUF を用意してください。"
+            f"{tensor.name}: 量化类型 {qtype.name} 无法用 gguf-py 反量化。"
+            " 请准备 F16 / Q8_0 版 GGUF。"
         )
     return gquants.dequantize(tensor.data, qtype).astype(np.float32, copy=False)
 
@@ -58,7 +58,7 @@ def _slab_to_f32(tensor, e: int) -> np.ndarray:
     if qtype == GGMLQuantizationType.F16:
         return part.astype(np.float32)
     if qtype not in gquants._type_traits:
-        raise NotImplementedError(f"{tensor.name}: 量子化型 {qtype.name} は gguf-py で dequantize できません")
+        raise NotImplementedError(f"{tensor.name}：量化类型 {qtype.name} 无法用 gguf-py 反量化")
     return gquants.dequantize(part, qtype).astype(np.float32, copy=False)
 
 
@@ -124,7 +124,7 @@ class Weights:
     def _read_meta(self) -> ModelMeta:
         arch = self.field("general.architecture")
         if arch is None:
-            raise ValueError(f"{self.path}: general.architecture がありません")
+            raise ValueError(f"{self.path}: 缺少 general.architecture")
         name = self.field("general.name") or self.path.stem
         n_layer = int(self.field(f"{arch}.block_count"))
         n_embd = int(self.field(f"{arch}.embedding_length"))
@@ -171,29 +171,29 @@ class Weights:
     def tensor(self, name: str):
         t = self._tensors.get(name)
         if t is None:
-            raise KeyError(f"{self.path.name}: テンソル {name} がありません")
+            raise KeyError(f"{self.path.name}: 缺少张量 {name}")
         return t
 
     def check_arch(self) -> list[str]:
         """警告メッセージ一覧(§12 のマトリクスに対応)。"""
         m, out = self.meta, []
         if m.has_post_ffn_norm:
-            out.append("post_ffw_norm があります(Gemma 系): 方向加算としては働くが「ニューロン n を押した」とは等価ではありません(§2.1)")
+            out.append("存在 post_ffw_norm（Gemma 系）：它可作为方向加法生效，但不等价于“推动神经元 n”（§2.1）")
         if m.n_expert or any(n.endswith("ffn_down_exps.weight") for n in self._tensors):
-            out.append(f"MoE(n_expert={m.n_expert}): 専門家のニューロンは L:Ee:Nn の形。add は「書き込み方向の押し」で、"
-                       "専門家が選ばれたときだけ効く本当のニューロン押しは gain(CHANGE-05 §C)")
+            out.append(f"MoE（n_expert={m.n_expert}）：专家神经元使用 L:Ee:Nn 格式。add 是“沿写入方向推动”，"
+                       "只有选中专家时才生效的真正神经元推动是 gain（CHANGE-05 §C）")
         if m.ffn_down_scale:
-            out.append("ffn_down.scale があります(BitNet 系): raw dose に係数 s を掛けます")
+            out.append("存在 ffn_down.scale（BitNet 系）：会将 raw dose 乘以系数 s")
         try:
             qtype = GGMLQuantizationType[m.ffn_down_qtype]
             if not dequantizable(qtype):
-                out.append(f"ffn_down の量子化型 {m.ffn_down_qtype} は dequantize できません: F16 / Q8_0 版を用意してください")
+                out.append(f"ffn_down 的量化类型 {m.ffn_down_qtype} 无法反量化：请准备 F16 / Q8_0 版")
         except KeyError:
-            out.append(f"ffn_down.weight が見つからないか型が不明です({m.ffn_down_qtype})")
+            out.append(f"找不到 ffn_down.weight 或类型未知（{m.ffn_down_qtype}）")
         missing = [L for L in range(m.n_layer) if f"blk.{L}.ffn_down.weight" not in self._tensors
                    and f"blk.{L}.ffn_down_exps.weight" not in self._tensors]          # MoE の層は ffn_down_exps
         if missing:
-            out.append(f"ffn_down.weight が無い層: {missing[:8]}{' …' if len(missing) > 8 else ''}")
+            out.append(f"缺少 ffn_down.weight 的层：{missing[:8]}{' …' if len(missing) > 8 else ''}")
         return out
 
     # --- ffn_down -------------------------------------------------------------------------------
@@ -207,7 +207,7 @@ class Weights:
         mat = tensor_to_f32(t)
         expected = (self.meta.n_embd, self.meta.n_ff_at(L))
         if mat.shape != expected:
-            raise ValueError(f"blk.{L}.ffn_down.weight の形状 {mat.shape} が期待値 {expected} と違います(§5.4)")
+            raise ValueError(f"blk.{L}.ffn_down.weight 的形状 {mat.shape} 与期望值 {expected} 不同（§5.4）")
         self._cache[L] = mat
         while len(self._cache) > self._cache_layers:
             self._cache.popitem(last=False)
@@ -217,11 +217,11 @@ class Weights:
         """W_up (n_ff, n_embd) float32(キャッシュしない)。ニューロン n の入力側の重みは [n, :](§6.16 gain)。"""
         name = f"blk.{L}.ffn_up.weight"
         if not self.has_tensor(name):
-            raise ValueError(f"{name} がありません(MoE や gate と up が 1 つのテンソルの arch は gain に未対応)")
+            raise ValueError(f"缺少 {name}（MoE 或将 gate 与 up 合为一个张量的 arch 暂不支持 gain）")
         mat = tensor_to_f32(self.tensor(name))
         expected = (self.meta.n_ff_at(L), self.meta.n_embd)
         if mat.shape != expected:
-            raise ValueError(f"{name} の形状 {mat.shape} が期待値 {expected} と違います")
+            raise ValueError(f"{name} 的形状 {mat.shape} 与期望值 {expected} 不同")
         return mat
 
     # MoE の層(CHANGE-05)では、下の読み口は層の中の通し番号 i = e·n_ff_exp + n で専門家 e のニューロン n を指す
@@ -285,10 +285,10 @@ class Weights:
         """層 L の LayerInfo(MoE でなければ GneError)。"""
         from .steer import GneError
         if not 0 <= L < self.meta.n_layer:
-            raise GneError("BAD_RECIPE", f"層 {L} は範囲外です")
+            raise GneError("BAD_RECIPE", f"第 {L} 层超出范围")
         li = self.arch.layers[L]
         if not li.ffn.startswith("moe"):
-            raise GneError("BAD_RECIPE", f"層 {L} は MoE ではありません({li.ffn})。ニューロンは L:N の形です")
+            raise GneError("BAD_RECIPE", f"第 {L} 层不是 MoE（{li.ffn}）。神经元请使用 L:N 形式")
         return li
 
     def _expert_slab(self, name: str, e: int) -> np.ndarray:
@@ -300,7 +300,7 @@ class Weights:
         t = self.tensor(name)
         if not 0 <= e < t.data.shape[0]:
             from .steer import GneError
-            raise GneError("BAD_RECIPE", f"専門家 {e} は範囲外です(0..{t.data.shape[0] - 1})")
+            raise GneError("BAD_RECIPE", f"专家 {e} 超出范围（0..{t.data.shape[0] - 1}）")
         slab = _slab_to_f32(t, e)
         cache[key] = slab
         while sum(x.nbytes for x in cache.values()) > EXPERT_CACHE_BYTES and len(cache) > 1:
@@ -351,14 +351,14 @@ class Weights:
         from .steer import GneError
         name = f"blk.{L}.ffn_down_shexp.weight"
         if not self.has_tensor(name):
-            raise GneError("BAD_RECIPE", f"層 {L} に shared expert はありません")
+            raise GneError("BAD_RECIPE", f"第 {L} 层没有 shared expert")
         return tensor_to_f32(self.tensor(name))
 
     def shexp_up(self, L: int) -> np.ndarray:
         from .steer import GneError
         name = f"blk.{L}.ffn_up_shexp.weight"
         if not self.has_tensor(name):
-            raise GneError("BAD_RECIPE", f"層 {L} に shared expert の ffn_up はありません")
+            raise GneError("BAD_RECIPE", f"第 {L} 层没有 shared expert 的 ffn_up")
         return tensor_to_f32(self.tensor(name))
 
     # --- attention ヘッド(CHANGE-04) -------------------------------------------------------------
@@ -376,12 +376,12 @@ class Weights:
         ヘッド h の出力を残差に書く(ggml ne = [n_head·head_dim, n_embd] の ne0 方向)。"""
         from .steer import GneError
         if not 0 <= L < self.meta.n_layer:
-            raise GneError("BAD_RECIPE", f"層 {L} は範囲外です")
+            raise GneError("BAD_RECIPE", f"第 {L} 层超出范围")
         li = self.arch.layers[L]
         if li.head_writer is None or not li.head_dim:
-            raise GneError("ARCH_UNSUPPORTED", f"層 {L}({li.mixer})にはヘッドの書き込み行列がありません")
+            raise GneError("ARCH_UNSUPPORTED", f"第 {L} 层（{li.mixer}）没有注意力头的写入矩阵")
         if not 0 <= h < li.n_head:
-            raise GneError("BAD_RECIPE", f"L{L} のヘッド {h} は範囲外です(0..{li.n_head - 1})")
+            raise GneError("BAD_RECIPE", f"L{L} 的注意力头 {h} 超出范围（0..{li.n_head - 1}）")
         return f"blk.{L}.{li.head_writer}.weight", h * li.head_dim, (h + 1) * li.head_dim
 
     def head_writer_matrix(self, L: int) -> np.ndarray:
@@ -390,7 +390,7 @@ class Weights:
         mat = tensor_to_f32(self.tensor(name))
         li = self.arch.layers[L]
         if mat.shape != (self.meta.n_embd, li.n_head * li.head_dim):
-            raise ValueError(f"{name} の形状 {mat.shape} が期待値 {(self.meta.n_embd, li.n_head * li.head_dim)} と違います")
+            raise ValueError(f"{name} 的形状 {mat.shape} 与期望值 {(self.meta.n_embd, li.n_head * li.head_dim)} 不同")
         return mat
 
     def head_write_matrix(self, L: int, h: int) -> np.ndarray:
@@ -421,7 +421,7 @@ class Weights:
             elif dequantizable(t.tensor_type):
                 rows = gquants.dequantize(np.asarray(part), t.tensor_type).astype(np.float32, copy=False)
             else:
-                raise NotImplementedError(f"{t.name}: 量子化型 {t.tensor_type.name} は dequantize できません")
+                raise NotImplementedError(f"{t.name}: 量化类型 {t.tensor_type.name} 无法反量化")
             yield i, rows
 
     def embed_rows(self, ids) -> np.ndarray:

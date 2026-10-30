@@ -31,7 +31,7 @@ def _umap(X, *, metric: str, seed: int):
     try:
         import umap
     except ImportError as e:
-        raise GneError("TOOL_MISSING", "umap-learn がありません", "pip install umap-learn(pyproject の ui extra)") from e
+        raise GneError("TOOL_MISSING", "缺少 umap-learn", "pip install umap-learn（pyproject 的 ui extra）") from e
     import warnings
     with warnings.catch_warnings():                              # random_state を付けると 1 スレッドになる、などの警告
         warnings.simplefilter("ignore")
@@ -49,14 +49,14 @@ def _pca(X: np.ndarray, k: int = 50) -> np.ndarray:
 
 def compute_layout(session, kind: str, L: int, *, seed: int = 0) -> tuple[np.ndarray, dict]:
     if kind not in KINDS:
-        raise GneError("BAD_ARGS", f"配置の種類は {' / '.join(KINDS)} です")
+        raise GneError("BAD_ARGS", f"布局类型为 {' / '.join(KINDS)}")
     w = session.weights
     n = w.meta.n_ff_at(L)
     side = int(np.ceil(np.sqrt(n)))
     if kind == "writes":
         X = _pca(w.unit_matrix(L).T.astype(np.float32))
         Y = _umap(X, metric="euclidean", seed=seed)
-        src = "W_down の列(単位ベクトル)、PCA 50"
+        src = "W_down 的列（单位向量），PCA 50"
     else:
         from scipy import sparse
 
@@ -64,13 +64,13 @@ def compute_layout(session, kind: str, L: int, *, seed: int = 0) -> tuple[np.nda
         data = UIData(session)
         sl, ll = data.steer_lens(L), data.logit_lens(L)
         if sl is not None and sl.done.all():
-            up, down, src = sl.up_ids, sl.down_ids, "steer lens の ± 上位語"
+            up, down, src = sl.up_ids, sl.down_ids, "steer lens 的 ± 高频词"
         elif ll is not None and ll.neurons.size == n:
             o = np.argsort(ll.neurons)
-            up, down, src = ll.up_ids[o], ll.down_ids[o], "logit lens の ± 上位語"
+            up, down, src = ll.up_ids[o], ll.down_ids[o], "logit lens 的 ± 高频词"
         else:
-            raise GneError("NOT_FOUND", f"層 {L} の lens が全ニューロンぶんありません",
-                           "gne lens logit --layer L(数十秒)か lens steer で作ってください")
+            raise GneError("NOT_FOUND", f"第 {L} 层的 lens 不包含全部神经元",
+                           "请用 gne lens logit --layer L（数十秒）或 lens steer 生成")
         V = len(session.vocab.pieces)
         rows, cols = [], []
         for i in range(n):                                       # + 極の語と − 極の語は別の特徴にする

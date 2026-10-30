@@ -37,7 +37,7 @@ def parse_budget(text: str | None) -> float | None:
         return float(t) * 60
     except (ValueError, IndexError) as e:
         from .steer import GneError
-        raise GneError("BAD_ARGS", f"--budget {text!r} は 30m・2h・90s のように書きます") from e
+        raise GneError("BAD_ARGS", f"--budget {text!r} 的写法应如 30m、2h、90s") from e
 
 
 class Speed:
@@ -233,10 +233,10 @@ def recommended_workflow(session) -> list[dict]:
     lens_per = 3.1 * sp.setprefill / 1000
     quick = _design_cost(sp, "quick", 128)
     steps = [
-        {"step": "gne reverse --contrast <対照集合> --top 200", "seconds": 6.0 * sp.setprefill / REF["setprefill_ms"] + 30},
-        {"step": f"gne lens steer --layer {L} --neurons <逆引きの上位 200>", "seconds": (200 + 64) * lens_per},
-        {"step": "gne sweep --design quick --neurons <lens の KL 上位 50>", "seconds": (50 + 16) * quick},
-        {"step": "gne eval --recipe <レシピ>", "seconds": estimate(session, "eval", {})["seconds"]},
+        {"step": "gne reverse --contrast <对照集> --top 200", "seconds": 6.0 * sp.setprefill / REF["setprefill_ms"] + 30},
+        {"step": f"gne lens steer --layer {L} --neurons <反向查找前 200>", "seconds": (200 + 64) * lens_per},
+        {"step": "gne sweep --design quick --neurons <lens KL 前 50>", "seconds": (50 + 16) * quick},
+        {"step": "gne eval --recipe <配方>", "seconds": estimate(session, "eval", {})["seconds"]},
     ]
     return steps
 
@@ -260,8 +260,8 @@ class NeedsConfirm(Exception):
     def __init__(self, est: dict):
         from .steer import GneError
         self.estimate = est
-        self.error = GneError("NEEDS_CONFIRM", f"{est['kind']} の見積もりは {fmt_seconds(est['seconds'])} です(30 分を超えるので止めました)",
-                              "--yes(MCP は params の yes: true)で走らせるか、--budget 30m で絞ってください")
+        self.error = GneError("NEEDS_CONFIRM", f"{est['kind']} 预计耗时 {fmt_seconds(est['seconds'])}（超过 30 分钟，已暂停）",
+                              "请用 --yes（MCP 为 params 的 yes: true）运行，或用 --budget 30m 限制预算")
         super().__init__(self.error.message)
 
 

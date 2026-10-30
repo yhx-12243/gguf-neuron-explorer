@@ -46,9 +46,9 @@ def load_design(name: str, *, prompt_set: str = "en", designs_path: str | Path |
     dd = yaml.safe_load(Path(designs_path or CONFIGS / "designs.yaml").read_text(encoding="utf-8"))["designs"]
     pp = yaml.safe_load(Path(prompts_path or CONFIGS / "prompts" / "default.yaml").read_text(encoding="utf-8"))
     if name not in dd:
-        raise GneError("BAD_ARGS", f"設計 {name!r} がありません({', '.join(dd)})")
+        raise GneError("BAD_ARGS", f"没有设计 {name!r}（{', '.join(dd)}）")
     if prompt_set not in pp:
-        raise GneError("BAD_ARGS", f"プロンプト集 {prompt_set!r} がありません({', '.join(pp)})")
+        raise GneError("BAD_ARGS", f"没有提示词集 {prompt_set!r}（{', '.join(pp)}）")
     d = dd[name]
     if "pairs" in d:
         pairs = [(str(k), float(v)) for k, v in d["pairs"]]
@@ -57,7 +57,7 @@ def load_design(name: str, *, prompt_set: str = "en", designs_path: str | Path |
     prompts = pp[prompt_set]
     missing = sorted({k for k, _ in pairs} - set(prompts))
     if missing:
-        raise GneError("BAD_ARGS", f"プロンプト集 {prompt_set!r} に {missing} がありません")
+        raise GneError("BAD_ARGS", f"提示词集 {prompt_set!r} 中缺少 {missing}")
     return Design(name, pairs, {k: prompts[k] for k, _ in pairs})
 
 
@@ -109,9 +109,9 @@ def run_sweep(engine: Engine, weights, stats, *, L: int, neurons: Sequence[int],
     """層 L の neurons(+ 対照)を design で押して生成し、JSONL に 1 rollout 1 行で追記する。
     signs[n] = -1 のニューロンは dose の符号を反転して押す(逆引きで cos が負の候補)。"""
     if L == 0:
-        raise GneError("BAD_ARGS", "層 0 は control vector で押せません")
+        raise GneError("BAD_ARGS", "第 0 层无法用 control vector 推动")
     if random_controls and dose_unit != "rel":
-        raise GneError("BAD_ARGS", "ランダム対照は dose_unit=rel でだけ使えます")
+        raise GneError("BAD_ARGS", "随机对照只能用于 dose_unit=rel")
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     rho = stats.rho(L)
@@ -123,7 +123,7 @@ def run_sweep(engine: Engine, weights, stats, *, L: int, neurons: Sequence[int],
         old = json.loads(meta_path.read_text())
         diff = [k for k in meta if k not in ("llama_cpp_version",) and json.dumps(old.get(k)) != json.dumps(meta[k])]
         if diff:
-            raise GneError("RUN_MISMATCH", f"{out.name} は別の条件で作られています({diff})", "--run で別の名前にしてください")
+            raise GneError("RUN_MISMATCH", f"{out.name} 是在其他条件下生成的（{diff}）", "请用 --run 指定其他名称")
     elif not resume and out.exists():
         out.unlink()
     meta["prompt_ids"] = {k: engine.tokenize_prompt(engine.render_chat([{"role": "user", "content": t}]))

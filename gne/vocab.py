@@ -19,7 +19,7 @@ class Vocab:
         mp.n_gpu_layers = 0
         model = C.llama_model_load_from_file(str(path).encode(), mp)
         if not model:
-            raise RuntimeError(f"語彙を読み込めません: {path}")
+            raise RuntimeError(f"无法加载词表：{path}")
         try:
             v = C.llama_model_get_vocab(model)
             self.n = C.llama_vocab_n_tokens(v)

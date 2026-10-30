@@ -1,10 +1,10 @@
-"""MCP サーバ `gne mcp`(stdio)。設計書 §6.13 (d)。ツールは gne.api の写像。
+"""MCP 服务器 `gne mcp`（stdio）。设计文档 §6.13 (d)。工具是 gne.api 的映射。
 
     claude mcp add gne -- gne mcp --model <path>
 
-- 戻り値は --json と同じ形の dict(トークン列は文字列)。失敗は {"error": {"code", "message", "hint"}}。
-- GPU を使う呼び出しは worker スレッドで GpuArbiter を通して実行する。長い処理は job_start で投げ、
-  job_status で進捗を見る。ジョブはユニットの切れ目で対話的な呼び出しに GPU を譲る。
+- 返回值是与 --json 相同形式的 dict（token 序列为字符串）。失败时为 {"error": {"code", "message", "hint"}}。
+- 使用 GPU 的调用在 worker 线程中通过 GpuArbiter 执行。长时间处理用 job_start 提交，
+  用 job_status 查看进度。任务会在单元边界把 GPU 让给交互调用。
 """
 
 from __future__ import annotations
@@ -23,29 +23,29 @@ from .steer import GneError
 from .store import CONFIGS
 
 INSTRUCTIONS = """\
-gguf-neuron-explorer: llama.cpp 上の GGUF モデルの MLP ニューロンを調べ、押し(steer)、レシピを control vector に書き出す。
-進め方(詳しくは docs/agent_playbook.md):
-1. model_overview → layer_summary(L) で、どの層にどのデータ(ρ・lens・sweep・逆引き)があるかを見る。無いものは job_start で作る。
-2. 候補は neuron(L, n) の調書で判断する。null_pct(sweep が対照群の何割より上か)と kl_null_p95(steer lens の対照の 95% 点)を必ず見る。対照群を超えないものは報告しない。
-3. 「名乗り・作者名が変わる」はランダム方向でも起こる安い効果。複数のプロンプトで同じテーマが出るものだけを本物とみなす。
-4. rel dose: 0.5 で微かな挿入、0.8 で話題を上書き、1.0 以上は崩壊域。層 0〜2 には rel dose がそのまま通用しない。
-5. steer(units, compare=True) で無介入との差を確かめ、recipe_save → eval(recipe) で副作用(能力・ppl・言語の混入)を測ってから export_cvec。
-   抑える用途は add の − より gain の x0 を先に試す。位置(when)は gen を第一候補にして all と比べる。
-   ニューロンで断片しか見つからない性格・振る舞いは direction(contrast, select="auto", mode="add"|"ablate") で方向を作る。
-   消したい振る舞いは ablate(steer の ablate="NAME")と上位ニューロンの x0 を eval の比較(gne eval --compare-ablation)で比べてから選ぶ。
-   方向も対照を超えているかを見る(direction の null_pct、eval(random_controls=N) の novelty_null_pct)。null_pct が 0.95 未満の方向は報告しない。
-   見積もりが 30 分を超えるジョブは NEEDS_CONFIRM と見積もりを返して止まる。params に budget("30m")で絞るか yes: true。
-   大型モデル(GPU に載らない、全数の lens が 1 層 1 時間を超える)は逆引きから: reverse → 上位 N の lens_steer → quick sweep → eval。
-ユニットの書き方: "L:N:dose"(例 "14:8949:+1.0")、gain は "L:N:x2"(出力を k 倍、x0 で消去)、ランダム方向は "L:random:SEED:dose"、
-direction で作った方向は "L:dir:NAME:dose"、attention ヘッドの gain は "L:Hh:xk"(例 "21:H7:x0")。
-7. 反応性(トリガーの有無で差が出るか)はヘッドで作る。まず heads_contrast → 上位を x0 / x2 で eval(reactivity=対照集合) →
-   対照(同じ k のランダムなヘッド)を超えたものだけ残す。
-6. 人が UI(gne serve)を見ていれば、ui_open で調べているニューロンを開き、ui_highlight で候補を強調し、ui_note で判断の要点を
-   ニューロンに貼る(--ui-url で繋いだときだけ。繋いでいなければ UI_NOT_RUNNING が返るので気にせず続ける)。
-8. MoE(専門家を選ぶモデル)では、専門家のニューロンは "L:Ee:Nn:dose"(例 "12:E37:N511:+0.8")。MoE の add は「書き込み方向の押し」
-   (専門家が選ばれたかに関係なく全トークンに足す)で、ニューロンを押すなら gain("12:E37:N511:x2"、選ばれたときだけ効く)。
-   専門家全体は "L:Ee:x0"(消す)/ "L:Ee:x2"、ルーターのバイアスは "L:Ee:route:+2"(バイアスを持つ arch だけ)。
-   まず experts_contrast で専門家を絞り(usage_shift = ペルソナのときに呼ばれる、contrib_cos = 方向を書く)、その中のニューロンを gain で試す。
+gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推动（steer）它们，并将配方导出为 control vector。
+流程（详见 docs/agent_playbook.md）：
+1. 用 model_overview → layer_summary(L) 查看各层有哪些数据（ρ・lens・sweep・反向查找）。缺失的用 job_start 创建。
+2. 通过 neuron(L, n) 的档案判断候选。务必查看 null_pct（sweep 高于对照群的多少比例）与 kl_null_p95（steer lens 对照的 95% 分位）。不要报告未超过对照群的项。
+3. “自称・作者名改变”是随机方向也会产生的廉价效果。只有多个提示词出现同一主题时，才视为真实效果。
+4. rel dose：0.5 为细微插入，0.8 可覆盖话题，1.0 以上进入崩溃区。第 0～2 层的 rel dose 不能直接套用。
+5. 用 steer(units, compare=True) 确认与无干预的差异，再通过 recipe_save → eval(recipe) 测量副作用（能力・ppl・语言混入），最后 export_cvec。
+   抑制类用途先试 gain 的 x0，而不是 add 的 −。位置（when）优先尝试 gen，并与 all 比较。
+   若只能找到神经元层面的性格・行为片段，用 direction(contrast, select="auto", mode="add"|"ablate") 创建方向。
+   要消除的行为，先比较 ablate（steer 的 ablate="NAME"）与上位神经元 x0 的 eval（gne eval --compare-ablation）再选择。
+   方向也要检查是否超过对照（direction 的 null_pct、eval(random_controls=N) 的 novelty_null_pct）。不要报告 null_pct 低于 0.95 的方向。
+   预计超过 30 分钟的任务会返回 NEEDS_CONFIRM 与估算后停止。可在 params 中通过 budget("30m") 限制，或设置 yes: true。
+   大型模型（无法装入 GPU、全量 lens 每层超过 1 小时）从反向查找开始：reverse → 前 N 个 lens_steer → quick sweep → eval。
+单元写法："L:N:dose"（例 "14:8949:+1.0"），gain 为 "L:N:x2"（输出放大 k 倍，x0 表示消除），随机方向为 "L:random:SEED:dose"，
+用 direction 创建的方向为 "L:dir:NAME:dose"，attention 注意力头的 gain 为 "L:Hh:xk"（例 "21:H7:x0"）。
+7. 反应性（有/无触发词是否产生差异）用注意力头创建。先用 heads_contrast → 对前几名用 x0 / x2 运行 eval(reactivity=对照集) →
+   只保留超过对照（相同 k 的随机注意力头）的项。
+6. 如果有人正在查看 UI（gne serve），用 ui_open 打开正在调查的神经元，用 ui_highlight 高亮候选，用 ui_note 将判断要点
+   贴到神经元上（仅在通过 --ui-url 连接时。未连接时会返回 UI_NOT_RUNNING，可忽略并继续）。
+8. MoE（选择专家的模型）中，专家神经元写作 "L:Ee:Nn:dose"（例："12:E37:N511:+0.8"）。MoE 的 add 是“沿写入方向推动”
+   （无论是否选中专家，都会加到所有 token 上）；若要推动神经元本身，请用 gain（"12:E37:N511:x2"，仅在选中专家时生效）。
+   专家整体用 "L:Ee:x0"（消除）/ "L:Ee:x2"，路由器偏置用 "L:Ee:route:+2"（仅限带偏置的 arch）。
+   先用 experts_contrast 筛选专家（usage_shift = 人格状态下被调用，contrib_cos = 写入方向），再用 gain 试其中的神经元。
 """
 
 
@@ -59,7 +59,7 @@ def _err(e: Exception) -> dict:
 
 
 def _strip_ids(d: Any) -> Any:
-    """token_ids を落とす(トークン列は文字列で返す、§6.13 (d))。"""
+    """移除 token_ids（token 序列以字符串返回，§6.13 (d)）。"""
     if isinstance(d, dict):
         return {k: _strip_ids(v) for k, v in d.items() if k != "token_ids"}
     if isinstance(d, list):
@@ -96,34 +96,34 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def model_overview() -> dict:
-        """ModelMeta、arch の警告、bake の可否、層ごとの coverage(ρ_L・活性統計・logit lens・steer lens・sweep・逆引き)。"""
+        """ModelMeta、arch 警告、bake 是否可用，以及各层的 coverage（ρ_L・激活值统计・logit lens・steer lens・sweep・反向查找）。"""
         return await call(session.model_overview, gpu=False)
 
     @srv.tool()
     async def layer_summary(layer: int, top: int = 20) -> dict:
-        """層の要約: ρ_L、steer lens の KL(中央値・p90・対照の 95% 点を超える割合)、sweep の対照群超えの割合と上位ユニット、logit lens の上位、逆引きの上位。"""
+        """层摘要：ρ_L、steer lens 的 KL（中位数・p90・超过对照 95% 分位的比例）、sweep 超过对照群的比例与上位单元、logit lens 前几名、反向查找前几名。"""
         return await call(session.layer_summary, layer, top=top, gpu=False)
 
     @srv.tool()
     async def neuron(layer: int, neuron: int, rollouts: int = 4, compute: bool = False) -> dict:
-        """ニューロン 1 個の調書(sweep の順位・語・rollout、steer lens、logit lens、逆引きの cos、活性統計、coverage)。
-        compute=True なら、無い logit lens と steer lens をこのニューロンだけ計算する(数秒)。"""
+        """单个神经元的档案（sweep 排名・词・rollout、steer lens、logit lens、反向查找 cos、激活值统计、coverage）。
+        compute=True 时，仅针对该神经元计算缺失的 logit lens 与 steer lens（数秒）。"""
         return await call(session.neuron, layer, neuron, rollouts=rollouts, compute=compute, gpu=compute)
 
     @srv.tool()
     async def search(q: str, mode: str = "lens", layer: int | None = None, limit: int = 50) -> dict:
-        """一致するニューロンの一覧。mode: lens(steer/logit lens の上位語)、words(sweep の語)、name(付けた名前)。"""
+        """匹配的神经元列表。mode：lens（steer/logit lens 上位词）、words（sweep 的词）、name（已命名）。"""
         return await call(session.search, q, mode=mode, layer=layer, limit=limit, gpu=False)
 
     @srv.tool()
     async def steer(units: list[str], prompt: str | None = None, messages: list[dict[str, str]] | None = None,
                     max_tokens: int = 128, compare: bool = True, dose_unit: str = "rel",
                     system: str | None = None, when: str = "all", ablate: str | None = None) -> dict:
-        """ユニット(例 ["14:8949:+1.0", "13:7956:-1.0"])で押して生成する(greedy)。compare=True なら無介入も並べる。
-        "14:8949:x2" のように x を付けると gain(そのニューロンの出力を k 倍、x0 で消去。§6.16)。
-        when は足す位置: all(全位置) / gen(生成中だけ、プロンプトの理解を壊さない) / assistant(assistant の発話だけ) /
-        after:<文字列>(出力にその文字列が出てから) / ramp:<a>-<b>(倍率を a から b へ)。
-        ablate は direction で作った方向の射影消去("NAME"、"NAME@層"、"NAME:0.5")。units は空でもよい。"""
+        """用单元（例 ["14:8949:+1.0", "13:7956:-1.0"]）推动并生成（greedy）。compare=True 时并列显示无干预结果。
+        在 "14:8949:x2" 中加 x 表示 gain（将该神经元输出放大 k 倍，x0 表示消除。§6.16）。
+        when 为添加位置：all（全部位置）/ gen（仅生成中，不破坏对提示词的理解）/ assistant（仅 assistant 发言）/
+        after:<字符串>（输出中出现该字符串后）/ ramp:<a>-<b>（倍率从 a 到 b）。
+        ablate 是用 direction 创建的方向执行投影消除（"NAME"、"NAME@层"、"NAME:0.5"）。units 可以为空。"""
         def fn():
             r = session.recipe(units=units or None, dose_unit=dose_unit, when=when, ablate=ablate)
             return session.steer(r, prompt=prompt, messages=messages, system=system, max_tokens=max_tokens,
@@ -132,20 +132,20 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def steer_lens(layer: int, neurons: str, dose: float = 0.8, random_controls: int = 16) -> dict:
-        """指定ニューロン(例 "2742" や "1,5,9-12")の steer lens(± で押したときの次トークンの変化、KL と対照)。少数向け。"""
+        """指定神经元（例 "2742" 或 "1,5,9-12"）的 steer lens（向 ± 推动时下一 token 的变化、KL 与对照）。适合少量神经元。"""
         return await call(session.lens_steer, layer, neurons=neurons, dose=dose, random_controls=random_controls)
 
     @srv.tool()
     async def fires(text: str, top: int = 50) -> dict:
-        """文章を流し、トークンごとに最も光る(活性 ÷ 基準 が大きい)ニューロンを top 件ずつ返す。"""
+        """流式输入文本，按 token 返回最亮的神经元（激活值 ÷ 基准 最大）前 top 个。"""
         return await call(session.fires, text, top=top)
 
     @srv.tool()
     async def reverse(contrast: str | None = None, system_a: str | None = None, system_b: str | None = None,
                       user_prompts: list[str] | None = None, name: str | None = None, top: int = 50,
                       method: str = "mean_diff", positions: str = "all") -> dict:
-        """逆引き: 対照プロンプト集(configs/contrast/ の名前かパス、または system_a / system_b / user_prompts を直接)から
-        方向を作り、全層・全ニューロンを順位づけする。検証(rollout)は job_start("reverse", {..., "verify": true})。"""
+        """反向查找：从对照提示词集（configs/contrast/ 的名称或路径，或直接提供 system_a / system_b / user_prompts）
+        创建方向，并对所有层・所有神经元排序。验证（rollout）用 job_start("reverse", {..., "verify": true})。"""
         def fn():
             path = _contrast_path(session, contrast, system_a, system_b, user_prompts, name)
             return session.reverse(contrast=path, top=top, method=method, positions=positions, name=name)
@@ -155,14 +155,14 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     async def direction(contrast: str, name: str | None = None, select: str | None = None, mode: str = "ablate",
                         layers: str | None = None, dose: float = 1.0, positions: str = "last",
                         random_controls: int = 16) -> dict:
-        """対照集合(configs/contrast/ の名前かパス。system_a / system_b / user_prompts、層選びには validate.match)から
-        全層の方向 r_L = mean_A − mean_B(生成プロンプトの最終トークン)を作って保存する(§6.17)。
-        select="auto" なら候補層ごとに効果を測ってジョブで層を選ぶ(job_status で結果)。mode="add" は層 L に平均差の dose 倍を
-        足して判定の一致率が上がるか、mode="ablate" は全層から r_L を消して下がるか(B 側の KL が 0.1 以下の層から)。
-        作った方向は steer の units に "L:dir:NAME:+0.5"(rel dose)で足せる。
-        positions="response" は A / B の system で返事を生成し、返事のトークンで測る(性格を足す用途ではこちらが効きやすい)。
-        random_controls 本の同じ大きさのランダムな向きを層ごとに対照として流し、効果が対照の p95 を超えた層だけを選ぶ
-        (行の ctrl_effect_p95・null_pct、選んだ層の selected_null_pct。0 で対照なし)。"""
+        """从对照集（configs/contrast/ 的名称或路径。system_a / system_b / user_prompts，选层使用 validate.match）
+        创建并保存所有层方向 r_L = mean_A − mean_B（生成提示词的最后一个 token）（§6.17）。
+        select="auto" 时按候选层测量效果并用任务选层（结果用 job_status 查看）。mode="add" 检查在第 L 层
+        加上平均差的 dose 倍后判定一致率是否提高；mode="ablate" 检查从所有层消除 r_L 后是否下降（从 B 侧 KL 不超过 0.1 的层中选）。
+        创建的方向可用 "L:dir:NAME:+0.5"（rel dose）加入 steer 的 units。
+        positions="response" 时用 A / B 的 system 生成回复，并用回复 token 测量（添加人格时通常更有效）。
+        按层运行 random_controls 个同量级随机方向作为对照，只选择效果超过对照 p95 的层
+        （行中的 ctrl_effect_p95・null_pct，所选层的 selected_null_pct。0 表示无对照）。"""
         try:
             params = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
                       "select": select, "mode": mode, "layers": layers, "dose": dose, "positions": positions,
@@ -179,17 +179,17 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def recipe_save(name: str, units: list[str], dose_unit: str = "rel", ablate: str | None = None,
                           when: str | None = None) -> dict:
-        """レシピを <root>/recipes/<name>.yaml に保存する。ablate は方向の射影消去("NAME"、"NAME@層"、"NAME:倍率")、
-        when は足す位置(all / gen / assistant / skip-replies / after:<文字列> / ramp:<a>-<b>)。"""
+        """将配方保存到 <root>/recipes/<name>.yaml。ablate 是方向投影消除（"NAME"、"NAME@层"、"NAME:倍率"），
+        when 是添加位置（all / gen / assistant / skip-replies / after:<字符串> / ramp:<a>-<b>）。"""
         return await call(session.recipe_save, name, units, dose_unit=dose_unit, ablate=ablate, when=when, gpu=False)
 
     @srv.tool()
     async def export_cvec(name: str, format: str = "cvec", verify: bool = False) -> dict:
-        """保存したレシピを control vector GGUF(または npz / json / safetensors)に書き出す。verify=True で llama-completion と比べる。"""
+        """将保存的配方导出为 control vector GGUF（或 npz / json / safetensors）。verify=True 时与 llama-completion 比较。"""
         def fn():
             from .cli import _EXT
             if format not in _EXT:
-                raise GneError("BAD_FORMAT", f"format は {', '.join(_EXT)} のどれかです")
+                raise GneError("BAD_FORMAT", f"format 只能为 {', '.join(_EXT)} 之一")
             r = session.recipe(path=session.recipe_path(name))
             out = session.store.export_dir() / f"{name}{_EXT[format]}"
             return session.export_cvec(r, out, fmt=format, verify=verify)
@@ -197,8 +197,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def gain_export(name: str, bake: bool = False) -> dict:
-        """保存したレシピの gain ユニット("14:8949:x2" のように出力を k 倍、x0 で消去)を書き出す(§6.16)。
-        既定は LoRA アダプタ GGUF(llama.cpp の --lora で使える、Qwen 系でも可)。bake=True なら W_up を書き換えた GGUF。"""
+        """导出保存配方中的 gain 单元（如 "14:8949:x2"，将输出放大 k 倍，x0 表示消除）（§6.16）。
+        默认输出 LoRA 适配器 GGUF（可用于 llama.cpp 的 --lora，Qwen 系也可）。bake=True 时输出改写 W_up 的 GGUF。"""
         def fn():
             r = session.recipe(path=session.recipe_path(name))
             out = session.store.export_dir() / (f"{name}-gain.gguf" if bake else f"{name}.lora.gguf")
@@ -209,14 +209,14 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     async def eval_recipe(recipe: str | None = None, units: list[str] | None = None, doses: list[float] | None = None,
                    when: str | None = None, random_controls: int = 0, reactivity: str | None = None,
                    head_controls: int = 0) -> dict:
-        """副作用チェック(§6.14)をジョブとして投げる。recipe は保存したレシピの名前、units は単発指定(どちらか)。
-        doses はレシピ全体の倍率(既定 [0, 0.25, 0.5, 0.75, 1]、0 が無介入)。倍率ごとに exact / format の正答率、ppl、
-        言語の混入(簡体字・ハングルなど)、性格の変化量(無介入にない語の割合など)を測り、配布可(能力 −5pt 以内、
-        ppl +10% 以内、混入が増えない)の倍率を返す。4B で数分。job_status で結果を見る(保存先 <root>/evals/)。
-        random_controls=N なら各倍率で同じ大きさのランダムな対照レシピ N 本も測る(時間は約 N 倍)。行の ctrl_novelty_p95・
-        novelty_null_pct(新語が対照の何割より多いか)、ctrl_capability_drop_p50・ctrl_ppl_worse_p50(大きさだけで起きる悪化)。
-        reactivity(対照集合の名前かパス。reactivity の対と validate.match が要る)を渡すと、行の reactivity に
-        トリガーあり/なしの一致率とその差を入れる。head_controls 本のランダムなヘッド(同じ k)と比べた null_pct も。"""
+        """将副作用检查（§6.14）作为任务提交。recipe 是已保存配方的名称，units 是临时指定（二选一）。
+        doses 是配方整体倍率（默认 [0, 0.25, 0.5, 0.75, 1]，0 为无干预）。逐倍率测量 exact / format 正确率、ppl、
+        语言混入（简体字・韩文等）、人格变化量（无干预中不存在的词所占比例等），并返回可发布（能力下降不超过 5pt、
+        ppl 上升不超过 10%、混入不增加）的倍率。4B 模型需数分钟。用 job_status 查看结果（保存到 <root>/evals/）。
+        random_controls=N 时，每个倍率也测量 N 个同量级随机对照配方（耗时约为 N 倍）。行中的 ctrl_novelty_p95・
+        novelty_null_pct（新词高于对照多少比例）、ctrl_capability_drop_p50・ctrl_ppl_worse_p50（仅由规模造成的恶化）。
+        传入 reactivity（对照集名称或路径。需要 reactivity 对与 validate.match）时，在行的 reactivity 中加入
+        有/无触发词的一致率及其差异。还会给出与 head_controls 个随机注意力头（相同 k）比较的 null_pct。"""
         try:
             p = {"recipe": recipe, "units": units, "when": when, "random_controls": random_controls}
             if reactivity:
@@ -231,10 +231,10 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def ablate_export(name: str, layers: str = "all", scale: float = 1.0, bake: bool = False,
                             from_layer: int | None = None) -> dict:
-        """方向 name(gne direction / direction ツールで作ったもの)の射影消去を書き出す(§6.17、いわゆる abliteration)。
-        既定は LoRA アダプタ GGUF(llama.cpp の --lora、--lora-scaled で部分消去)。bake=True なら重みを Q8_0 で書き換えた GGUF を
-        ジョブで作る(大きい。job_status で結果)。layers は "all" / "10-40"、scale は消す割合(1 で全部)。
-        使う r は from_layer の層で測ったもの(既定は direction の select で選んだ層)。"""
+        """导出方向 name（用 gne direction / direction 工具创建）的投影消除（§6.17，即 abliteration）。
+        默认输出 LoRA 适配器 GGUF（用于 llama.cpp 的 --lora、--lora-scaled 可部分消除）。bake=True 时创建以 Q8_0 改写权重的 GGUF
+        任务（文件较大。用 job_status 查看结果）。layers 为 "all" / "10-40"，scale 是消除比例（1 表示全部）。
+        使用的 r 来自 from_layer 层测得的方向（默认是 direction 的 select 所选层）。"""
         from .cli import parse_layers
         try:
             Ls = parse_layers(layers)
@@ -253,7 +253,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def bake(name: str, dst: str, verify: bool = True) -> dict:
-        """保存したレシピを FFN バイアスとして焼き付けた GGUF を dst に作る(対応 arch のみ、Qwen 系は不可)。"""
+        """将保存的配方烧制为 FFN 偏置并生成 GGUF 到 dst（仅支持的 arch，Qwen 系不可）。"""
         def fn():
             r = session.recipe(path=session.recipe_path(name))
             return session.bake(r, dst, verify=verify)
@@ -261,17 +261,17 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def head(layer: int, head: int, lens: bool = True) -> dict:
-        """attention ヘッド 1 個の調書(CHANGE-04): kind(attn / linear)、幅、K/V グループ、保存済みの heads_contrast での
-        指標と順位、名前、当てたことのある gain、W_O の列ブロックの logit lens(lens=False で省く)。"""
+        """单个 attention 注意力头的档案（CHANGE-04）：kind（attn / linear）、宽度、K/V 组、已保存 heads_contrast 中的
+        指标与排名、名称、曾应用过的 gain、W_O 列块的 logit lens（lens=False 时省略）。"""
         return await call(session.head, layer, head, lens=lens, gpu=False)
 
     @srv.tool()
     async def heads_contrast(contrast: str, name: str | None = None, direction: str | None = None,
                              layers: str | None = None, max_tokens: int = 48) -> dict:
-        """ヘッドの対照分析をジョブとして投げる(job_status で結果)。対照集合(configs/contrast/ の名前かパス)の会話を
-        ペルソナあり(system_a)と中立(system_b)で流し、ヘッドごとに trigger_mass(トリガー語への注目の割合の差、
-        対照集合の triggers が要る)・pattern_shift(注目の分布の JS)・out_shift(出力の差)・dir_cos(出力差が方向 r_L に
-        書く cos、direction か同じ名前の方向があるとき)を測り、中立どうしの差を床にして z で順位づける。"""
+        """将注意力头的对照分析作为任务提交（用 job_status 查看结果）。用有人格（system_a）与中立（system_b）
+        运行对照集（configs/contrast/ 的名称或路径）的会话，逐注意力头测量 trigger_mass（对触发词关注比例的差异，
+        需要对照集的 triggers）・pattern_shift（关注分布的 JS）・out_shift（输出差异）・dir_cos（输出差异写到方向 r_L 的
+        cos，存在 direction 或同名方向时），并以中立对中立的差异为下限按 z 排序。"""
         from .cli import parse_layers
         try:
             params = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
@@ -282,16 +282,16 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def expert(layer: int, expert: int) -> dict:
-        """MoE の専門家 1 個の調書(CHANGE-05): 選択率・選ばれたときの重みの平均・よく選ぶトークン(stats act があるとき)、
-        保存済みの experts_contrast での指標と順位、書き込みの大きいニューロン(q999 × ‖W_down[:, n]‖)。"""
+        """单个 MoE 专家的档案（CHANGE-05）：选择率、选中时的平均权重、常选中的 token（存在 stats act 时）、
+        已保存 experts_contrast 中的指标与排名、写入量较大的神经元（q999 × ‖W_down[:, n]‖）。"""
         return await call(session.expert, layer, expert)
 
     @srv.tool()
     async def experts_contrast(contrast: str, name: str | None = None, direction: str | None = None,
                                layers: str | None = None, max_tokens: int = 48) -> dict:
-        """専門家の対照分析をジョブとして投げる(job_status で結果)。対照集合の同じ返事をペルソナあり(system_a)と中立(system_b)で
-        読ませ、MoE の層の専門家ごとに usage_shift(選ばれた割合の差)・weight_shift(実効の重みの差)・contrib_cos(寄与の差と
-        その層の状態の向きの cos)・contrib_norm を測り、中立どうしを床にして z で順位づける。数秒〜数十秒。"""
+        """将专家对照分析作为任务提交（用 job_status 查看结果）。分别用带人格（system_a）和中立（system_b）
+        读取对照集中的同一回复，逐 MoE 层专家测量 usage_shift（选中比例差）、weight_shift（有效权重差）、
+        contrib_cos（贡献差与该层状态方向的 cos）、contrib_norm，并以中立对中立的下限为基准按 z 排序。数秒至数十秒。"""
         from .cli import parse_layers
         try:
             params = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
@@ -303,8 +303,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def experts_sweep(layer: int, experts: list[int] | None = None, ks: list[float] | None = None,
                             max_tokens: int = 48) -> dict:
-        """専門家単位のスイープをジョブとして投げる。層の各専門家を k 倍(既定 0 と 2)するスケールパッチで生成し、語の出方で
-        順位づける(帰無は同じ層の全専門家)。1 専門家・1 倍率ごとにモデルを読み直す(小さいモデルで 0.3〜1 秒)。"""
+        """将按专家进行的 sweep 作为任务提交。用将每个层专家乘以 k（默认 0 与 2）的缩放补丁生成，并按词语出现方式排序
+        （零假设为同一层全部专家）。每测试一个专家的一个倍率都会重新读取模型（小模型约 0.3～1 秒）。"""
         try:
             p = {"layer": layer, "experts": experts, "ks": tuple(ks) if ks else (0.0, 2.0), "max_tokens": max_tokens}
             return jobs.start("experts_sweep", p).view()
@@ -313,24 +313,24 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def moe_route(text: str, layers: str | None = None, chat: bool = False) -> dict:
-        """文を流し、MoE の層ごとに各トークンで選ばれた専門家と実効のルーティング重み(大きい順)を返す。"""
+        """流式输入文本，逐 MoE 层返回每个 token 选中的专家与有效路由权重（从大到小）。"""
         from .cli import parse_layers
         return await call(session.moe_route, text, layers=parse_layers(layers), chat=chat)
 
     @srv.tool()
     async def expert_patch(layer: int, expert: int, k: float, prompt: str, system: str | None = None,
                            max_tokens: int = 64) -> dict:
-        """専門家 e の出力を k 倍(0 で消す)するスケールパッチを作業用コピーに当てて生成し、無介入と並べる。終わったら元に戻す
-        (元の GGUF は触らない)。レシピに入れるなら "L:Ee:xk" を recipe_save に渡す。"""
+        """在工作副本上应用将专家 e 的输出乘以 k（0 表示消除）的缩放补丁后生成，并与无干预结果并列。结束后恢复原状
+        （不会改动原 GGUF）。若要写入配方，请将 "L:Ee:xk" 传给 recipe_save。"""
         return await call(session.steer, [f"{layer}:E{expert}:x{k:g}"], prompt=prompt, system=system, max_tokens=max_tokens)
 
     @srv.tool()
     async def writers(contrast: str, name: str | None = None, ref_layer: int | None = None,
                       replies_a: str | None = None, max_tokens: int = 96) -> dict:
-        """書き手の強さをジョブとして投げる(job_status で結果)。対照集合の A(見たい状態、例 ヤンデレの system)と B(中立)の
-        返事のトークンで、各ニューロンが残差に書き足した量(活性の差 × 書く向き)の、参照の層の方向への直接の寄与を測る。
-        方向を埋め込み・mixer(attention など)・MLP が何割書いたかも返す。replies_a は A の返事を読ませるファイル
-        (別のモデルの返事を借りるとき)。活性の差(読み手)と違い、方向に実際に書いている「書き手」が上に来る。"""
+        """将写入器强度作为任务提交（用 job_status 查看结果）。使用对照集 A（目标状态，例如病娇的 system）与 B（中立）的
+        回复 token，测量各神经元写入残差的量（激活值差异 × 写入方向）对参考层方向的直接贡献。
+        也返回嵌入・mixer（如 attention）・MLP 各写入多少比例。replies_a 是让 A 读取的回复文件
+        （借用其他模型的回复时）。与激活值差异（读取器）不同，真正沿方向写入的“写入器”会排在前面。"""
         try:
             p = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
                  "ref_layer": ref_layer, "replies_a": replies_a, "max_tokens": max_tokens}
@@ -341,33 +341,33 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def attention(text: str, layer: int | None = None, head: int | None = None, top: int = 5, pos: int = -1,
                         chat: bool = False, system: str | None = None) -> dict:
-        """文を流し、位置 pos(既定は最後)のトークンが各ヘッドでどこを見ているか(上位 top)と per-head 出力のノルム。
-        layer と head を両方指定すると T × T のパターンも返す。chat=True なら text をユーザーの発話としてテンプレートに入れる。"""
+        """流式输入文本，查看位置 pos（默认最后）的 token 在各注意力头中关注何处（前 top 个）以及每个头输出的范数。
+        同时指定 layer 与 head 时还返回 T × T 模式。chat=True 时将 text 作为用户发言放入模板。"""
         return await call(session.attention, text, layer=layer, head=head, top=top, pos=pos, chat=chat, system=system)
 
     @srv.tool()
     async def heads_listen(user: str, heads: str, system: str | None = None, reply: str | None = None, max_tokens: int = 64,
                            direction: str | None = None, top: int = 20) -> dict:
-        """返事のトークンが、選んだヘッド(例 "14:H0-3")で文脈のどのトークンに注目しているか(注目の平均)。
-        direction(保存済みの方向)を渡すと、文脈の各トークンがヘッドの出力を通してその層の方向に寄与した量(注目 × ゲート × OV、
-        attention の後の norm 込み)と、層の全ヘッドの寄与のうち選んだヘッドの分も返す。reply を省くと greedy に作る。"""
+        """回复的 token 在所选注意力头（例："14:H0-3"）中关注上下文的哪些 token（注意力的平均）。
+        传入 direction（已保存的方向）时，还会返回各上下文 token 通过注意力头输出对该层方向的贡献量
+        （注意力 × 门控 × OV，含 attention 后的 norm），以及整层全部注意力头贡献中所选头的部分。省略 reply 时以 greedy 生成。"""
         return await call(session.heads_listen, user, heads=heads, system=system, reply=reply, max_tokens=max_tokens,
                           direction=direction, top=top)
 
     @srv.tool()
     async def set_name(layer: int, neuron: int, name: str) -> dict:
-        """ニューロンに名前を付ける(空文字で消す)。調書と search(mode="name") に出る。"""
+        """为神经元命名（空字符串表示删除）。会出现在档案与 search(mode="name") 中。"""
         return await call(session.set_name, layer, neuron, name, gpu=False)
 
     @srv.tool()
     async def job_start(kind: str, params: dict[str, Any] | None = None, workers: str | None = None) -> dict:
-        """長時間の処理を投げる。kind: stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast。
-        params は gne.api の同名メソッドの引数(例 sweep: {"layer": 22, "neurons": "random:64", "design": "quick"})。
-        見積もりが 30 分を超えるジョブは走らせずに NEEDS_CONFIRM と見積もりを返す。params に budget("30m" など)を入れると
-        予算に収まるように絞る(lens_steer は方向に近いニューロンの上位、sweep は quick 設計で steer lens の上位、reverse は
-        確かめる候補の数、connections は window)。それでも走らせるなら params に yes: true。
-        workers("auto" か名前のカンマ区切り)を渡すと、gne worker のファイルのキューに入れる(sweep / lens_steer は
-        ニューロンで分ける、CHANGE-03 B)。返り値の jobs の id で job_status を見る。"""
+        """提交长时间处理。kind：stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast。
+        params 是 gne.api 中同名方法的参数（例 sweep：{"layer": 22, "neurons": "random:64", "design": "quick"}）。
+        预计超过 30 分钟的任务不会运行，而是返回 NEEDS_CONFIRM 与估算。在 params 中加入 budget("30m" 等)可按预算
+        缩小范围（lens_steer 取靠近方向的上位神经元，sweep 用 quick 设计取 steer lens 前几名，reverse 减少
+        待确认候选数，connections 调整 window）。仍要运行时，在 params 中设置 yes: true。
+        传入 workers（"auto" 或逗号分隔的名称）时，会加入 gne worker 的文件队列（sweep / lens_steer 按
+        神经元拆分，CHANGE-03 B）。用返回值 jobs 中的 id 查看 job_status。"""
         try:
             if workers:
                 from .estimate import NeedsConfirm, gate
@@ -384,7 +384,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def job_status(job_id: str | None = None) -> dict:
-        """ジョブの進捗(done / total / eta_s)と結果。job_id を省くと全ジョブの一覧。"""
+        """任务进度（done / total / eta_s）与结果。省略 job_id 时列出所有任务。"""
         try:
             from .workers import job_files
             if job_id is None:
@@ -400,7 +400,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def job_cancel(job_id: str) -> dict:
-        """ジョブを止める(次のユニットの切れ目で止まる。途中までの結果は残り、同じ条件で続きから再開できる)。"""
+        """停止任务（会在下一个单元边界停止。已有结果会保留，可在相同条件下继续）。"""
         try:
             return jobs.cancel(job_id).view()
         except Exception as e:  # noqa: BLE001
@@ -417,15 +417,15 @@ def _contrast_path(session, contrast, system_a, system_b, user_prompts, name) ->
         if not p.exists():
             p = CONFIGS / "contrast" / f"{contrast}.yaml"
         if not p.exists():
-            raise GneError("FILE_NOT_FOUND", f"対照プロンプト集 {contrast} がありません",
-                           "configs/contrast/ の名前かパス、または system_a / system_b / user_prompts を渡してください")
+            raise GneError("FILE_NOT_FOUND", f"对照提示词集 {contrast} 不存在",
+                           "请传入 configs/contrast/ 中的名称或路径，或提供 system_a / system_b / user_prompts")
         return p
     if not (system_a and system_b and user_prompts):
-        raise GneError("BAD_ARGS", "contrast か、system_a・system_b・user_prompts の 3 つを渡してください")
+        raise GneError("BAD_ARGS", "请传入 contrast，或同时传入 system_a・system_b・user_prompts 三项")
     import yaml
     nm = name or "contrast"
     if not re.fullmatch(r"[\w.\-]+", nm):
-        raise GneError("BAD_ARGS", "name は英数字・_・-・. だけにしてください")
+        raise GneError("BAD_ARGS", "name 只能包含字母、数字、_、-、.")
     p = session.store.root / "contrast" / f"{nm}.yaml"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml.safe_dump({"name": nm, "system_a": system_a, "system_b": system_b,
@@ -434,12 +434,12 @@ def _contrast_path(session, contrast, system_a, system_b, user_prompts, name) ->
 
 
 def _register_ui_tool(srv, action: str, ui_url: str | None) -> None:
-    """ui_* ツール(別冊 §11)。gne serve の POST /api/ui/{action} を叩く。UI に繋いでいなければ UI_NOT_RUNNING。"""
+    """ui_* 工具（别册 §11）。调用 gne serve 的 POST /api/ui/{action}。未连接 UI 时返回 UI_NOT_RUNNING。"""
 
     async def post(body: dict) -> dict:
         if not ui_url:
-            return {"error": {"code": "UI_NOT_RUNNING", "message": "UI に接続していません",
-                              "hint": "gne serve を起動し、gne mcp --ui-url http://127.0.0.1:8791 で繋いでください"}}
+            return {"error": {"code": "UI_NOT_RUNNING", "message": "未连接 UI",
+                              "hint": "请启动 gne serve，并通过 gne mcp --ui-url http://127.0.0.1:8791 连接"}}
         req = urllib.request.Request(f"{ui_url.rstrip('/')}/api/ui/{action}", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
 
@@ -451,29 +451,29 @@ def _register_ui_tool(srv, action: str, ui_url: str | None) -> None:
                 try:
                     return json.loads(e.read())
                 except ValueError:
-                    return {"error": {"code": "UI_ERROR", "message": f"UI が {e.code} を返しました", "hint": None}}
+                    return {"error": {"code": "UI_ERROR", "message": f"UI 返回了 {e.code}", "hint": None}}
         try:
             return await anyio.to_thread.run_sync(send)
         except (urllib.error.URLError, OSError) as e:
-            return {"error": {"code": "UI_NOT_RUNNING", "message": f"UI に届きません: {e}", "hint": None}}
+            return {"error": {"code": "UI_NOT_RUNNING", "message": f"无法连接 UI：{e}", "hint": None}}
 
     if action == "highlight":
         async def ui_highlight(units: list[str], label: str | None = None) -> dict:
-            """UI のマップでユニットを強調する(水色の破線の輪と札)。units は ["22:2742", "14:8949:+1"] の形。
-            前の強調は置き換わる。空のリストで消す。label はまとまりの見出し(例 "宇宙人の候補")。
-            強調は「人に見てほしいもの」だけにする。見送った候補は強調せず、ui_note で理由だけ貼る。"""
+            """在 UI 地图中高亮单元（浅蓝色虚线圈与标签）。units 形如 ["22:2742", "14:8949:+1"]。
+            会替换之前的高亮。空列表表示清除。label 是分组标题（例 "外星人候选"）。
+            只高亮“希望人查看的内容”。暂缓的候选不要高亮，只用 ui_note 贴上原因。"""
             return await post({"units": units, "label": label})
         srv.tool(name="ui_highlight")(ui_highlight)
     elif action == "note":
         async def ui_note(layer: int, neuron: int, text: str) -> dict:
-            """UI のマップのニューロンに短い注釈(400 字まで)を貼る。同じニューロンには上書き、空の text で消す。
-            地図には最初の 28 字だけが出るので、結論から書く(例 "本命: 宇宙人の話題。sweep 3 位・全対照超え、3 プロンプトで
-            extraterrestrial" / "見送り: 量の語(many/most)")。事実と解釈を分ける。"""
+            """在 UI 地图的神经元上贴简短注记（最多 400 字）。同一神经元会覆盖，空 text 表示删除。
+            地图只显示前 28 字，因此先写结论（例 "首选：外星人话题。sweep 第 3・超过全部对照，3 个提示词出现
+            extraterrestrial" / "暂缓：数量词（many/most）"）。区分事实与解释。"""
             return await post({"layer": layer, "neuron": neuron, "text": text})
         srv.tool(name="ui_note")(ui_note)
     else:
         async def ui_open(layer: int, neuron: int, tab: str | None = None) -> dict:
-            """UI の NEURON パネルでニューロンを開き、マップをその層の正面ビューにする。tab: examples / chat / details / web。"""
+            """在 UI 的 NEURON 面板中打开神经元，并将地图切换到该层的正面视图。tab：examples / chat / details / web。"""
             return await post({"layer": layer, "neuron": neuron, "tab": tab})
         srv.tool(name="ui_open")(ui_open)
 

@@ -51,8 +51,8 @@ def load_triggers(path: str | Path, cs: ContrastSet) -> list[list[str]]:
         return [list(t) for _ in range(n)]
     if isinstance(t, list) and len(t) == n and all(isinstance(x, list | type(None)) for x in t):
         return [[str(y) for y in (x or [])] for x in t]
-    raise GneError("BAD_CONTRAST", "triggers は文字列のリスト、user_prompts と同じ長さのリストのリスト、"
-                                   "または {プロンプト: [文字列]} です")
+    raise GneError("BAD_CONTRAST", "triggers 必须是字符串列表、与 user_prompts 等长的列表之列表，"
+                                   "或 {提示词: [字符串]} 映射")
 
 
 def _js_bits(p: np.ndarray, q: np.ndarray) -> np.ndarray:
@@ -196,7 +196,7 @@ def heads_contrast(session, contrast: str | Path, *, name: str | None = None, di
         S = min(_suffix_len(ids["A"], ids["B"]), _suffix_len(ids["A"], ids["B2"]))
         sa, sb, sb2 = (len(ids[k]) - S for k in ("A", "B", "B2"))
         if p_a is None or p_a < sa or p_a >= len(ids["A"]):
-            session.warn(f"プロンプト {i + 1}: 返事の位置を合わせられないので飛ばしました")
+            session.warn(f"提示词 {i + 1}: 无法对齐回复位置，已跳过")
             tick(f"heads: {i + 1}/{n}")
             continue
         ra = list(range(p_a, len(ids["A"])))
@@ -221,7 +221,7 @@ def heads_contrast(session, contrast: str | Path, *, name: str | None = None, di
     rows = _flatten(main.metrics(w, dirs), kinds)
     nrows = _flatten(null.metrics(w, dirs), kinds)
     if not rows:
-        raise GneError("BAD_CONTRAST", "測れたヘッドがありません")
+        raise GneError("BAD_CONTRAST", "没有可测量的注意力头")
     stats = {}
     for k in METRICS:
         signed = k in ("trigger_mass", "dir_cos")
@@ -256,7 +256,7 @@ def heads_contrast(session, contrast: str | Path, *, name: str | None = None, di
 def load_candidates(session, name: str) -> list[dict]:
     p = session.store.heads_dir(session.meta.model_id) / f"{name}.candidates.jsonl"
     if not p.exists():
-        raise GneError("FILE_NOT_FOUND", f"ヘッドの対照分析 {name} がありません(gne heads contrast で作れます)")
+        raise GneError("FILE_NOT_FOUND", f"没有注意力头对照分析 {name}（可用 gne heads contrast 生成）")
     return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
@@ -275,12 +275,12 @@ def attention_view(session, text: str, *, pos: int = -1, layer: int | None = Non
         conv = text
     Ls = None if layer is None else [layer]
     if layer is not None and not w.arch.layers[layer].head_dim:
-        raise GneError("BAD_ARGS", f"層 {layer} にはヘッドがありません")
+        raise GneError("BAD_ARGS", f"第 {layer} 层没有注意力头")
     ac = capture_attention(session, [conv], layers=Ls)[0]
     T = ac.n_tokens
     p = pos if pos >= 0 else T + pos
     if not 0 <= p < T:
-        raise GneError("BAD_ARGS", f"pos {pos} は範囲外です(0..{T - 1})")
+        raise GneError("BAD_ARGS", f"pos {pos} 超出范围（0..{T - 1}）")
     toks = [ac.text[a:b] for a, b in ac.offsets]
     heads = []
     for L in sorted(ac.head_out):
@@ -288,7 +288,7 @@ def attention_view(session, text: str, *, pos: int = -1, layer: int | None = Non
         hs = range(li.n_head) if head is None else [head]
         for h in hs:
             if not 0 <= h < li.n_head:
-                raise GneError("BAD_ARGS", f"L{L} のヘッド {h} は範囲外です")
+                raise GneError("BAD_ARGS", f"L{L} 的注意力头 {h} 超出范围")
             row = {"layer": L, "head": h, "kind": "attn" if li.mixer == "attention" else "linear",
                    "norm": float(np.linalg.norm(ac.head_out[L][p, h]))}
             if L in ac.pattern:
@@ -312,20 +312,20 @@ def parse_heads(spec: str, weights) -> list[tuple[int, int]]:
     for part in [p.strip() for p in str(spec).split(",") if p.strip()]:
         m = re.fullmatch(r"(\d+):[Hh](\*|\d+)(?:-(\d+))?", part)
         if not m:
-            raise GneError("BAD_ARGS", f"{part!r}: ヘッドは L:Hh・L:Ha-b・L:H* で書きます(例 14:H0-3)")
+            raise GneError("BAD_ARGS", f"{part!r}：注意力头请写作 L:Hh、L:Ha-b、L:H*（例：14:H0-3）")
         L = int(m.group(1))
         if not 0 <= L < weights.meta.n_layer:
-            raise GneError("BAD_ARGS", f"層 {L} は範囲外です")
+            raise GneError("BAD_ARGS", f"第 {L} 层超出范围")
         li = weights.arch.layers[L]
         if li.mixer != "attention" or not li.head_dim:
-            raise GneError("BAD_ARGS", f"層 {L} は softmax の attention の層ではありません")
+            raise GneError("BAD_ARGS", f"第 {L} 层不是 softmax attention 层")
         a = 0 if m.group(2) == "*" else int(m.group(2))
         b = li.n_head - 1 if m.group(2) == "*" else int(m.group(3) or a)
         if not 0 <= a <= b < li.n_head:
-            raise GneError("BAD_ARGS", f"{part!r}: L{L} のヘッドは 0..{li.n_head - 1} です")
+            raise GneError("BAD_ARGS", f"{part!r}：L{L} 的注意力头范围为 0..{li.n_head - 1}")
         out += [(L, h) for h in range(a, b + 1) if (L, h) not in out]
     if not out:
-        raise GneError("BAD_ARGS", "ヘッドを指定してください(例 14:H0-3)")
+        raise GneError("BAD_ARGS", "请指定注意力头（例：14:H0-3）")
     return out
 
 
@@ -356,7 +356,7 @@ def listen_view(session, user: str, *, heads: str | list[tuple[int, int]], syste
     from .weights import tensor_to_f32
     e, w = session.engine, session.weights
     if not user or not user.strip():
-        raise GneError("BAD_ARGS", "ユーザーの発話が空です")
+        raise GneError("BAD_ARGS", "用户发言为空")
     hs = parse_heads(heads, w) if isinstance(heads, str) else [(int(L), int(h)) for L, h in heads]
     system = (system or "").strip() or None
     msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
@@ -366,7 +366,7 @@ def listen_view(session, user: str, *, heads: str | list[tuple[int, int]], syste
     else:
         rids = e.tokenize(reply, add_special=False, parse_special=False)
     if not rids:
-        raise GneError("BAD_ARGS", "返事が空です")
+        raise GneError("BAD_ARGS", "回复为空")
     ids, st = pids + rids, len(pids)
     T = len(ids)
     Ls = sorted({L for L, _ in hs})
@@ -384,7 +384,7 @@ def listen_view(session, user: str, *, heads: str | list[tuple[int, int]], syste
                            extra=extra)[0]
     for L in Ls:
         if L not in ac.pattern:
-            raise GneError("ARCH_UNSUPPORTED", f"L{L} の注目のパターンを捕捉できませんでした")
+            raise GneError("ARCH_UNSUPPORTED", f"无法捕获 L{L} 的注意力模式")
     toks = [ac.text[a:b] for a, b in ac.offsets]
     roles = ["template"] * T
     cut = ac.offsets[st][0]
@@ -568,9 +568,9 @@ def q_rows(weights, L: int, h: int) -> tuple[int, int]:
     [q(head_dim 行) | ゲート(head_dim 行)] が交互に並ぶ(verification.md §14.1)ので、q の行だけを返す。"""
     li = weights.arch.layers[L]
     if li.mixer != "attention":
-        raise GneError("ARCH_UNSUPPORTED", f"層 {L} は attention の層ではありません(クエリ操作は attention の層だけ)")
+        raise GneError("ARCH_UNSUPPORTED", f"第 {L} 层不是 attention 层（查询操作仅适用于 attention 层）")
     if not weights.has_tensor(f"blk.{L}.attn_q.weight"):
-        raise GneError("ARCH_UNSUPPORTED", f"blk.{L}.attn_q.weight がありません(Q・K・V が 1 つのテンソルの arch は未対応)")
+        raise GneError("ARCH_UNSUPPORTED", f"缺少 blk.{L}.attn_q.weight（暂不支持 Q・K・V 合为一个张量的 arch）")
     hd = li.head_dim
     if weights.meta.arch in GATED_Q_ARCHS:
         return 2 * h * hd, 2 * h * hd + hd
@@ -607,7 +607,7 @@ def query_vectors(session, L: int, h: int, *, direction: str, seek: str | Path, 
     cs, _ = load_contrast(seek)
     trig = load_triggers(seek, cs)
     if not any(trig):
-        raise GneError("BAD_CONTRAST", f"{seek} に triggers がありません(探しに行く語が要ります)")
+        raise GneError("BAD_CONTRAST", f"{seek} 中没有 triggers（需要用于查找的词）")
     ds = session.direction_set(direction)
     src = L - 1 if (L - 1) in ds.raw else L
     gamma = w.tensor(f"blk.{L}.attn_norm.weight")
@@ -644,7 +644,7 @@ def query_vectors(session, L: int, h: int, *, direction: str, seek: str | Path, 
             qn += np.linalg.norm(qh[user], axis=1).tolist()
     e.free_attn_probe()
     if not kt or not ko:
-        raise GneError("BAD_CONTRAST", "トリガーのトークンが見つかりませんでした")
+        raise GneError("BAD_CONTRAST", "找不到触发词 token")
     XA, XB = np.concatenate(xa), np.concatenate(xb)
     mu = XB.mean(axis=0)
     mu /= max(float(np.linalg.norm(mu)), 1e-12)
@@ -657,11 +657,11 @@ def query_vectors(session, L: int, h: int, *, direction: str, seek: str | Path, 
     u = np.zeros(li.head_dim, dtype=np.float32)
     u[dims] = d[dims]
     if np.linalg.norm(u) == 0:
-        raise GneError("BAD_CONTRAST", "u が 0 になりました")
+        raise GneError("BAD_CONTRAST", "u 变为零")
     u /= np.linalg.norm(u)
     gap = float(np.mean(sa) - np.mean(sb))
     if gap <= 1e-9:
-        raise GneError("BAD_CONTRAST", "方向が A と B の入力を分けません(v·norm(x) の差が 0 以下)")
+        raise GneError("BAD_CONTRAST", "该方向无法区分 A 与 B 的输入（v·norm(x) 的差小于等于 0）")
     return {"u": u, "v": v / gap, "rows": (lo, hi), "kv_group": grp, "dims": dims,
             "source_layer": src, "v_gap": gap, "v_mean_a": float(np.mean(sa) / gap), "v_mean_b": float(np.mean(sb) / gap),
             "q_norm": float(np.mean(qn)), "n_trigger_tokens": len(kt)}

@@ -44,11 +44,11 @@ def load_replies(path: str | Path | None, prompts: list[str]) -> list[str] | Non
     if isinstance(d, dict):
         missing = [p for p in prompts if p not in d]
         if missing:
-            raise GneError("BAD_ARGS", f"{path}: 返事の無いプロンプトがあります({missing[0]!r} など {len(missing)} 個)")
+            raise GneError("BAD_ARGS", f"{path}: 有提示词缺少回复（{missing[0]!r} 等共 {len(missing)} 个）")
         return [str(d[p]) for p in prompts]
     if isinstance(d, list) and len(d) == len(prompts):
         return [str(x) for x in d]
-    raise GneError("BAD_ARGS", f"{path}: 返事は user_prompts と同じ長さのリストか、{{プロンプト: 返事}} の表です")
+    raise GneError("BAD_ARGS", f"{path}: 回复必须是长度与 user_prompts 相同的列表，或 {{提示词: 回复}} 映射")
 
 
 def _post_norm(weights, L: int):
@@ -78,13 +78,13 @@ def writer_contributions(session, contrast: str | Path, *, name: str | None = No
     Ls = list(range(n_l - 1))                                  # 最終層は行が間引かれるので除く
     ref = n_l - 2 if ref_layer is None else int(ref_layer)
     if ref not in Ls:
-        raise GneError("BAD_ARGS", f"--ref-layer は 0〜{n_l - 2} です")
+        raise GneError("BAD_ARGS", f"--ref-layer 范围为 0～{n_l - 2}")
     d = yaml.safe_load(Path(contrast).read_text(encoding="utf-8")) or {}
     given = {"A": load_replies(replies_a, cs.user_prompts) or d.get("replies_a"),
              "B": load_replies(replies_b, cs.user_prompts) or d.get("replies_b")}
     for side in "AB":
         if given[side] is not None and len(given[side]) != len(cs.user_prompts):
-            raise GneError("BAD_CONTRAST", f"replies_{side.lower()} の数が user_prompts と違います")
+            raise GneError("BAD_CONTRAST", f"replies_{side.lower()} 的数量与 user_prompts 不同")
     probe = e.tokenize_prompt(e.render_chat([{"role": "user", "content": cs.user_prompts[0]}]))
     seen = e.list_names(probe[:16])
     act_name = {L: pick_act_name(seen, L) for L in Ls}
@@ -117,11 +117,11 @@ def writer_contributions(session, contrast: str | Path, *, name: str | None = No
             pids = e.tokenize_prompt(e.render_chat(c))
             if r:
                 seqs[side].append((pids + r, len(pids)))
-        tick(f"writers: {side} の返事")
+        tick(f"writers: {side} 的回复")
     if not seqs["A"] or not seqs["B"]:
-        raise GneError("BAD_CONTRAST", "返事がありません")
+        raise GneError("BAD_CONTRAST", "没有回复")
     if max(len(s) for side in "AB" for s, _ in seqs[side]) > e.n_ctx:
-        raise GneError("BAD_ARGS", "会話が n_ctx を超えています")
+        raise GneError("BAD_ARGS", "对话超过 n_ctx")
 
     # 1 回目: 全層の l_out と埋め込み → 層ごとの方向 r_L
     names1 = {f"l_out-{L}": L for L in Ls}
@@ -147,11 +147,11 @@ def writer_contributions(session, contrast: str | Path, *, name: str | None = No
     r = {L: res_sum["A"][L] / cnt["A"] - res_sum["B"][L] / cnt["B"] for L in Ls}
     d_emb = emb_sum["A"] / cnt["A"] - emb_sum["B"] / cnt["B"]
     if not emb_name:
-        session.warn("埋め込みのテンソルが捕捉できないので、token_embd の行で代わりにしました(埋め込みを拡大する arch ではずれます)")
+        session.warn("无法捕获嵌入张量，已改用 token_embd 的行代替（在放大嵌入的 arch 中会有偏差）")
     r_ref = r[ref]
     nrm = float(np.linalg.norm(r_ref))
     if nrm == 0:
-        raise GneError("BAD_CONTRAST", "A と B の残差が同じです")
+        raise GneError("BAD_CONTRAST", "A 与 B 的残差相同")
     rh = r_ref / nrm
 
     # 2 回目: 層ごとに活性を取り、MLP の出力とニューロンごとの寄与
@@ -274,7 +274,7 @@ def load_layer(session, name: str, L: int) -> dict[str, np.ndarray] | None:
     """保存した書き足しの層 L(contrib・act_a・act_b・act_diff・align)。無ければ None。"""
     p = session.store.root / "writers" / session.meta.model_id / f"{name}.npz"
     if not p.exists():
-        raise GneError("FILE_NOT_FOUND", f"書き手の分析 {name} がありません(gne writers で作れます)")
+        raise GneError("FILE_NOT_FOUND", f"没有写入器分析 {name}（可用 gne writers 生成）")
     z = np.load(p)
     if f"contrib_{L}" not in z.files:
         return None
@@ -309,12 +309,12 @@ def export_writes(session, name: str, out_name: str, *, part: str = "mlp", top: 
     from .direction import DirectionSet  # noqa: F401  形式を合わせる相手
     p = session.store.root / "writers" / session.meta.model_id / f"{name}.npz"
     if not p.exists():
-        raise GneError("FILE_NOT_FOUND", f"書き手の分析 {name} がありません")
+        raise GneError("FILE_NOT_FOUND", f"没有写入器分析 {name}")
     z = np.load(p)
     if "emb_vec" not in z.files:
-        raise GneError("BAD_ARGS", f"{name} は古い形式です(gne writers で作り直してください)")
+        raise GneError("BAD_ARGS", f"{name} 是旧格式（请用 gne writers 重新创建）")
     if part not in ("mlp", "mixer", "all", "r"):
-        raise GneError("BAD_ARGS", "part は mlp / mixer / all / r です")
+        raise GneError("BAD_ARGS", "part 须为 mlp / mixer / all / r")
     ref = int(z["ref_layer"])
     Ls_all = sorted(int(k.split("_")[2]) for k in z.files if k.startswith("r_vec_"))
     Ls = [L for L in (layers if layers is not None else Ls_all) if L in Ls_all and 1 <= L <= ref]   # 層 0 は cvec で押せない
@@ -351,7 +351,7 @@ def export_writes(session, name: str, out_name: str, *, part: str = "mlp", top: 
         out[L] = np.asarray(v, dtype=np.float32)
         norms[str(L)] = float(np.linalg.norm(out[L]))
     if not out:
-        raise GneError("BAD_ARGS", "書き出す層がありません")
+        raise GneError("BAD_ARGS", "没有可导出的层")
     d = session.store.direction_dir(session.meta.model_id)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{out_name}.npz"

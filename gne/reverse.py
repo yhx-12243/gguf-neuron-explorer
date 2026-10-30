@@ -35,11 +35,11 @@ class ContrastSet:
     def load(cls, path: str | Path) -> ContrastSet:
         p = Path(path)
         if not p.exists():
-            raise GneError("FILE_NOT_FOUND", f"対照プロンプト集 {p} がありません")
+            raise GneError("FILE_NOT_FOUND", f"找不到对照提示词集 {p}")
         text = p.read_text(encoding="utf-8")
         d = yaml.safe_load(text) or {}
         if not d.get("user_prompts") or "system_a" not in d or "system_b" not in d:
-            raise GneError("BAD_CONTRAST", f"{p}: system_a / system_b / user_prompts が要ります")
+            raise GneError("BAD_CONTRAST", f"{p}: 需要 system_a / system_b / user_prompts")
         return cls(d.get("name") or p.stem, d["system_a"], d["system_b"], list(d["user_prompts"]),
                    hashlib.sha256(text.encode()).hexdigest()[:16])
 
@@ -135,7 +135,7 @@ def contrastive_directions(engine: Engine, cs: ContrastSet, *, layers: Sequence[
             pc *= np.sign(pc @ md) or 1.0
             dirs[L] = (pc * (pc @ md)).astype(np.float32)                         # 平均差をその軸に射影した大きさ
         else:
-            raise GneError("BAD_ARGS", f"method={method!r} は mean_diff か pca1 です")
+            raise GneError("BAD_ARGS", f"method={method!r} 只能为 mean_diff 或 pca1")
     act = {L: (act_sums["A"][L] / counts["A"] - act_sums["B"][L] / counts["B"]).astype(np.float32)
            for L in act_names.values()}
     n = counts["A"] + counts["B"]

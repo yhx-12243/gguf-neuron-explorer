@@ -61,14 +61,14 @@ def _default_layers(engine: Engine, layers: Sequence[int] | None, include_last_l
     if not include_last_layer:
         out = [L for L in out if L != engine.n_layer - 1]
     if not out:
-        raise GneError("BAD_ARGS", "統計を取る層がありません", "最終層だけなら --include-last-layer を付けてください")
+        raise GneError("BAD_ARGS", "没有可统计的层", "如果只需要最后一层，请添加 --include-last-layer")
     return out
 
 
 def _rows_check(name: str, x: np.ndarray, n_tok: int) -> None:
     if x.shape[0] != n_tok:
-        raise RuntimeError(f"{name} の行数 {x.shape[0]} がトークン数 {n_tok} と違います。最終層の行の間引き(R5)なら "
-                           "--include-last-layer を付けてください")
+        raise RuntimeError(f"{name} 的行数 {x.shape[0]} 与 token 数 {n_tok} 不一致。如果是最后一层行被抽稀（R5），"
+                           "请添加 --include-last-layer")
 
 
 # --- 残差ノルム -------------------------------------------------------------------------------------
@@ -88,7 +88,7 @@ class ResidStats:
     def rho(self, L: int) -> float:
         hit = np.nonzero(self.layers == L)[0]
         if not hit.size:
-            raise KeyError(f"層 {L} の残差ノルム統計がありません(gne stats resid --layers に含めてください)")
+            raise KeyError(f"第 {L} 层没有残差范数统计（请将其包含在 gne stats resid --layers 中）")
         return float(self.p50[hit[0]])
 
     def save(self, path: str | Path) -> None:
@@ -274,7 +274,7 @@ def neuron_activation_stats(engine: Engine, corpus: Corpus, layers: Sequence[int
             continue
         nm = pick_act_name(names_all, L)
         if nm is None:
-            raise RuntimeError(f"層 {L} の ffn_down 入力テンソルが見つかりません(gne probe --list-names --layer {L})")
+            raise RuntimeError(f"找不到第 {L} 层的 ffn_down 输入张量（gne probe --list-names --layer {L}）")
         act_names[nm] = L
     moe_wanted = {v for mn in moe.values() for k, v in mn.items() if k in ("act", "argsort", "weights")}
     cap = Capture(lambda n: n in act_names or n in moe_wanted)
@@ -317,7 +317,7 @@ class StatsView:
 
     def rho(self, L: int) -> float:
         if self.resid is None:
-            raise KeyError("残差ノルム統計がありません(gne stats resid を先に実行してください)")
+            raise KeyError("没有残差范数统计（请先运行 gne stats resid）")
         return self.resid.rho(L)
 
     def absmax(self, L: int, n: int) -> float:
@@ -325,5 +325,5 @@ class StatsView:
             self._act[L] = self._act_loader(L)
         st = self._act[L]
         if st is None:
-            raise KeyError(f"層 {L} の活性統計がありません(gne stats act --layers {L} を先に実行してください)")
+            raise KeyError(f"第 {L} 层没有激活统计（请先运行 gne stats act --layers {L}）")
         return float(st.absmax.reshape(-1)[n])            # MoE の層は (n_expert, n_ff_exp) を通し番号で引く

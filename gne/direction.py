@@ -52,7 +52,7 @@ def load_contrast(path: str | Path) -> tuple[ContrastSet, Validate]:
         try:
             re.compile(v["match"])
         except re.error as e:
-            raise GneError("BAD_CONTRAST", f"validate.match の正規表現が読めません: {e}") from e
+            raise GneError("BAD_CONTRAST", f"无法读取 validate.match 的正则表达式：{e}") from e
     return cs, Validate(list(v.get("prompts") or cs.user_prompts), v.get("match"), v.get("target"))
 
 
@@ -76,7 +76,7 @@ class DirectionSet:
 
     def unit(self, L: int) -> np.ndarray:
         if L not in self.raw:
-            raise GneError("BAD_DIRECTION", f"方向 {self.name} に層 {L} がありません(0〜{max(self.raw)})")
+            raise GneError("BAD_DIRECTION", f"方向 {self.name} 中没有第 {L} 层（0～{max(self.raw)}）")
         d = self.raw[L]
         n = float(np.linalg.norm(d))
         return d / n if n > 0 else d
@@ -104,7 +104,7 @@ def candidate_layers(n_layer: int, spec: str | list[int] | None = None) -> list[
         for part in str(spec).split(","):
             m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*(?::\s*(\d+))?)?\s*", part)
             if not m:
-                raise GneError("BAD_ARGS", f"層の指定 {spec!r} を読めません(例 10-24、10-24:2、12,16,20)")
+                raise GneError("BAD_ARGS", f"无法解析层指定 {spec!r}（例：10-24、10-24:2、12,16,20）")
             a, b, st = m.groups()
             Ls += list(range(int(a), int(b) + 1, int(st or 1))) if b else [int(a)]
     return sorted({L for L in Ls if 1 <= L < n_layer - 1})
@@ -157,14 +157,14 @@ def select_layer(session, ds: DirectionSet, cs: ContrastSet, val: Validate, *, m
     )
     from .evalx import _generate
     if mode not in ("ablate", "add"):
-        raise GneError("BAD_ARGS", "mode は ablate か add です")
+        raise GneError("BAD_ARGS", "mode 只能为 ablate 或 add")
     rx = re.compile(val.match, re.IGNORECASE) if val.match else None
     if rx is None and judge is None:
-        raise GneError("BAD_CONTRAST", "層を選ぶには対照集合の validate.match(判定の正規表現)か --judge-model が要ります")
+        raise GneError("BAD_CONTRAST", "选择层需要对照集的 validate.match（判定正则）或 --judge-model")
     e = session.engine
     Ls = [L for L in (layers or candidate_layers(e.n_layer)) if L in ds.raw]
     if not Ls:
-        raise GneError("BAD_ARGS", "候補の層がありません")
+        raise GneError("BAD_ARGS", "没有候选层")
     t0 = time.perf_counter()
     if mode == "ablate":
         gen_convs = [[{"role": "system", "content": cs.system_a}, {"role": "user", "content": u}] for u in val.prompts]
@@ -354,11 +354,11 @@ def behavior_null(session, cs: ContrastSet, val: Validate, recipe, *, random_con
     from .evalx import _generate
     from .when import parse_when
     if not val.match:
-        raise GneError("BAD_CONTRAST", "対照の効果を測るには対照集合の validate.match(判定の正規表現)が要ります")
+        raise GneError("BAD_CONTRAST", "测量对照效果需要对照集的 validate.match（判定正则）")
     rx = re.compile(val.match, re.IGNORECASE)
     mode = mode or ("ablate" if recipe.ablate is not None and not recipe.add_units else "add")
     if mode not in ("add", "ablate"):
-        raise GneError("BAD_ARGS", "mode は add か ablate です")
+        raise GneError("BAD_ARGS", "mode 只能为 add 或 ablate")
     ps = list(prompts) if prompts else list(val.prompts)
     n_rep = max(1, int(seeds)) if sampling is not None else 1
     if mode == "ablate":
@@ -458,7 +458,7 @@ def response_directions(session, cs: ContrastSet, *, max_tokens: int = 96, with_
             if progress:
                 progress(step, total, "direction: response")
     if not cnt["A"] or not cnt["B"]:
-        raise GneError("BAD_CONTRAST", "返事が生成されませんでした")
+        raise GneError("BAD_CONTRAST", "未生成回复")
     n = cnt["A"] + cnt["B"]
     dirs = {L: (sums["A"][L] / cnt["A"] - sums["B"][L] / cnt["B"]).astype(np.float32) for L in Ls}
     scale = {L: np.sqrt(np.maximum(sq[L] / n - ((sums["A"][L] + sums["B"][L]) / n) ** 2, 0)).astype(np.float32) for L in Ls}

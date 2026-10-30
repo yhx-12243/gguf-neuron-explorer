@@ -216,8 +216,8 @@ def steer_lens_layer(engine: Engine, weights, stats, L: int, *, neurons: np.ndar
         old = SteerLens.load(out)
         if SteerLens.config_key(old.config) != SteerLens.config_key(config):
             diff = sorted(k for k in config if json.dumps(old.config.get(k)) != json.dumps(config[k]))
-            raise GneError("LENS_MISMATCH", f"{Path(out).name} は別の条件で作られています({diff})",
-                           "同じ条件で続けるか、--no-resume で作り直してください(既存の結果は消えます)")
+            raise GneError("LENS_MISMATCH", f"{Path(out).name} 是在其他条件下生成的（{diff}）",
+                           "请用相同条件继续，或用 --no-resume 重新生成（现有结果会被删除）")
         res = old
     if res is None:
         res = SteerLens.empty(L, n_ff, config)
@@ -281,7 +281,7 @@ def merge_parts(paths: Sequence[str | Path], out: str | Path) -> SteerLens:
     key = SteerLens.config_key(base.config)
     for it in items[1:]:
         if it.layer != base.layer or SteerLens.config_key(it.config) != key:
-            raise GneError("LENS_MISMATCH", "結合する steer lens の層か条件が違います")
+            raise GneError("LENS_MISMATCH", "待合并的 steer lens 层或条件不同")
     res = SteerLens.empty(base.layer, base.n_ff, base.config)
     for it in items:
         m, c = it.done, it.ctrl_done

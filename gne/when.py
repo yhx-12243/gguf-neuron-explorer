@@ -51,12 +51,12 @@ def parse_when(spec: str | None) -> When:
         return When(s)
     if s.startswith("after:"):
         if not s[6:]:
-            raise GneError("BAD_ARGS", "after: の後に文字列が要ります", "例: --when 'after:結論:'")
+            raise GneError("BAD_ARGS", "after: 后需要字符串", "例：--when 'after:结论:'")
         return When("after", text=s[6:])
     m = _RAMP.match(s)
     if m:
         return When("ramp", a=float(m.group(1)), b=float(m.group(2)))
-    raise GneError("BAD_ARGS", f"when={spec!r} は読めません", "all / gen / assistant / skip-replies / after:<文字列> / ramp:<a>-<b>")
+    raise GneError("BAD_ARGS", f"无法解析 when={spec!r}", "all / gen / assistant / skip-replies after:<字符串> / ramp:<a>-<b>")
 
 
 def chat_segments(e: Engine, messages: list[dict]) -> tuple[list[int], list[tuple[int, int, bool]]]:
@@ -147,7 +147,7 @@ def generate_when(e: Engine, ctx, messages: list[dict], vectors: dict[int, np.nd
             try:
                 e.set_cvec(ctx, v)
             except ValueError as ex:
-                raise GneError("BAD_RECIPE", str(ex), "ブロック 0 は control vector で操作できません(bake なら可)") from ex
+                raise GneError("BAD_RECIPE", str(ex), "无法用 control vector 操作第 0 块（bake 可以）") from ex
             state["cur"] = v
             info["set_cvec"] += 1
 
@@ -162,8 +162,8 @@ def generate_when(e: Engine, ctx, messages: list[dict], vectors: dict[int, np.nd
         ban = e.audio_out_tokens() or None
         info["audio_in"] = sum(1 for t in ids if t < 0)          # 音声の区間のトークン数
     if len(ids) + max_tokens > e.n_ctx:
-        raise GneError("CONTEXT_FULL", f"会話が長すぎます({len(ids)} トークン、n_ctx {e.n_ctx})",
-                       "会話をやり直すか、max_tokens を減らしてください")
+        raise GneError("CONTEXT_FULL", f"对话过长（{len(ids)} 个 token，n_ctx 为 {e.n_ctx}）",
+                       "请重开对话或减少 max_tokens")
     e.clear_memory(ctx)
     schedule = None
     if lora:

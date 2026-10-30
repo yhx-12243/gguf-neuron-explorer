@@ -62,10 +62,10 @@ class FastGGUF:
         self._mm = np.memmap(self.path, mode="r")
         buf = memoryview(self._mm)
         if bytes(buf[:4]) != b"GGUF":
-            raise ValueError(f"{self.path}: GGUF ではありません")
+            raise ValueError(f"{self.path}: 不是 GGUF 文件")
         version, = struct.unpack_from("<I", buf, 4)
         if version not in (2, 3):
-            raise ValueError(f"{self.path}: 未対応の GGUF バージョン {version}(ビッグエンディアンの可能性)")
+            raise ValueError(f"{self.path}: 不支持的 GGUF 版本 {version}（可能是大端格式）")
         n_tensors, n_kv = struct.unpack_from("<QQ", buf, 8)
         self.values: dict[str, object] = {}
         self.types: dict[str, tuple[GGUFValueType, GGUFValueType | None]] = {}
@@ -84,7 +84,7 @@ class FastGGUF:
                 if etype == GGUFValueType.STRING:
                     off = self._skip_strings(buf, off, count)
                 elif etype == GGUFValueType.ARRAY:
-                    raise ValueError(f"{key}: 入れ子の配列には対応していません")
+                    raise ValueError(f"{key}: 不支持嵌套数组")
                 else:
                     size = np.dtype(_NP[etype]).itemsize * count
                     if count <= _SMALL_ARRAY:

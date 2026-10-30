@@ -132,11 +132,11 @@ def submit(session, kind: str, params: dict, *, workers: str | list[str] = "auto
         known = {w["name"]: w for w in list_workers(root, alive_only=False)}
         bad = [n for n in names if n in known and known[n].get("model_id") != session.meta.model_id]
         if bad:
-            raise GneError("WORKER_MISMATCH", f"ワーカー {', '.join(bad)} は別のモデルを載せています",
-                           f"このモデル({session.meta.model_id})を載せたワーカーに投げてください")
+            raise GneError("WORKER_MISMATCH", f"工作进程 {', '.join(bad)} 加载的是其他模型",
+                           f"请提交给加载此模型（{session.meta.model_id}）的工作进程")
     if not names:
-        raise GneError("NO_WORKERS", f"このモデル({session.meta.model_id})を載せた生きているワーカーがありません",
-                       "gne worker -m <model> --name <名前> を先に起動してください")
+        raise GneError("NO_WORKERS", f"没有加载此模型（{session.meta.model_id}）的存活工作进程",
+                       "请先启动 gne worker -m <model> --name <名称>")
     group = uuid.uuid4().hex[:8]
     jd = _jobs_dir(root)
     plist = split_params(session, kind, params, names) if kind in SPLITTABLE and len(names) > 1 else [dict(params)]
@@ -178,7 +178,7 @@ def wait(root: Path, group: str, *, poll: float = 2.0, timeout: float | None = N
         if js and all(j["status"] in ("done", "error", "cancelled") for j in js):
             return js
         if timeout is not None and time.monotonic() - t0 > timeout:
-            raise GneError("TIMEOUT", f"ジョブ {group} が {timeout:.0f} 秒で終わりませんでした")
+            raise GneError("TIMEOUT", f"任务 {group} 未能在 {timeout:.0f} 秒内完成")
         time.sleep(poll)
 
 
@@ -294,7 +294,7 @@ def run_worker(session, name: str, *, poll: float = 2.0, once: bool = False, max
             time.sleep(poll)
             continue
         if log:
-            log(f"{name}: {d['kind']} {d['id']} を開始")
+            log(f"{name}: 开始 {d['kind']} {d['id']}")
         heartbeat(root, name, session, status="busy", job=d["id"], info=info)
         d = run_job(session, d, name=name)
         n += 1

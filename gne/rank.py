@@ -23,7 +23,7 @@ def rollout_words(rec: dict, word_unit: str, token_words: Sequence[str | None] |
     if word_unit == "regex":
         return set(_REGEX.findall(rec["text"].casefold()))
     if token_words is None:
-        raise ValueError("word_unit=tokens には語彙(token_words)が要ります")
+            raise ValueError("word_unit=tokens 需要词表（token_words）")
     ids = rec["token_ids"][:-1] if rec.get("finish") == "eog" else rec["token_ids"]
     return {w for w in (token_words[t] for t in ids if 0 <= t < len(token_words)) if w}
 

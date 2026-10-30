@@ -36,17 +36,17 @@ def _part_audio(part: dict) -> bytes:
     if a.get("path"):
         p = Path(a["path"]).expanduser()
         if not p.exists():
-            raise GneError("BAD_ARGS", f"音声ファイルがありません: {p}")
+            raise GneError("BAD_ARGS", f"找不到音频文件：{p}")
         return p.read_bytes()
     data = a.get("data")
     if not data:
-        raise GneError("BAD_ARGS", "input_audio に data か path が要ります")
+        raise GneError("BAD_ARGS", "input_audio 需要 data 或 path")
     if data.startswith("data:"):
         data = data.split(",", 1)[-1]
     try:
         return base64.b64decode(data, validate=False)
     except ValueError as ex:
-        raise GneError("BAD_ARGS", f"input_audio の data が base64 として読めません: {ex}") from ex
+        raise GneError("BAD_ARGS", f"input_audio 的 data 无法按 base64 读取：{ex}") from ex
 
 
 def split_content(content) -> tuple[str, list[bytes]]:
@@ -67,8 +67,8 @@ def split_content(content) -> tuple[str, list[bytes]]:
         elif isinstance(p, dict) and p.get("type") in (None, "text"):
             text.append(p.get("text") or "")
         else:
-            raise GneError("BAD_ARGS", f"読めない content の部品です: {p.get('type') if isinstance(p, dict) else p!r}",
-                           "text か input_audio")
+            raise GneError("BAD_ARGS", f"无法识别 content 部件：{p.get('type') if isinstance(p, dict) else p!r}",
+                           "应为 text 或 input_audio")
     return "".join(text), audios
 
 
@@ -105,7 +105,7 @@ def http_content(content):
         if p.get("type") in AUDIO_PARTS:
             a = p.get("input_audio") or p.get("audio")
             if not isinstance(a, dict) or not a.get("data"):
-                raise GneError("BAD_ARGS", "input_audio には data(base64)が要ります", "path はこの API では使えません")
+                raise GneError("BAD_ARGS", "input_audio 需要 data（base64）", "此 API 不能使用 path")
             parts.append({"type": "input_audio", "input_audio": {"data": a["data"]}})
         elif p.get("type") in (None, "text"):
             parts.append({"type": "text", "text": p.get("text") or ""})
@@ -146,13 +146,13 @@ class Media:
         p.n_threads = engine.n_threads
         self.ctx = M.mtmd_init_from_file(str(mmproj).encode(), engine.model, p)
         if not self.ctx:
-            raise GneError("BAD_MMPROJ", f"mmproj を読み込めません: {mmproj}", "モデルに合う mmproj-*.gguf を --mmproj で渡してください")
+            raise GneError("BAD_MMPROJ", f"无法加载 mmproj：{mmproj}", "请通过 --mmproj 传入与模型匹配的 mmproj-*.gguf")
         if not M.mtmd_support_audio(self.ctx):
             self.close()
-            raise GneError("NO_AUDIO", f"{mmproj.name} は音声のエンコーダを持っていません")
+            raise GneError("NO_AUDIO", f"{mmproj.name} 不包含音频编码器")
         if M.mtmd_decode_use_mrope(self.ctx):
             self.close()
-            raise GneError("UNSUPPORTED", "M-RoPE の位置を使うモデルの音声入力は、まだ扱えません")
+            raise GneError("UNSUPPORTED", "使用 M-RoPE 位置的模型暂不支持音频输入")
         self.n_embd = C.llama_model_n_embd_inp(engine.model)
         self.sample_rate = M.mtmd_get_audio_sample_rate(self.ctx)
         self._rows: dict[int, tuple[np.ndarray, int, bool]] = {}     # 負の番号 → (埋め込み, 行, 非因果か)
@@ -174,7 +174,7 @@ class Media:
                 buf = (ctypes.c_uint8 * len(a)).from_buffer_copy(a)
                 bm = M.mtmd_helper_bitmap_init_from_buf(self.ctx, buf, len(a), False)
                 if not bm or not M.mtmd_bitmap_is_audio(bm):
-                    raise GneError("BAD_AUDIO", "音声として読めません(wav / mp3 / flac)")
+                    raise GneError("BAD_AUDIO", "无法作为音频读取（wav / mp3 / flac）")
                 bms.append(bm)
             chunks = M.mtmd_input_chunks_init()
             try:
@@ -183,8 +183,8 @@ class Media:
                 arr = (M.mtmd_bitmap_p_ctypes * max(1, len(bms)))(*bms)
                 rc = M.mtmd_tokenize(self.ctx, chunks, ctypes.byref(it), arr, len(bms))
                 if rc != 0:
-                    raise GneError("BAD_AUDIO", f"音声の入ったプロンプトをトークンにできません (rc={rc})",
-                                   "音声の部品の数と、プロンプトの音声の位置の数が合っているか")
+                    raise GneError("BAD_AUDIO", f"无法将包含音频的提示词转换为 token（rc={rc}）",
+                                   "请确认音频部件数量与提示词中音频位置的数量一致")
                 ids: list[int] = []
                 k = 0
                 for i in range(M.mtmd_input_chunks_size(chunks)):
@@ -211,7 +211,7 @@ class Media:
         M = self.M
         n = M.mtmd_input_chunk_get_n_tokens(ch)
         if M.mtmd_encode_chunk(self.ctx, ch) != 0:
-            raise GneError("BAD_AUDIO", "音声のエンコードに失敗しました")
+            raise GneError("BAD_AUDIO", "音频编码失败")
         emb = np.ctypeslib.as_array(M.mtmd_get_output_embd(self.ctx), shape=(n * self.n_embd,))
         emb = emb.reshape(n, self.n_embd).astype(np.float32, copy=True)
         nc = bool(M.mtmd_decode_use_non_causal(self.ctx, ch))
@@ -229,5 +229,5 @@ class Media:
         try:
             emb, j, nc = self._rows[tok]
         except KeyError:
-            raise GneError("INTERNAL", f"音声の置き場所 {tok} の埋め込みがありません(古い音声を忘れた後か)") from None
+            raise GneError("INTERNAL", f"找不到音频占位 {tok} 的嵌入（可能是在忘记旧音频之后）") from None
         return emb[j], nc

@@ -1,9 +1,9 @@
-"""`--json` 出力のスキーマ。設計書 §6.13 (a)、V10。
+"""`--json` 输出的 schema。设计文档 §6.13 (a)、V10。
 
-規約:
-- stdout には JSON だけを出す。最後の行が結果のオブジェクト。長い処理はその前に進捗を JSONL で 1 行ずつ出す。
-- すべての出力に schema_version, command, model_id, llama_cpp_version, seed, generated_at を含める。
-- 失敗は非ゼロ終了 + {"error": {"code", "message", "hint"}}(エンベロープ付き)。
+约定：
+- stdout 只输出 JSON。最后一行是结果对象。长时间处理会在此之前以 JSONL 每行一条输出进度。
+- 所有输出都包含 schema_version, command, model_id, llama_cpp_version, seed, generated_at。
+- 失败时以非零状态退出 + {"error": {"code", "message", "hint"}}（带 envelope）。
 """
 
 from __future__ import annotations

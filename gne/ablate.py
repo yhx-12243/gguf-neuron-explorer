@@ -77,15 +77,15 @@ def writer_info(weights) -> dict:
                     if weights.has_tensor(n.replace(".weight", ".bias")))
     warn = []
     if m.n_expert:
-        warn.append("MoE の ffn_down_exps は bake でだけ射影できます(LoRA は未対応)")
+        warn.append("MoE 的 ffn_down_exps 只能用 bake 投影消除（不支持 LoRA）")
     if m.arch in t.get("post_norm", []) or m.has_post_ffn_norm:
-        warn.append(f"{m.arch} は post-norm(ライターの出力が norm を通ってから残差に足される)ので、射影消去は近似です")
+        warn.append(f"{m.arch} 是 post-norm（写入器输出先经过 norm 再加入残差），因此投影消除只是近似")
     if m.arch not in t.get("verified", []):
-        warn.append(f"{m.arch} の残差ライターはグラフを読んで確かめていません(テンソル名で推定)")
+        warn.append(f"尚未通过计算图确认 {m.arch} 的残差写入器（仅根据张量名推断）")
     if biases:
-        warn.append(f"ライターのバイアス {len(biases)} 個は LoRA では射影できません(bake では射影する)")
+        warn.append(f"写入器的 {len(biases)} 个偏置无法用 LoRA 投影（bake 会投影）")
     if not embed_in_lora(weights):
-        warn.append("出力層が埋め込みと共有(tied)なので、LoRA では埋め込みの r 成分が残ります(bake なら消せる)")
+        warn.append("输出层与嵌入共享（tied），因此 LoRA 中会残留嵌入的 r 分量（bake 可以消除）")
     return {"verified": m.arch in t.get("verified", []), "post_norm": m.arch in t.get("post_norm", []),
             "counts": counts, "n_layers": len(ws), "biases": biases[:8], "embed_in_lora": embed_in_lora(weights),
             "warnings": warn, "checked_llama_cpp": t.get("checked_llama_cpp")}
@@ -95,7 +95,7 @@ def unit(r: np.ndarray) -> np.ndarray:
     r = np.asarray(r, dtype=np.float64).reshape(-1)
     n = float(np.linalg.norm(r))
     if n == 0:
-        raise GneError("BAD_DIRECTION", "方向の長さが 0 です")
+        raise GneError("BAD_DIRECTION", "方向长度为零")
     return (r / n).astype(np.float32)
 
 
@@ -119,7 +119,7 @@ def layer_list(spec: str | list[int] | None) -> list[int] | None:
     for part in str(spec).split(","):
         m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*(?::\s*(\d+))?)?\s*", part)
         if not m:
-            raise GneError("BAD_ARGS", f"層の指定 {spec!r} を読めません(例 all、10-40、10-40:2、1,5,9-12)")
+            raise GneError("BAD_ARGS", f"无法解析层指定 {spec!r}（例：all、10-40、10-40:2、1,5,9-12）")
         a, b, st = m.groups()
         out |= set(range(int(a), int(b) + 1, int(st or 1))) if b else {int(a)}
     return sorted(out)
@@ -143,10 +143,10 @@ def projection_rows(weights, R: np.ndarray, *, layers: list[int] | None = None,
     (ライターを 1 つずつ dequantize するので、層選びで候補が多くても重みを読むのは 1 回)。"""
     m = weights.meta
     if m.n_expert:
-        raise GneError("ARCH_UNSUPPORTED", "MoE の射影消去は LoRA では未対応です(gne ablate --bake を使ってください)")
+        raise GneError("ARCH_UNSUPPORTED", "MoE 的投影消除不支持 LoRA（请使用 gne ablate --bake）")
     R = np.atleast_2d(np.asarray(R, dtype=np.float32))
     if R.shape[1] != m.n_embd:
-        raise GneError("BAD_DIRECTION", f"方向の長さ {R.shape[1]} が n_embd={m.n_embd} と違います")
+        raise GneError("BAD_DIRECTION", f"方向长度 {R.shape[1]} 与 n_embd={m.n_embd} 不同")
     ws = residual_writers(weights)
     Ls = [L for L in _select_layers(weights, layers)]
     out: dict[str, np.ndarray] = {}
@@ -154,7 +154,7 @@ def projection_rows(weights, R: np.ndarray, *, layers: list[int] | None = None,
         for name in ws[L]:
             W = tensor_to_f32(weights.tensor(name))
             if W.ndim != 2 or W.shape[0] != m.n_embd:
-                raise GneError("ARCH_UNSUPPORTED", f"{name} の形状 {W.shape} は (n_embd, in) ではありません")
+                raise GneError("ARCH_UNSUPPORTED", f"{name} 的形状 {W.shape} 不是 (n_embd, in)")
             out[name] = R @ W
         if progress:
             progress(i + 1, len(Ls), "ablate: rᵀW")
@@ -187,7 +187,7 @@ def write_ablation_lora(weights, rs: dict[str, np.ndarray], rows: dict[str, np.n
     w.add_key_value("gne.source_model_id", m.model_id, GGUFValueType.STRING)
     if embed is not None:
         if not embed_in_lora(weights):
-            raise GneError("BAD_ARGS", "出力層が埋め込みと共有(tied)のモデルでは、LoRA に埋め込みを入れられません")
+            raise GneError("BAD_ARGS", "输出层与嵌入共享（tied）的模型无法将嵌入写入 LoRA")
         ea, er = embed
         w.add_tensor("token_embd.weight.lora_a", np.asarray(ea, dtype=np.float32).reshape(-1, 1))
         w.add_tensor("token_embd.weight.lora_b", (-scale * np.asarray(er, dtype=np.float32)).reshape(-1, 1))
@@ -219,7 +219,7 @@ def export_ablation_lora(weights, r: np.ndarray | dict[int, np.ndarray], path: s
                 progress(i + 1, len(Ls), "ablate: rᵀW")
         emb = None
         if embed:
-            warnings.append("層ごとの方向(--per-layer)では埋め込みは射影しません")
+            warnings.append("使用逐层方向（--per-layer）时不会投影嵌入")
     else:
         ru = unit(r)
         part = projection_rows(weights, ru[None, :], layers=Ls, progress=progress)
@@ -229,7 +229,7 @@ def export_ablation_lora(weights, r: np.ndarray | dict[int, np.ndarray], path: s
         if embed and embed_in_lora(weights):
             emb = (embed_projection(weights, ru[None, :])[:, 0], ru)
         elif embed:
-            warnings.append("出力層が埋め込みと共有(tied)なので、LoRA には埋め込みを入れていません(r 成分が埋め込みの分だけ残る)")
+            warnings.append("输出层与嵌入共享（tied），因此未将嵌入写入 LoRA（嵌入部分会残留 r 分量）")
     rep = write_ablation_lora(weights, rs, rows, path, meta={**(meta or {}), "layers": Ls}, scale=scale, embed=emb)
     return {**rep, "layers": Ls, "scale": scale, "warnings": warnings}
 
@@ -246,7 +246,7 @@ def _project(W: np.ndarray, r: np.ndarray, s: float, axis: int) -> np.ndarray:
     elif W.ndim == 3 and axis == 1:
         W -= s * np.einsum("i,ej->eij", r, np.einsum("i,eij->ej", r, W))
     else:
-        raise GneError("ARCH_UNSUPPORTED", f"形状 {W.shape} の軸 {axis} は射影できません")
+        raise GneError("ARCH_UNSUPPORTED", f"形状 {W.shape} 的轴 {axis} 无法投影")
     return W
 
 
@@ -255,7 +255,7 @@ def _encode(W: np.ndarray, requant: str):
         return W.astype(np.float16), GGMLQuantizationType.F16
     if requant == "q8_0":
         return gquants.quantize(W, GGMLQuantizationType.Q8_0), GGMLQuantizationType.Q8_0
-    raise GneError("BAD_ARGS", "--requant は q8_0 か f16 です")
+    raise GneError("BAD_ARGS", "--requant 只能为 q8_0 或 f16")
 
 
 def _moe_writers(weights, Ls: list[int]) -> dict[str, int]:
@@ -274,7 +274,7 @@ def bake_ablation_gguf(weights, r: np.ndarray | dict[int, np.ndarray], dst: str 
     """ライター(と埋め込み)から r を射影した GGUF を書く。書き換えたテンソルだけ Q8_0 か F16 にし、他は生バイトのまま写す。
     大きなモデルでもメモリに載せるのは 1 テンソルずつ(書く直前に dequantize → 射影 → 量子化)。"""
     if Path(weights.path).resolve() == Path(dst).resolve():
-        raise GneError("BAD_ARGS", "--in と --out が同じファイルです")
+        raise GneError("BAD_ARGS", "--in 与 --out 指向同一文件")
     _encode(np.zeros((1, 32), np.float32), requant)                  # 型の誤りを先に返す
     Ls = _select_layers(weights, layers)
     ws = residual_writers(weights)
@@ -344,7 +344,7 @@ def bake_ablation_gguf(weights, r: np.ndarray | dict[int, np.ndarray], dst: str 
     w.close()
     return {"path": str(dst), "modified": modified, "n_modified": len(modified), "layers": Ls, "scale": scale,
             "embed": embed, "requant": requant, "bytes": Path(dst).stat().st_size,
-            "warnings": (["出力層が埋め込みと共有(tied)なので、埋め込みの射影は出力層にも効きます"]
+            "warnings": (["输出层与嵌入共享（tied），因此嵌入投影也会作用于输出层"]
                          if embed and weights.meta.tied_output else [])}
 
 
@@ -388,16 +388,16 @@ def bake_via_f16(weights, r, dst: str | Path, *, layers=None, scale: float = 1.0
     """書き換えるテンソルを F16 で書いた中間の GGUF を作り、llama-quantize で元の量子化型に戻す。"""
     lq = find_llama_quantize(llama_quantize)
     if lq is None:
-        raise GneError("TOOL_NOT_FOUND", "llama-quantize が見つかりません",
-                       "--llama-quantize でパスを渡すか、環境変数 GNE_LLAMA_QUANTIZE を設定してください")
+        raise GneError("TOOL_NOT_FOUND", "找不到 llama-quantize",
+                       "请用 --llama-quantize 传入路径，或设置环境变量 GNE_LLAMA_QUANTIZE")
     # llama-quantize は、目標の型が IQ1 / IQ2 / IQ3_XXS のテンソルが 1 つでもあれば(写すだけのテンソルでも)imatrix を求める
     # (src/llama-quant.cpp の前処理。埋め込みと出力層は除く)
     need = sorted({t.tensor_type.name for t in weights.reader.tensors if t.name.endswith(".weight")
                    and t.name not in ("token_embd.weight", "output.weight")} & _NEEDS_IMATRIX)
     if need and not imatrix:
-        raise GneError("NEEDS_IMATRIX", f"このモデルには {', '.join(need)} のテンソルがあり、llama-quantize は imatrix が無いと"
-                       "書き出しません(写すだけのテンソルでも)",
-                       "元のモデルを作ったときの imatrix を --imatrix で渡すか、--requant q8_0 を使ってください")
+        raise GneError("NEEDS_IMATRIX", f"此模型包含 {', '.join(need)} 张量，llama-quantize 在没有 imatrix 时不会导出"
+                       "（即使只是原样复制的张量也需要）",
+                       "请用 --imatrix 传入制作原模型时的 imatrix，或使用 --requant q8_0")
     dst = Path(dst)
     mid = dst.with_name(dst.name + ".f16.part")
     rep = bake_ablation_gguf(weights, r, mid, layers=layers, scale=scale, embed=embed, requant="f16", meta=meta,
@@ -414,7 +414,7 @@ def bake_via_f16(weights, r, dst: str | Path, *, layers=None, scale: float = 1.0
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if p.returncode != 0:
-            raise GneError("TOOL_FAILED", f"llama-quantize が失敗しました(rc={p.returncode})", (p.stderr or p.stdout)[-800:])
+            raise GneError("TOOL_FAILED", f"llama-quantize 失败（rc={p.returncode}）", (p.stderr or p.stdout)[-800:])
     finally:
         tt.unlink(missing_ok=True)
         if not keep_f16:

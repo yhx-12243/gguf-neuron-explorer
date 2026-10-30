@@ -164,7 +164,7 @@ def test_bias_support_table():
     assert bias_support("llama")[0] == "add"
     assert bias_support("gpt2")[0] == "existing"
     assert bias_support("qwen3")[0] is None and bias_support("qwen35")[0] is None
-    assert bias_support("refact")[0] is None and "使わない" in bias_support("refact")[1]
+    assert bias_support("refact")[0] is None and "ffn_down.bias" in bias_support("refact")[1]
 
 
 def test_bake_adds_bias_and_copies_everything_else(tiny, tmp_path):

@@ -43,7 +43,7 @@ class AttnCapture:
 def kv_group(h: int, n_head: int, n_head_kv: int) -> int:
     """GQA: Q ヘッド h が使う K/V のグループ(llama.cpp は連続する n_head / n_head_kv 個の Q ヘッドが 1 つの K/V を共有)。"""
     if n_head_kv <= 0 or n_head % n_head_kv:
-        raise GneError("ARCH_UNSUPPORTED", f"n_head {n_head} が n_head_kv {n_head_kv} で割り切れません")
+        raise GneError("ARCH_UNSUPPORTED", f"n_head {n_head} 不能被 n_head_kv {n_head_kv} 整除")
     return h // (n_head // n_head_kv)
 
 
@@ -155,9 +155,9 @@ def capture_attention(session, convs: Sequence[list[dict] | str | list[int]], *,
         else:
             ids = e.tokenize_prompt(e.render_chat(list(c)))
         if len(ids) > e.probe_ubatch:
-            raise GneError("BAD_ARGS", f"{len(ids)} トークンは attention の捕捉の上限 {e.probe_ubatch} を超えています(短くしてください)")
+            raise GneError("BAD_ARGS", f"{len(ids)} 个 token 超过 attention 捕获上限 {e.probe_ubatch}（请缩短）")
         if len(ids) < 2:
-            raise GneError("BAD_ARGS", "文章が短すぎます(2 トークン以上)")
+            raise GneError("BAD_ARGS", "文本太短（至少需要 2 个 token）")
         ids_list.append(ids)
     arch = w.arch
     Ls = [L for L in (range(e.n_layer) if layers is None else layers) if arch.layers[L].head_dim]
@@ -171,7 +171,7 @@ def capture_attention(session, convs: Sequence[list[dict] | str | list[int]], *,
         for L in Ls:
             if arch.layers[L].mixer == "attention":
                 if f"kq_soft_max-{L}" not in names:
-                    raise GneError("ARCH_UNSUPPORTED", f"kq_soft_max-{L} が見えません(flash attention が切れていない可能性)")
+                    raise GneError("ARCH_UNSUPPORTED", f"看不到 kq_soft_max-{L}（可能尚未关闭 flash attention）")
                 want[f"kq_soft_max-{L}"] = (L, "pattern")
     if want_qkv:
         for L in Ls:
@@ -205,11 +205,11 @@ def capture_attention(session, convs: Sequence[list[dict] | str | list[int]], *,
                 if what == "pattern":
                     nh = li.n_head
                     if a.shape[0] != nh * T:
-                        raise GneError("ARCH_UNSUPPORTED", f"{nm} の形 {a.shape} が (n_head·T, n_kv) = ({nh}·{T}, …) と違います")
+                        raise GneError("ARCH_UNSUPPORTED", f"{nm} 的形状 {a.shape} 与 (n_head·T, n_kv) = ({nh}·{T}, …) 不符")
                     ac.pattern[L] = a.reshape(nh, T, a.shape[1])[:, :, :T]
                 elif what == "head_out":
                     if a.shape != (T, li.n_head * li.head_dim):
-                        raise GneError("ARCH_UNSUPPORTED", f"{nm} の形 {a.shape} が (T, n_head·head_dim) と違います")
+                        raise GneError("ARCH_UNSUPPORTED", f"{nm} 的形状 {a.shape} 与 (T, n_head·head_dim) 不符")
                     ac.head_out[L] = a.reshape(T, li.n_head, li.head_dim)
                 else:
                     # 2 次元 (T, n·hd) でも 3 次元 [hd, n, T](行 = n·T)でも、並びは (T, n, hd)
@@ -279,7 +279,7 @@ def check_head_gain(session, L: int, h: int, *, ks: Sequence[float] = (0.0, 2.0,
     names = _names(e, probe, ctx, e.tokenize(text, add_special=True, parse_special=False)[:16])
     out_name = writer_out_name(session, names, L)
     if out_name is None:
-        raise GneError("ARCH_UNSUPPORTED", f"層 {L} の書き込み行列の出力が捕捉できません")
+        raise GneError("ARCH_UNSUPPORTED", f"无法捕获第 {L} 层的写入矩阵输出")
     Ls = [x for x in range(L + 1) if w.arch.layers[x].head_dim]
     base = capture_attention(session, [text], layers=Ls, want_pattern=False, extra=[out_name])[0]
     Wb = w.head_write_matrix(L, h)                                   # (n_embd, head_dim)

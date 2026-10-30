@@ -39,7 +39,7 @@ def run_bench(engine: Engine, *, layer: int | None = None, reps: int = 10, gen_t
     rng = np.random.default_rng(seed)
     seqs = [e.tokenize(t)[:seq_tokens] for t in (_TEXTS * n_seq)[:n_seq]]
     if any(len(s) < seq_tokens for s in seqs):
-        raise RuntimeError("ベンチ用の文が短すぎます")
+        raise RuntimeError("基准测试文本过短")
     ctx = e.steer_ctx()
 
     def vec() -> dict[int, np.ndarray]:
@@ -134,20 +134,20 @@ def run_bench(engine: Engine, *, layer: int | None = None, reps: int = 10, gen_t
 def bench_markdown(r: dict) -> str:
     g = r["gen"]
     return "\n".join([
-        f"### {r['model']}(層 L{r['layer']}、{r['gpu']}、llama-cpp-python {r['llama_cpp_python']}、n_ctx {r['n_ctx']}、各 {r['reps']} 回の中央値)",
+        f"### {r['model']}（第 L{r['layer']} 层、{r['gpu']}、llama-cpp-python {r['llama_cpp_python']}、n_ctx {r['n_ctx']}、各 {r['reps']} 次中位数）",
         "",
-        "| 処理 | 時間 |",
+        "| 操作 | 时间 |",
         "|---|---|",
-        f"| prefill {r['n_seq']} seq × {r['seq_tokens']} tok(cvec 変更なし) | {r['prefill_ms']:.1f} ms |",
-        f"| `set_cvec` の呼び出しだけ | {r['set_cvec_call_ms']:.2f} ms |",
-        f"| `set_cvec` 直後の prefill(グラフ再予約込み) | {r['prefill_after_set_ms']:.1f} ms |",
-        f"| → 再予約の上乗せ | {r['reserve_ms']:.1f} ms |",
-        f"| `set_cvec` + prefill 合計 | {r['set_plus_prefill_ms']:.1f} ms |",
-        f"| 層範囲を 1..n_layer-1 に固定した `set_cvec` 直後の prefill | {r['prefill_after_set_fixed_ms']:.1f} ms |",
-        f"| decode 1 step({r['n_seq']} seq) | {r['decode_step_ms']:.1f} ms |",
-        f"| 生成 {r['gen_tokens']} tok × {g['batch']['n_seq']} seq | {g['batch']['ms']:.0f} ms({g['batch']['tok_per_s']:.0f} tok/s) |",
-        f"| 生成 {r['gen_tokens']} tok × 1 seq | {g['single']['ms']:.0f} ms({g['single']['tok_per_s']:.0f} tok/s) |",
-        f"| probe ctx prefill {r['probe_tokens']} tok(捕捉なし / 全層 l_out / 全層 FFN 活性) | "
+        f"| prefill {r['n_seq']} seq × {r['seq_tokens']} tok（cvec 不变） | {r['prefill_ms']:.1f} ms |",
+        f"| 仅调用 `set_cvec` | {r['set_cvec_call_ms']:.2f} ms |",
+        f"| `set_cvec` 后立即 prefill（含计算图重新预留） | {r['prefill_after_set_ms']:.1f} ms |",
+        f"| → 重新预留的额外开销 | {r['reserve_ms']:.1f} ms |",
+        f"| `set_cvec` + prefill 合计 | {r['set_plus_prefill_ms']:.1f} ms |",
+        f"| 层范围固定为 1..n_layer-1 后立即 `set_cvec` 的 prefill | {r['prefill_after_set_fixed_ms']:.1f} ms |",
+        f"| decode 1 步（{r['n_seq']} seq） | {r['decode_step_ms']:.1f} ms |",
+        f"| 生成 {r['gen_tokens']} tok × {g['batch']['n_seq']} seq | {g['batch']['ms']:.0f} ms（{g['batch']['tok_per_s']:.0f} tok/s） |",
+        f"| 生成 {r['gen_tokens']} tok × 1 seq | {g['single']['ms']:.0f} ms（{g['single']['tok_per_s']:.0f} tok/s） |",
+        f"| probe ctx prefill {r['probe_tokens']} tok（不捕获 / 全层 l_out / 全层 FFN 激活值） | "
         f"{r['probe_prefill_512_ms']['none']:.1f} / {r['probe_prefill_512_ms']['all_l_out']:.1f} / "
         f"{r['probe_prefill_512_ms']['all_ffn_act']:.1f} ms |",
         "",

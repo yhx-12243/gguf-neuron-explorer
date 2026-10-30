@@ -143,7 +143,7 @@ def neuron_dossier(session, L: int, n: int, *, rollouts: int = 4, compute: bool 
     from .stats import ActStats
     m = session.meta
     if not 0 <= L < m.n_layer or not 0 <= n < session.weights.n_units(L):
-        raise GneError("BAD_ARGS", f"L{L} N{n} は範囲外です")
+        raise GneError("BAD_ARGS", f"L{L} N{n} 超出范围")
     tok = session._tok
     cov = {"sweep": False, "steer_lens": False, "logit_lens": False, "directions": False, "activation": False,
            "connections": False}
@@ -153,7 +153,7 @@ def neuron_dossier(session, L: int, n: int, *, rollouts: int = 4, compute: bool 
     if m.n_expert and session.weights.is_moe(L):                 # CHANGE-05: n は層の中の通し番号
         e, k = session.weights.moe_split(L, n)
         out.update(expert=e, expert_neuron=k, semantics="direction",
-                   address=f"L{L} E{e} N{k}", recipe_hint=f"{L}:E{e}:N{k}:x2(選ばれたときだけ効く gain)/ {L}:E{e}:N{k}:+0.8(方向押し)")
+                   address=f"L{L} E{e} N{k}", recipe_hint=f"{L}:E{e}:N{k}:x2（仅在选中专家时生效的 gain）/ {L}:E{e}:N{k}:+0.8（沿写入方向推动）")
 
     # sweep: その層の run のうち、このニューロンの rollout が一番多いもの
     best = None
@@ -275,7 +275,7 @@ def layer_summary(session, L: int, *, top: int = 20) -> dict:
     from .lens import LogitLens, SteerLens
     m = session.meta
     if not 0 <= L < m.n_layer:
-        raise GneError("BAD_ARGS", f"層 {L} は範囲外です")
+        raise GneError("BAD_ARGS", f"第 {L} 层超出范围")
     tok = session._tok
     resid = session.resid_stats()
     out: dict = {"layer": L, "rho": None, "steer_lens": None, "sweep": [], "logit_lens": None, "directions": []}
@@ -329,10 +329,10 @@ def search(session, q: str, *, mode: str = "lens", layer: int | None = None, lim
     """lens: steer lens / logit lens の上位語に q を含むニューロン。words: sweep の語。name: 付けた名前。"""
     from .lens import LogitLens, SteerLens
     if mode not in ("lens", "words", "name"):
-        raise GneError("BAD_ARGS", "mode は lens / words / name です")
+        raise GneError("BAD_ARGS", "mode 只能为 lens / words / name")
     qq = q.casefold().strip()
     if not qq:
-        raise GneError("BAD_ARGS", "検索語が空です")
+        raise GneError("BAD_ARGS", "搜索词为空")
     hits: dict[tuple[int, int], set[str]] = {}
     Ls = range(session.meta.n_layer) if layer is None else [layer]
     if mode == "lens":

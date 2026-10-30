@@ -60,7 +60,7 @@ def make_columns(recipe: Recipe | None, *, dose: float | None = None, left: Reci
                  right: Recipe | None = None, center: Recipe | None = None) -> list[Column]:
     """既定は [−レシピ, 無介入, +レシピ]。--left / --right / --center で任意のレシピに差し替えられる。"""
     if recipe is None and (left is None or right is None):
-        raise GneError("BAD_ARGS", "--recipe / --unit か、--left と --right の両方を指定してください")
+        raise GneError("BAD_ARGS", "请指定 --recipe / --unit，或同时指定 --left 和 --right")
 
     def label(r: Recipe | None, default: str) -> str:
         if r is None:
@@ -69,7 +69,7 @@ def make_columns(recipe: Recipe | None, *, dose: float | None = None, left: Reci
 
     lr = left if left is not None else _with_dose(recipe, dose, -1)
     rr = right if right is not None else _with_dose(recipe, dose, +1)
-    return [Column(label(lr, "−"), lr), Column(label(center, "0(無介入)"), center), Column(label(rr, "+"), rr)]
+    return [Column(label(lr, "−"), lr), Column(label(center, "0（无干预）"), center), Column(label(rr, "+"), rr)]
 
 
 def chat_turn(session, state: ChatState, user: str, *, max_tokens: int = 256,
@@ -87,8 +87,8 @@ def chat_turn(session, state: ChatState, user: str, *, max_tokens: int = 256,
         vecs = session.vectors(col.recipe)[0] if col.recipe is not None else None
         ids = e.tokenize_prompt(e.render_chat(state.messages(i)))
         if len(ids) + max_tokens > e.n_ctx:
-            raise GneError("CONTEXT_FULL", f"会話が長すぎます({len(ids)} トークン、n_ctx {e.n_ctx})",
-                           "--n-ctx を大きくするか、会話をやり直してください(/reset)")
+            raise GneError("CONTEXT_FULL", f"对话过长（{len(ids)} 个 token，n_ctx 为 {e.n_ctx}）",
+                           "请增大 --n-ctx，或重开对话（/reset）")
         if on_column:
             on_column(i, col)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")

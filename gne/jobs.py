@@ -117,7 +117,7 @@ def _sweep_rank(s, layer: int, **p) -> dict:
 def _eval(s, recipe: str | None = None, units: list[str] | None = None, dose_unit: str | None = None, **p) -> dict:
     """eval(§6.14)。recipe は保存したレシピの名前、units は単発指定(どちらか)。"""
     if bool(recipe) == bool(units):
-        raise GneError("BAD_ARGS", "recipe(名前)か units のどちらかを渡してください")
+        raise GneError("BAD_ARGS", "请传入 recipe（名称）或 units 其中之一")
     r = s.recipe(path=s.recipe_path(recipe)) if recipe else s.recipe(units=list(units), dose_unit=dose_unit)
     d = s.eval(r, **p)
     return {k: v for k, v in d.items() if k != "samples"}
@@ -160,7 +160,7 @@ class JobRunner:
 
     def start(self, kind: str, params: dict | None = None) -> Job:
         if kind not in self.kinds:
-            raise GneError("BAD_ARGS", f"ジョブの種類 {kind!r} はありません({', '.join(self.kinds)})")
+            raise GneError("BAD_ARGS", f"没有任务类型 {kind!r}（{', '.join(self.kinds)}）")
         from .estimate import NeedsConfirm, gate
         try:
             params, est = gate(self.session, kind, dict(params or {}))     # CHANGE-03 C: 予算と 30 分の確認
@@ -181,7 +181,7 @@ class JobRunner:
     def get(self, job_id: str) -> Job:
         job = self.jobs.get(job_id)
         if job is None:
-            raise GneError("BAD_ARGS", f"ジョブ {job_id} はありません")
+            raise GneError("BAD_ARGS", f"没有任务 {job_id}")
         return job
 
     def cancel(self, job_id: str) -> Job:

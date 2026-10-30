@@ -1,10 +1,10 @@
-"""Python API。設計書 §6.13 (c)。CLI はこの薄い皮。
+"""Python API。设计文档 §6.13 (c)。CLI 是它的薄封装。
 
     from gne.api import open_model
     with open_model("models/Qwen3.5-4B-Q8_0.gguf") as s:
         out = s.steer(["14:8949:+1.0", "13:7956:-1.0"], prompt="Who are you?")
 
-戻り値は --json と同じ形の dict(エンベロープ抜き)。エンベロープは envelope() で作る。
+返回值是与 --json 相同形式的 dict（不含 envelope）。envelope 由 envelope() 创建。
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class Session:
                  progress: Progress | None = None, mmproj: str | Path | None = None):
         self.path = Path(path)
         if not self.path.exists():
-            raise GneError("MODEL_NOT_FOUND", f"{self.path} がありません")
+            raise GneError("MODEL_NOT_FOUND", f"{self.path} 不存在")
         self.weights = Weights(self.path)
         self.meta = self.weights.meta
         self.store = Store(root)
@@ -72,7 +72,7 @@ class Session:
         tpl = template_override(self.meta.model_id, self.meta.arch)
         if tpl is not None:
             e.chat_template = tpl[1]
-            self.warn(f"チャットテンプレートを {tpl[0]} で上書きしました")
+            self.warn(f"已使用 {tpl[0]} 覆盖聊天模板")
         return e
 
     def close(self) -> None:
@@ -111,7 +111,7 @@ class Session:
                 e = self.engine
                 llama = {"ok": True, "n_layer": e.n_layer, "n_embd": e.n_embd, "n_vocab": e.n_vocab}
                 if e.n_layer != m.n_layer:
-                    self.warn(f"llama.cpp の n_layer {e.n_layer} と block_count {m.n_layer} が違います(MTP 層など)")
+                    self.warn(f"llama.cpp 的 n_layer {e.n_layer} 与 block_count {m.n_layer} 不一致（例如 MTP 层）")
             except Exception as ex:  # noqa: BLE001
                 llama = {"ok": False, "error": str(ex)}
         mode, reason, checked = bias_support(m.arch)
@@ -174,16 +174,16 @@ class Session:
         return self._resid
 
     def stats_view(self, recipe: Recipe | None = None, *, auto: bool = True) -> StatsView:
-        """レシピに要る統計を用意する。auto なら足りない統計を既定コーパスで計算する(対話的な確認はしない)。"""
+        """准备配方所需的统计。若 auto 为真，则用默认语料计算缺少的统计（不进行交互确认）。"""
         need_rel = recipe is None or recipe.dose_unit == "rel" or any(u.kind == "random" for u in recipe.units)
         resid = self.resid_stats()
         if recipe is not None and need_rel:
             missing = [u.layer for u in recipe.units if resid is None or u.layer not in resid.layers]
             if missing:
                 if not auto:
-                    raise GneError("STATS_MISSING", f"層 {sorted(set(missing))} の残差ノルム統計がありません",
-                                   "gne stats resid を先に実行してください")
-                self.warn("残差ノルム統計が無いので既定コーパスで計算しました(gne stats resid)")
+                    raise GneError("STATS_MISSING", f"第 {sorted(set(missing))} 层缺少残差范数统计",
+                                   "请先运行 gne stats resid")
+                self.warn("缺少残差范数统计，已用默认语料计算（gne stats resid）")
                 last = self.meta.n_layer - 1 in missing
                 if resid is None:
                     self.stats_resid()
@@ -197,8 +197,8 @@ class Session:
                               if not self.store.act_path(self.meta.model_id, u.layer).exists()})
             if missing:
                 if not auto:
-                    raise GneError("STATS_MISSING", f"層 {missing} の活性統計がありません", "gne stats act を先に実行してください")
-                self.warn(f"層 {missing} の活性統計が無いので既定コーパスで計算しました(gne stats act)")
+                    raise GneError("STATS_MISSING", f"第 {missing} 层缺少激活值统计", "请先运行 gne stats act")
+                self.warn(f"第 {missing} 层缺少激活值统计，已用默认语料计算（gne stats act）")
                 self.stats_act(layers=missing, include_last_layer=self.meta.n_layer - 1 in missing)
 
         def act_loader(L: int) -> ActStats | None:
@@ -212,18 +212,18 @@ class Session:
     def recipe(self, *, units: list[str] | None = None, path: str | Path | None = None,
                dose_unit: str | None = None, scale: float = 1.0, name: str | None = None,
                when: str | None = None, ablate: str | dict | None = None) -> Recipe:
-        """ablate は方向の射影消去(§6.17)。"NAME[@層][:倍率]" か {direction, scale, layers, from_layer}。
-        ablate だけ(ユニットなし)のレシピも作れる。"""
+        """ablate 表示方向的投影消除（§6.17）。格式为 "NAME[@层][:倍率]" 或 {direction, scale, layers, from_layer}。
+        也可以创建仅含 ablate（不含单元）的配方。"""
         from .steer import AblateSpec
         if units and path:
-            raise GneError("BAD_ARGS", "--recipe か --unit のどちらか一方を指定してください")
+            raise GneError("BAD_ARGS", "请指定 --recipe 或 --unit 中的恰好一个")
         if not units and not path and not ablate:
-            raise GneError("BAD_ARGS", "--recipe か --unit(または --ablate)を指定してください")
+            raise GneError("BAD_ARGS", "请指定 --recipe 或 --unit（或 --ablate）")
         if not units and not path:
             r = Recipe([], self.meta.model_id, dose_unit or "rel", name)
         elif path:
             if not Path(path).exists():
-                raise GneError("FILE_NOT_FOUND", f"レシピ {path} がありません")
+                raise GneError("FILE_NOT_FOUND", f"配方 {path} 不存在")
             r = Recipe.load(path)
             if dose_unit:
                 r.dose_unit = dose_unit
@@ -237,44 +237,44 @@ class Session:
         if r.ablate is not None:
             self.direction_path(r.ablate.direction)              # 方向が無ければここで返す
         if r.model_id and r.model_id != self.meta.model_id:
-            self.warn(f"レシピの model_id {r.model_id!r} が読み込んだモデル {self.meta.model_id!r} と違います")
+            self.warn(f"配方的 model_id {r.model_id!r} 与已加载模型 {self.meta.model_id!r} 不一致")
         for u in r.units:
             if not 0 <= u.layer < self.meta.n_layer:
-                raise GneError("BAD_RECIPE", f"層 {u.layer} は範囲外です(0..{self.meta.n_layer - 1})")
+                raise GneError("BAD_RECIPE", f"第 {u.layer} 层超出范围（0..{self.meta.n_layer - 1}）")
             if u.kind == "neuron" and self.weights.is_moe(u.layer):
-                raise GneError("BAD_RECIPE", f"層 {u.layer} は MoE です。専門家のニューロンは {u.layer}:E<専門家>:N{u.neuron} の形で指定します",
-                               "shared expert のニューロンなら L:S:Nn")
+                raise GneError("BAD_RECIPE", f"第 {u.layer} 层是 MoE。专家神经元请按 {u.layer}:E<专家>:N{u.neuron} 的形式指定",
+                               "shared expert 的神经元请用 L:S:Nn")
             if u.kind == "neuron" and not 0 <= u.neuron < self.meta.n_ff_at(u.layer):
-                raise GneError("BAD_RECIPE", f"L{u.layer} のニューロン {u.neuron} は範囲外です(0..{self.meta.n_ff_at(u.layer) - 1})")
+                raise GneError("BAD_RECIPE", f"L{u.layer} 的神经元 {u.neuron} 超出范围（0..{self.meta.n_ff_at(u.layer) - 1}）")
             if u.kind in ("expert_neuron", "expert"):
                 li = self.weights.moe_layer(u.layer)                    # MoE でない層ならここで返す
                 if not 0 <= u.expert < li.n_expert:
-                    raise GneError("BAD_RECIPE", f"L{u.layer} の専門家 {u.expert} は範囲外です(0..{li.n_expert - 1})")
+                    raise GneError("BAD_RECIPE", f"L{u.layer} 的专家 {u.expert} 超出范围（0..{li.n_expert - 1}）")
                 if u.kind == "expert_neuron" and not 0 <= u.neuron < li.n_ff:
-                    raise GneError("BAD_RECIPE", f"L{u.layer} E{u.expert} のニューロン {u.neuron} は範囲外です(0..{li.n_ff - 1})")
+                    raise GneError("BAD_RECIPE", f"L{u.layer} E{u.expert} 的神经元 {u.neuron} 超出范围（0..{li.n_ff - 1}）")
                 if u.mode == "route" and not li.has_router_bias:
-                    raise GneError("ARCH_UNSUPPORTED", f"層 {u.layer} にはルーターのバイアスがありません({self.meta.arch})",
-                                   "route はルーターのバイアス(exp_probs_b)を持つ arch(lfm2moe・deepseek2 など)だけです")
+                    raise GneError("ARCH_UNSUPPORTED", f"第 {u.layer} 层没有路由器偏置（{self.meta.arch}）",
+                                   "route 仅适用于带路由器偏置（exp_probs_b）的 arch（lfm2moe、deepseek2 等）")
             if u.kind == "shared":
                 li = self.weights.arch.layers[u.layer]
                 if not li.n_ff_shexp:
-                    raise GneError("BAD_RECIPE", f"層 {u.layer} に shared expert はありません")
+                    raise GneError("BAD_RECIPE", f"第 {u.layer} 层没有 shared expert")
                 if not 0 <= u.neuron < li.n_ff_shexp:
-                    raise GneError("BAD_RECIPE", f"L{u.layer} S のニューロン {u.neuron} は範囲外です(0..{li.n_ff_shexp - 1})")
+                    raise GneError("BAD_RECIPE", f"L{u.layer} S 的神经元 {u.neuron} 超出范围（0..{li.n_ff_shexp - 1}）")
             if u.kind in ("expert_neuron", "shared") and u.mode == "add":
-                self.warn(f"{u.label()}: MoE の add は書き込み方向の押しです(専門家が選ばれたかに関係なく全トークンに足す)。"
-                          "選ばれたときだけ効くニューロン押しは gain(x)です")
+                self.warn(f"{u.label()}：MoE 的 add 是沿写入方向推动（无论是否选中专家，都会加到所有 token 上）。"
+                          "仅在选中专家时生效的真正神经元推动是 gain(x)")
             if u.kind == "head":
                 self.weights.head_block(u.layer, u.head)            # 層にヘッドが無い・範囲外ならここで返す
             if u.layer <= 2:
-                self.warn(f"層 {u.layer}: 層 0〜2 は残差が小さく rel dose がそのまま通用しないことがあります(R9)")
+                self.warn(f"第 {u.layer} 层：第 0～2 层残差较小，rel dose 可能无法直接适用（R9）")
         return r.scaled(scale) if scale != 1.0 else r
 
     def _as_recipe(self, recipe: Recipe | list[str]) -> Recipe:
         return recipe if isinstance(recipe, Recipe) else self.recipe(units=list(recipe))
 
     def vectors(self, recipe: Recipe) -> tuple[dict[int, np.ndarray], list[dict]]:
-        """add ユニットの control vector(層ごと)と、全ユニットの詳細。gain だけのレシピなら統計は要らない。"""
+        """add 单元的 control vector（按层）以及所有单元的详情。仅有 gain 的配方不需要统计。"""
         if not recipe.add_units:
             return {}, unit_details(self.weights, None, recipe)
         sv = self.stats_view(Recipe(recipe.add_units, recipe.model_id, recipe.dose_unit, recipe.name))
@@ -282,7 +282,7 @@ class Session:
                 unit_details(self.weights, sv, recipe, self.direction_vec))
 
     def direction_path(self, name: str) -> Path:
-        """方向の名前 → ファイル。<root>/directions/ を先に、無ければ逆引きの <root>/reverse/ を探す。パスも可。"""
+        """方向名 → 文件。先搜索 <root>/directions/，找不到时再查反向查找的 <root>/reverse/。也可传路径。"""
         p = Path(name)
         if p.suffix == ".npz" and p.exists():
             return p
@@ -290,7 +290,7 @@ class Session:
                   self.store.reverse_dir(self.meta.model_id) / f"{name}.directions.npz"):
             if q.exists():
                 return q
-        raise GneError("FILE_NOT_FOUND", f"方向 {name} がありません", "gne direction --contrast <対照集合> で作ってください")
+        raise GneError("FILE_NOT_FOUND", f"方向 {name} 不存在", "请用 gne direction --contrast <对照集> 创建")
 
     def direction_set(self, name: str):
         from .direction import DirectionSet
@@ -302,10 +302,10 @@ class Session:
         return cache[key][1]
 
     def direction_vec(self, name: str, L: int) -> np.ndarray:
-        """方向ユニット(L:dir:NAME:dose)が足す元のベクトル(その層の mean_A − mean_B)。"""
+        """方向单元（L:dir:NAME:dose）所添加的原始向量（该层的 mean_A − mean_B）。"""
         ds = self.direction_set(name)
         if L not in ds.raw:
-            raise GneError("BAD_RECIPE", f"方向 {name} に層 {L} がありません(0〜{max(ds.raw)})")
+            raise GneError("BAD_RECIPE", f"方向 {name} 中不存在第 {L} 层（0～{max(ds.raw)}）")
         return ds.raw[L]
 
     @staticmethod
@@ -314,22 +314,22 @@ class Session:
 
     def messages(self, prompt: str | None = None, messages: list[dict] | None = None,
                  system: str | None = None, audio: list[str | Path] | None = None) -> list[dict]:
-        """audio: 音声ファイル。ユーザーの発話を音声(と、あれば prompt の文)にする(media.py)。"""
+        """audio：音频文件。将用户发言作为音频（若同时提供 prompt，也会加入其中的文字）（media.py）。"""
         if messages:
             return messages
         if audio:
             from .media import audio_message
             user = audio_message(audio, prompt)
         elif prompt is None:
-            raise GneError("BAD_ARGS", "--prompt が要ります")
+            raise GneError("BAD_ARGS", "--prompt 为必填项")
         else:
             user = {"role": "user", "content": prompt}
         return ([{"role": "system", "content": system}] if system else []) + [user]
 
     def generate(self, vectors: dict[int, np.ndarray] | None, messages: list[dict], *, max_tokens: int = 128,
                  when: str = "all", lora: list[tuple[str, float]] | None = None, sampling=None) -> dict:
-        """1 本で生成する(バッチの組み方で結果が変わらないように、F2)。既定は greedy、sampling(engine.Sampling)で
-        サンプリング。when は §6.15 の位置別ステアリング、lora は gain(§6.16)の LoRA アダプタ。"""
+        """单条生成（确保结果不随批处理组合方式变化，F2）。默认 greedy，可用 sampling（engine.Sampling）采样。
+        when 是 §6.15 的位置别 steering，lora 是 gain（§6.16）的 LoRA 适配器。"""
         from .when import generate_when
         e = self.engine
         r, info = generate_when(e, e.steer_ctx(), messages, vectors, when, max_tokens=max_tokens, lora=lora,
@@ -341,8 +341,8 @@ class Session:
     def steer(self, recipe: Recipe | list[str], *, prompt: str | None = None, messages: list[dict] | None = None,
               system: str | None = None, max_tokens: int = 128, compare: bool = True, when: str | None = None,
               sampling=None, audio: list[str | Path] | None = None) -> dict:
-        """sampling(engine.Sampling)を渡すと、無介入と介入を同じ seed で引く(違いは介入だけになる)。
-        audio: 音声ファイルをユーザーの発話にする(mmproj が要る)。"""
+        """传入 sampling（engine.Sampling）时，无干预与干预使用相同 seed 采样（差异只来自干预）。
+        audio：将音频文件作为用户发言（需要 mmproj）。"""
         recipe = self._as_recipe(recipe)
         msgs = self.messages(prompt, messages, system, audio)
         vecs, details = self.vectors(recipe)
@@ -357,8 +357,8 @@ class Session:
     # --- export / import ------------------------------------------------------------------------
 
     def lora_for(self, recipe: Recipe | None) -> list[tuple[str, float]] | None:
-        """レシピの gain ユニット(§6.16)と ablate(§6.17)を当てる LoRA([(パス, 倍率)])。どちらも無ければ None。
-        作ったものは使い回す。ablate の LoRA は倍率 1 で作り、scale はアダプタの倍率で掛ける(eval の倍率列でも 1 ファイル)。"""
+        """应用配方中 gain 单元（§6.16）与 ablate（§6.17）的 LoRA（[(路径, 倍率)]）。两者皆无则返回 None。
+        创建过的会复用。ablate 的 LoRA 以倍率 1 创建，scale 通过适配器倍率相乘（eval 的倍率列也只需一个文件）。"""
         if recipe is None:
             return None
         out = []
@@ -382,7 +382,7 @@ class Session:
     # --- スケールパッチ(CHANGE-05 §C・§D)-----------------------------------------------------------
 
     def patches_for(self, recipe: Recipe | None):
-        """専門家全体の gain(ffn_down_exps のスラブを k 倍、k = 0 で消す)とルーターのバイアス(route)のパッチ。無ければ None。"""
+        """专家整体 gain（将 ffn_down_exps 的 slab 乘以 k，k = 0 表示消除）与路由器偏置（route）的补丁。不存在时返回 None。"""
         if recipe is None:
             return None
         from .patch import Patcher, PatchSet
@@ -397,15 +397,15 @@ class Session:
             else:
                 name = self.weights.router_bias_name(u.layer)
                 if name is None:
-                    raise GneError("ARCH_UNSUPPORTED", f"層 {u.layer} にはルーターのバイアスがありません({self.meta.arch})")
+                    raise GneError("ARCH_UNSUPPORTED", f"第 {u.layer} 层没有路由器偏置（{self.meta.arch}）")
                 ps.extend(pt.add_element(name, u.expert, float(u.dose)))
         ps.name = "p-" + hashlib.sha256(json.dumps(ps.ops, sort_keys=True).encode()).hexdigest()[:12]
         return ps
 
     @contextmanager
     def patched(self, ps):
-        """パッチを作業用コピーに当て、そのコピーでモデルを読み直す。抜けるとき元に戻し、次に使うときに元のモデルを読む。
-        作業用コピーは 1 回だけ作る(cp --reflink=auto)。読み直しは mmap とページキャッシュで数秒(docs/measurements.md)。"""
+        """将补丁应用到工作副本，并用该副本重新读取模型。退出时恢复；下次使用时读取原模型。
+        工作副本只创建一次（cp --reflink=auto）。重新读取借助 mmap 与页面缓存，约需数秒（docs/measurements.md）。"""
         if ps is None or not ps.patches:
             yield self.engine
             return
@@ -417,7 +417,7 @@ class Session:
             for n in stale:                                   # 前に落ちたときのパッチが残っていれば戻す
                 f = self.store.patch_dir(self.meta.model_id) / f"{n}.patch.json"
                 if not f.exists():
-                    raise GneError("PATCH_CONFLICT", f"作業用コピーに知らないパッチ {n} が掛かっています", f"{work} を消して作り直してください")
+                    raise GneError("PATCH_CONFLICT", f"工作副本上应用了未知补丁 {n}", f"请删除 {work} 后重新创建")
                 PatchSet.load(f).revert(work)
         ps.save(self.store.patch_dir(self.meta.model_id) / f"{ps.name}.patch.json")
         if self._engine is not None:                          # VRAM を空けてから読み直す
@@ -436,7 +436,7 @@ class Session:
             ps.revert(work)
 
     def query_lora(self, u) -> Path:
-        """query のユニット → attn_q の rank-1 LoRA(<root>/heads/<model_id>/ に作って使い回す)。u・v の計算に対照集合の捕捉が要る。"""
+        """query 单元 → attn_q 的 rank-1 LoRA（在 <root>/heads/<model_id>/ 中创建并复用）。计算 u・v 需要捕获对照集。"""
         from .heads import query_vectors, write_query_lora
         seek = self._contrast_file(u.seek)
         key = json.dumps([u.layer, u.head, u.direction, str(seek), float(u.k),
@@ -457,10 +457,10 @@ class Session:
         q = CONFIGS / "contrast" / f"{name}.yaml"
         if q.exists():
             return q
-        raise GneError("FILE_NOT_FOUND", f"対照集合 {name} がありません(configs/contrast/ の名前かパス)")
+        raise GneError("FILE_NOT_FOUND", f"对照集 {name} 不存在（请使用 configs/contrast/ 中的名称或路径）")
 
     def ablation_lora(self, spec) -> Path:
-        """AblateSpec → 倍率 1 の消去 LoRA(<root>/ablate/<model_id>/ に作って使い回す)。"""
+        """AblateSpec → 倍率 1 的消除 LoRA（在 <root>/ablate/<model_id>/ 中创建并复用）。"""
         from .ablate import export_ablation_lora, layer_list, vector_key
         r, meta = self.ablation_vector(spec.direction, from_layer=spec.from_layer)
         Ls = layer_list(spec.layers)
@@ -473,17 +473,17 @@ class Session:
         return path
 
     def gain(self, recipe: Recipe | list[str], out: str | Path, *, bake: bool = False, requant: str = "auto") -> dict:
-        """gain ユニットを LoRA アダプタ GGUF(既定)か、W_up(ヘッドは W_O)を書き換えた GGUF(bake)に書き出す(§6.16、CHANGE-04 D)。"""
+        """将 gain 单元导出为 LoRA 适配器 GGUF（默认），或改写 W_up（注意力头为 W_O）的 GGUF（bake）（§6.16、CHANGE-04 D）。"""
         from .gain import bake_gain_gguf, export_gain_lora
         recipe = self._as_recipe(recipe)
         if recipe.add_units:
-            self.warn("add のユニットは gain の書き出しに入りません(gne export-cvec で control vector に書き出せます)")
+            self.warn("add 单元不会进入 gain 导出（可通过 gne export-cvec 导出为 control vector）")
         routes = [u for u in recipe.units if u.mode == "route"]
         if not recipe.gain_units and not recipe.query_units and not routes:
-            raise GneError("BAD_RECIPE", "gain のユニットがありません(例 --unit 14:8949:x2、ヘッドは 21:H7:x0)")
+            raise GneError("BAD_RECIPE", "没有 gain 单元（例：--unit 14:8949:x2，注意力头为 21:H7:x0）")
         if not bake and (routes or any(u.kind == "expert" for u in recipe.gain_units)):
-            raise GneError("BAD_RECIPE", "専門家全体の gain と route は LoRA にできません(全ランクになる)",
-                           "--bake でスケールパッチを当てた GGUF にしてください(CHANGE-05 §D)")
+            raise GneError("BAD_RECIPE", "专家整体的 gain 与 route 无法导出为 LoRA（会变成全秩）",
+                           "请用 --bake 生成已应用缩放补丁的 GGUF（CHANGE-05 §D）")
         rep: dict = {"path": None, "bytes": 0}
         if recipe.gain_units or routes:
             if bake:
@@ -506,14 +506,14 @@ class Session:
 
     def _warn_when(self, recipe: Recipe, what: str) -> None:
         if recipe.ablate is not None:
-            self.warn(f"ablate({recipe.ablate.label()})は {what} では表せないので外しました(§6.17)。"
-                      "gne ablate で LoRA アダプタか書き換え GGUF に書き出してください")
+            self.warn(f"ablate（{recipe.ablate.label()}）无法用 {what} 表示，已移除（§6.17）。"
+                      "请用 gne ablate 导出为 LoRA 适配器或改写后的 GGUF")
         if recipe.gain_units:
-            self.warn(f"gain のユニット({len(recipe.gain_units)} 個)は {what} では表せないので外しました(§6.16)。"
-                      "gne gain で LoRA アダプタか書き換え GGUF に書き出してください")
+            self.warn(f"gain 单元（{len(recipe.gain_units)} 个）无法用 {what} 表示，已移除（§6.16）。"
+                      "请用 gne gain 导出为 LoRA 适配器或改写后的 GGUF")
         if recipe.when != "all":
-            self.warn(f"レシピの when={recipe.when} は {what} では表せないので、全位置(all)として書き出しました(§6.15)。"
-                      "位置別のまま使うなら gne steer / chat か gne serve --openai を使ってください")
+            self.warn(f"配方的 when={recipe.when} 无法用 {what} 表示，已按所有位置（all）导出（§6.15）。"
+                      "若要在位置别模式下使用，请使用 gne steer / chat 或 gne serve --openai")
 
     def export_cvec(self, recipe: Recipe | list[str], path: str | Path, *, fmt: str = "cvec", verify: bool = False,
                     verify_prompt: str = "Who are you?", n_tokens: int = 32,
@@ -521,19 +521,19 @@ class Session:
         recipe = self._as_recipe(recipe)
         self._warn_when(recipe, "control vector")
         if not recipe.add_units:
-            raise GneError("BAD_RECIPE", "add のユニットがありません(gain だけのレシピは control vector になりません)",
-                           "gne gain で LoRA アダプタか書き換え GGUF に書き出してください")
+            raise GneError("BAD_RECIPE", "没有 add 单元（只有 gain 的配方无法成为 control vector）",
+                           "请用 gne gain 导出为 LoRA 适配器或改写后的 GGUF")
         moe_add = [u.label() for u in recipe.add_units if u.kind in ("expert_neuron", "shared")]
         if moe_add:                                           # CHANGE-05 §C・V22
-            self.warn(f"{', '.join(moe_add)}: MoE の add は書き込み方向の押しとして書き出します(専門家が選ばれたかに関係なく全トークンに足す)")
+            self.warn(f"{', '.join(moe_add)}：MoE 的 add 会按写入方向推动导出（无论是否选中专家，都会加到所有 token 上）")
         rest = [u.label() for u in recipe.units if u.mode in ("gain", "route")]
         if rest:
-            self.warn(f"{', '.join(rest)}: gain と route は control vector に入りません"
-                      "(ニューロン・ヘッド・専門家のニューロンの gain は LoRA、専門家全体の gain と route はスケールパッチ)")
+            self.warn(f"{', '.join(rest)}：gain 与 route 不会进入 control vector"
+                      "（神经元、注意力头、专家神经元的 gain 走 LoRA，专家整体的 gain 与 route 走缩放补丁）")
         vecs, details = self.vectors(recipe)
         if fmt == "cvec" and 0 in vecs:
-            raise GneError("BAD_RECIPE", "ブロック 0 は control vector に書けません(llama.cpp の仕様)",
-                           "--format npz/json/safetensors か gne bake を使ってください")
+            raise GneError("BAD_RECIPE", "块 0 无法写入 control vector（llama.cpp 的限制）",
+                           "请使用 --format npz/json/safetensors 或 gne bake")
         meta = {"model_id": self.meta.model_id, "recipe": recipe.to_dict(), "dose_unit": recipe.dose_unit,
                 "n_embd": self.meta.n_embd, "gne_version": _version()}
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -541,7 +541,7 @@ class Session:
         check = None
         if verify:
             if fmt != "cvec":
-                raise GneError("BAD_ARGS", "--verify は --format cvec のときだけ使えます")
+                raise GneError("BAD_ARGS", "--verify 仅能与 --format cvec 一起使用")
             check = self.check_cvec_with_llama(Path(path), verify_prompt, n_tokens, llama_completion)
         from .steer import llama_server_args
         return {"path": str(path), "format": fmt, "recipe": recipe.to_dict(), "units": details,
@@ -549,11 +549,11 @@ class Session:
                 "llama_server_args": llama_server_args(recipe.sampling) if recipe.sampling else None}
 
     def check_cvec_with_llama(self, path: Path, prompt: str, n_tokens: int, binary: str | None) -> dict:
-        """書き出した cvec を本家のローダ(llama-completion --control-vector)で読ませ、greedy 出力を比べる。"""
+        """用原生加载器（llama-completion --control-vector）读取导出的 cvec，并比较 greedy 输出。"""
         from .verify import find_llama_completion, run_llama_completion
         binary = binary or find_llama_completion()
         if not binary:
-            raise GneError("TOOL_MISSING", "llama-completion が見つかりません", "--llama-completion でパスを渡してください")
+            raise GneError("TOOL_MISSING", "找不到 llama-completion", "请用 --llama-completion 传入路径")
         n_embd, data = load_cvec_like_common([(path, 1.0)])
         back = {i + 1: data[i * n_embd:(i + 1) * n_embd] for i in range(data.size // n_embd)
                 if np.any(data[i * n_embd:(i + 1) * n_embd])}
@@ -564,16 +564,16 @@ class Session:
         same = ours["text"] == theirs
         return {"tool": binary, "prompt": prompt, "n_tokens": n_tokens, "ours": ours["text"], "theirs": theirs,
                 "match": same, "exact": same, "first_diff": None,
-                "summary": "文字列が一致" if same else "文字列が不一致", "kl_next": None,
+                "summary": "字符串一致" if same else "字符串不一致", "kl_next": None,
                 "differs_from_baseline": ours["token_ids"] != base["token_ids"]}
 
     def import_cvec(self, path: str | Path, *, source: str = "exact", name: str | None = None) -> dict:
         if source == "exact":
-            self.warn("--source exact: direction.N を層 N の値として扱いました。llama-cvector-generator で作った"
-                      "ファイルなら --source generator(1 ずれ補正、§5.2)を使ってください")
+            self.warn("--source exact：已将 direction.N 视为第 N 层的值。如果文件由 llama-cvector-generator 生成，"
+                      "请使用 --source generator（偏移 1 补正，§5.2）")
         vecs = import_cvec_gguf(path, source=source)
         if not vecs:
-            raise GneError("EMPTY_CVEC", f"{path} に非ゼロの方向がありません")
+            raise GneError("EMPTY_CVEC", f"{path} 中没有非零方向")
         n = name or Path(path).name.split(".")[0]
         out = self.store.reverse_dir(self.meta.model_id) / f"{n}.directions.npz"
         np.savez(out, layers=np.array(sorted(vecs), dtype=np.int32),
@@ -587,7 +587,7 @@ class Session:
         recipe = self._as_recipe(recipe)
         self._warn_when(recipe, "bake")
         if not recipe.add_units:
-            raise GneError("BAD_RECIPE", "add のユニットがありません", "gain は gne gain --bake で書き換え GGUF にできます")
+            raise GneError("BAD_RECIPE", "没有 add 单元", "gain 可通过 gne gain --bake 写入改写后的 GGUF")
         vecs, details = self.vectors(recipe)
         Path(dst).parent.mkdir(parents=True, exist_ok=True)
         rep = bake_bias_gguf(self.weights, vecs, self.path, dst, recipe=recipe)
@@ -598,11 +598,11 @@ class Session:
 
     def check_bake(self, vecs: dict[int, np.ndarray], dst: Path, prompt: str, n_tokens: int,
                    kl_max: float = 0.05) -> dict:
-        """V9: 焼いた GGUF の greedy 出力と 元モデル + cvec の greedy 出力を比べる。焼いた結果が無介入と違うことも見る。
+        """V9：比较烧制 GGUF 与原模型 + cvec 的 greedy 输出。同时确认烧制结果不同于无干预。
 
-        bias と control vector は数学的に等価だが、加算の順番((x + Wa) + v と x + (Wa + b))の丸めの差(1e-8 程度)が
-        量子化 GEMM の活性の int8 丸めで増幅され、次トークン分布で KL 1e-3〜1e-2 程度ずれる(docs/verification.md F8)。
-        完全一致か、最初の分岐が僅差(0.5 nats 未満)で説明でき KL < kl_max なら合格とする。"""
+        bias 与 control vector 在数学上等价，但加法顺序（(x + Wa) + v 与 x + (Wa + b)）带来的舍入差异（约 1e-8）
+        会被量化 GEMM 激活值的 int8 舍入放大，使下一 token 分布产生约 1e-3～1e-2 的 KL 偏差（docs/verification.md F8）。
+        完全一致，或首次分叉能由微小差异（小于 0.5 nats）解释且 KL < kl_max 时，视为通过。"""
         from .engine import log_softmax
         from .verify import compare_greedy
         msgs = [{"role": "user", "content": prompt}]
@@ -621,12 +621,12 @@ class Session:
         base, _ = run(e, ctx, None)
         ref, ref_lp = (None, None) if 0 in vecs else run(e, ctx, vecs)
         if ref is None:
-            self.warn("層 0 は control vector で再現できないので、bake の比較は無介入との違いだけを見ます")
+            self.warn("第 0 层无法用 control vector 复现，因此 bake 比较只检查与无干预的差异")
         kw = dict(self._engine_kw)
         self.close()                                   # VRAM を空けてから焼いた方を読む
         with Engine(dst, **kw) as e2:
             baked, baked_lp = run(e2, e2.steer_ctx(), None)
-        out = {"tool": "llama-cpp-python(焼いた GGUF を読み込み)", "prompt": prompt, "n_tokens": n_tokens,
+        out = {"tool": "llama-cpp-python（加载烧制后的 GGUF）", "prompt": prompt, "n_tokens": n_tokens,
                "ours": ref.text if ref else "", "theirs": baked.text, "match": False, "exact": False,
                "first_diff": None, "summary": None, "kl_next": None,
                "differs_from_baseline": baked.token_ids != base.token_ids}
@@ -672,7 +672,7 @@ class Session:
     def lens_steer(self, L: int, *, neurons: str | None = None, dose: float = 0.8, random_controls: int = 64,
                    top_k: int = 12, resume: bool = True, show: int = 20, part: str | None = None,
                    controls: list[int] | None = None) -> dict:
-        """part を渡すと(ワーカー、CHANGE-03 B)steer_L{L}.part-<part>.npz に書き、controls の対照だけを計算する。"""
+        """传入 part 时（工作进程、CHANGE-03 B）写入 steer_L{L}.part-<part>.npz，并且只计算 controls 中的对照。"""
         from .lens import steer_lens_layer
         from .selection import parse_neurons
         self._check_layer(L, cvec=True)
@@ -702,12 +702,12 @@ class Session:
                 "seconds": seconds, "neurons": rows}
 
     def lens_summary(self, L: int, *, neurons: str | None = None, show: int = 20, seconds: float = 0.0) -> dict:
-        """保存済みの steer lens の要約(lens_steer と同じ形)。モデルを GPU に読み込まない(語は語彙だけで読む)。"""
+        """已保存的 steer lens 摘要（与 lens_steer 同形）。不会把模型加载到 GPU（词只从词表读取）。"""
         from .lens import SteerLens
         from .selection import parse_neurons
         path = self.store.lens_dir(self.meta.model_id) / f"steer_L{L}.npz"
         if not path.exists():
-            raise GneError("FILE_NOT_FOUND", f"{path} がありません")
+            raise GneError("FILE_NOT_FOUND", f"{path} 不存在")
         res = SteerLens.load(path)
         sel = parse_neurons(neurons, self.weights.n_units(L), seed=self.seed)
         return self._lens_rows(L, res, sel, neurons, path, float(res.config["dose"]), float(res.config["rho"]), show,
@@ -715,11 +715,11 @@ class Session:
 
     def _check_layer(self, L: int, *, cvec: bool = False) -> None:
         if not 0 <= L < self.meta.n_layer:
-            raise GneError("BAD_ARGS", f"層 {L} は範囲外です(0..{self.meta.n_layer - 1})")
+            raise GneError("BAD_ARGS", f"第 {L} 层超出范围（0..{self.meta.n_layer - 1}）")
         if cvec and L == 0:
-            raise GneError("BAD_ARGS", "層 0 は control vector で押せません(llama.cpp の仕様)")
-        if not self.weights.has_tensor(f"blk.{L}.ffn_down.weight") and not self.weights.has_tensor(f"blk.{L}.ffn_down_exps.weight"):
-            raise GneError("ARCH_UNSUPPORTED", f"層 {L} に ffn_down.weight(dense)も ffn_down_exps.weight(MoE)もありません")
+            raise GneError("BAD_ARGS", "第 0 层无法用 control vector 推动（llama.cpp 的限制）")
+        if not self.weights.has_tensor(f"blk.{L}.ffn_down.weight"):
+            raise GneError("ARCH_UNSUPPORTED", f"第 {L} 层没有 dense 的 ffn_down.weight")
 
     def reverse(self, *, contrast: str | Path | None = None, directions: str | Path | None = None,
                 method: str = "mean_diff", positions: str = "all", top: int = 200, layers: list[int] | None = None,
@@ -730,7 +730,7 @@ class Session:
         from .lens import SteerLens
         from .reverse import ContrastSet, candidate_dicts, contrastive_directions, rank_by_direction
         if bool(contrast) == bool(directions):
-            raise GneError("BAD_ARGS", "--contrast か --directions のどちらか一方を指定してください")
+            raise GneError("BAD_ARGS", "请指定 --contrast 或 --directions 中的恰好一个")
         t0 = time.perf_counter()
         rdir = self.store.reverse_dir(self.meta.model_id)
         act, scale = None, None
@@ -755,7 +755,7 @@ class Session:
             act = {int(k[4:]): z[k] for k in z.files if k.startswith("act_")} or None
             scale = {int(k[6:]): z[k] for k in z.files if k.startswith("scale_")} or None
             if standardize and scale is None:
-                self.warn("この方向には残差のばらつきの情報が無いので、標準化せずに cos を取りました")
+                self.warn("该方向没有残差离散程度信息，因此未标准化直接计算 cos")
             name = name or p.name.split(".")[0]
             info.update(source=str(p), method=str(z["method"]) if "method" in z.files else "imported")
         steer_kl = {}
@@ -807,7 +807,7 @@ class Session:
         return self._vocab
 
     def run_path(self, run: str) -> Path:
-        """--run の名前(<root>/runs/<model_id>/<run>.jsonl)か JSONL のパス。"""
+        """--run 的名称（<root>/runs/<model_id>/<run>.jsonl）或 JSONL 路径。"""
         p = Path(run)
         if p.suffix == ".jsonl" and (p.exists() or p.parent != Path(".")):
             return p
@@ -817,7 +817,7 @@ class Session:
               max_tokens: int = 128, top_k: int = 5, run: str | None = None, prompt_set: str = "en",
               dose_unit: str = "rel", resume: bool = True, part: str | None = None,
               controls: list[int] | None = None) -> dict:
-        """part を渡すと(ワーカー、CHANGE-03 B)<run>.part-<part>.jsonl に書き、controls の対照だけを回す。"""
+        """传入 part 时（工作进程、CHANGE-03 B）写入 <run>.part-<part>.jsonl，并且只运行 controls 中的对照。"""
         from .selection import parse_neurons
         from .sweep import load_design, run_sweep
         self._check_layer(L, cvec=True)
@@ -842,10 +842,10 @@ class Session:
         from .rank import rank_records
         from .sweep import part_paths, read_rollouts
         if word_unit not in ("tokens", "regex"):
-            raise GneError("BAD_ARGS", "--word-unit は tokens か regex です")
+            raise GneError("BAD_ARGS", "--word-unit 只能为 tokens 或 regex")
         path = self.run_path(run)
         if not part_paths(path):                          # 本体か、ワーカーごとの部分(part-*)のどちらかがあればよい
-            raise GneError("FILE_NOT_FOUND", f"run {path} がありません", "gne sweep --run で作ってください")
+            raise GneError("FILE_NOT_FOUND", f"run {path} 不存在", "请用 gne sweep --run 创建")
         t0 = time.perf_counter()
         recs = read_rollouts(path)
         words = self.vocab.words() if word_unit == "tokens" else None
@@ -859,7 +859,7 @@ class Session:
         for n in find or []:
             hit = next((u for u in units if u["kind"] == "neuron" and u["neuron"] == n), None)
             if hit is None:
-                self.warn(f"N{n} はこの run にありません")
+                self.warn(f"N{n} 不在该 run 中")
             else:
                 found.append(hit)
         return {"run": str(path), "parts": [p.name for p in part_paths(path)], "units_path": str(out),
@@ -894,19 +894,19 @@ class Session:
     # --- Phase 5 U3: connections と配置(重みだけ、CPU) -------------------------------------------------
 
     def connections(self, *, k: int = 24, window: int | None = None, chunk: int = 1024) -> dict:
-        """全層ペアの connections を計算して <root>/connections/<model_id>.npz に保存する(別冊 §8.4)。"""
+        """计算所有层对的 connections 并保存到 <root>/connections/<model_id>.npz（别册 §8.4）。"""
         from .connections import compute_connections, save_connections
         resid = self.resid_stats()
         rho = {int(L): float(p) for L, p in zip(resid.layers, resid.p50, strict=True)} if resid is not None else None
         if rho is None:
-            self.warn("残差ノルムの統計が無いので rms で割らずに計算します(層をまたいだ z が深い層に偏ります。gne stats resid で作れます)")
+            self.warn("缺少残差范数统计，因此不除以 rms 直接计算（跨层的 z 会偏向较深层。可用 gne stats resid 创建）")
         r = compute_connections(self.weights, k=k, window=window, rho=rho, chunk=chunk, progress=self.progress)
         path = self.store.connections_path(self.meta.model_id)
         save_connections(path, r)
         return {"path": str(path), **r["meta"]}
 
     def layout(self, kind: str = "writes", *, layers: list[int] | str | None = None, seed: int | None = None) -> dict:
-        """シート内の配置(別冊 §4.4)を計算して <root>/layout/<model_id>/<kind>_L{L}.npy に保存する。"""
+        """计算 sheet 内布局（别册 §4.4）并保存到 <root>/layout/<model_id>/<kind>_L{L}.npy。"""
         from .layout import compute_layout
         Ls = list(range(self.meta.n_layer)) if layers in (None, "all") else [int(x) for x in layers]
         out = []
@@ -922,7 +922,7 @@ class Session:
         return {"kind": kind, "layers": out}
 
     def embed(self, run: str, *, model: str | Path | None = None) -> dict:
-        """run の全 rollout を文埋め込み → UMAP 2D にして runs/<run>.umap.json に保存する(別冊 §7)。"""
+        """将 run 的所有 rollout 转为句子嵌入 → UMAP 2D，并保存到 runs/<run>.umap.json（别册 §7）。"""
         from .embed import embed_run
         return embed_run(self, run, model=model, seed=self.seed, progress=self.progress)
 
@@ -931,8 +931,8 @@ class Session:
     def writers(self, contrast: str | Path, *, name: str | None = None, ref_layer: int | None = None,
                 replies_a: str | Path | None = None, replies_b: str | Path | None = None, max_tokens: int = 96,
                 top: int = 50) -> dict:
-        """対照集合の A / B の返事のトークンで、各ニューロンが残差に書き足した量と、参照の層の方向への直接の寄与。
-        方向を埋め込み・mixer(attention など)・MLP がそれぞれ何割書いたかも返す。"""
+        """使用对照集 A / B 回复中的 token，测量各神经元写入残差的量，以及对参考层方向的直接贡献。
+        也返回嵌入、mixer（如 attention）与 MLP 各占多少比例。"""
         from .writers import writer_contributions
         return writer_contributions(self, contrast, name=name, ref_layer=ref_layer, replies_a=replies_a,
                                     replies_b=replies_b, max_tokens=max_tokens, top=top, progress=self.progress)
@@ -941,54 +941,54 @@ class Session:
 
     def heads_contrast(self, contrast: str | Path, *, name: str | None = None, direction: str | None = None,
                        system_b2: str | None = None, layers: list[int] | None = None, max_tokens: int = 48) -> dict:
-        """対照集合でヘッドごとに trigger_mass・pattern_shift・out_shift・dir_cos を測り、中立どうしを床にして順位づける。"""
+        """在对照集上按注意力头测量 trigger_mass・pattern_shift・out_shift・dir_cos，并以中性样本互为下限进行排序。"""
         from .heads import heads_contrast
         return heads_contrast(self, contrast, name=name, direction=direction, system_b2=system_b2, layers=layers,
                               max_tokens=max_tokens, progress=self.progress)
 
     def experts_contrast(self, contrast: str | Path, *, name: str | None = None, direction: str | None = None,
                          system_b2: str | None = None, layers: list[int] | None = None, max_tokens: int = 48) -> dict:
-        """MoE の層の専門家ごとに usage_shift・weight_shift・contrib_cos・contrib_norm を測り、中立どうしを床にして順位づける(CHANGE-05 §E.1)。"""
+        """逐 MoE 层专家测量 usage_shift、weight_shift、contrib_cos、contrib_norm，并以中立对中立为下限排序（CHANGE-05 §E.1）。"""
         from .experts import experts_contrast
         return experts_contrast(self, contrast, name=name, direction=direction, system_b2=system_b2, layers=layers,
                                 max_tokens=max_tokens, progress=self.progress)
 
     def experts_sweep(self, L: int, *, ks=(0.0, 2.0), design: str = "quick", prompt_set: str = "en", max_tokens: int = 48,
                       experts: list[int] | None = None, run: str | None = None) -> dict:
-        """専門家単位のスイープ(各専門家を消す・強めるスケールパッチで生成し、語の出方で順位づける、CHANGE-05 §E.2)。"""
+        """按专家进行的 sweep（用消除或增强各专家的缩放补丁生成，并按词语出现方式排序，CHANGE-05 §E.2）。"""
         from .experts import experts_sweep
         return experts_sweep(self, L, ks=ks, design=design, prompt_set=prompt_set, max_tokens=max_tokens, experts=experts,
                              run=run, progress=self.progress)
 
     def moe_route(self, text: str, *, layers: list[int] | None = None, chat: bool = False) -> dict:
-        """トークンごとに選ばれた専門家とルーティング重み(MoE の層ごと)。"""
+        """逐 token、逐 MoE 层返回选中的专家与路由权重。"""
         from .experts import moe_route
         return moe_route(self, text, layers=layers, chat=chat)
 
     def expert(self, L: int, e: int, *, top: int = 20) -> dict:
-        """専門家の調書(使用統計・対照分析での順位・ニューロンの上位)。"""
+        """专家档案（使用统计、对照分析排名、神经元排名）。"""
         from .experts import expert_dossier
         return expert_dossier(self, L, e, top=top)
 
     def attention(self, text: str, *, pos: int = -1, layer: int | None = None, head: int | None = None, top: int = 5,
                   system: str | None = None, chat: bool = False) -> dict:
-        """選んだトークンが各ヘッドでどこを見ているか(上位 top)と per-head 出力のノルム(gne heads attention)。"""
+        """选中的 token 在各注意力头中关注何处（前 top 个）以及每个头输出的范数（gne heads attention）。"""
         from .heads import attention_view
         return attention_view(self, text, pos=pos, layer=layer, head=head, top=top, system=system, chat=chat)
 
     def heads_listen(self, user: str, *, heads: str | list[tuple[int, int]], system: str | None = None, reply: str | None = None,
                      max_tokens: int = 64, direction: str | None = None, top: int = 20) -> dict:
-        """返事のトークンが選んだヘッドで文脈のどのトークンに注目し、各トークンが方向にどれだけ寄与したか(gne heads listen)。"""
+        """回复 token 通过所选注意力头关注上下文的哪些 token，以及各 token 对方向的贡献（gne heads listen）。"""
         from .heads import listen_view
         return listen_view(self, user, heads=heads, system=system, reply=reply, max_tokens=max_tokens, direction=direction, top=top)
 
     def head(self, L: int, h: int, *, lens: bool = True) -> dict:
-        """ヘッドの調書。"""
+        """注意力头档案。"""
         from .heads import head_dossier
         return head_dossier(self, L, h, lens=lens)
 
     def heads_query(self, L: int, h: int, *, direction: str, seek: str | Path, scales=(0.0, 0.5, 1.0, 2.0, 4.0)) -> dict:
-        """CHANGE-04 E(実験的)の V17: クエリ操作の scale ごとに、ヘッド h のトリガーへの注目がペルソナあり/なしでどう変わるか。"""
+        """CHANGE-04 E（实验性）的 V17：对每个 query 操作 scale，观察注意力头 h 对触发词的关注在有人设/无人设时如何变化。"""
         from .heads import check_query
         return check_query(self, L, h, direction=direction, seek=self._contrast_file(seek), scales=scales)
 
@@ -1004,10 +1004,10 @@ class Session:
 
     def recipe_save(self, name: str, units: list[str] | Recipe, *, dose_unit: str = "rel",
                     ablate: str | dict | None = None, when: str | None = None, sampling: dict | None = None) -> dict:
-        """sampling はこのレシピを試すときのサンプリング(seed は持たない)。"""
+        """sampling 是尝试该配方时使用的采样设置（不含 seed）。"""
         from .steer import sampling_values
         if not re.fullmatch(r"[\w.\-]+", name or ""):
-            raise GneError("BAD_ARGS", f"レシピ名 {name!r} は英数字・_・-・. だけにしてください")
+            raise GneError("BAD_ARGS", f"配方名 {name!r} 只能包含字母、数字、_、-、.")
         r = units if isinstance(units, Recipe) else self.recipe(units=list(units), dose_unit=dose_unit, name=name,
                                                                ablate=ablate, when=when)
         if sampling:
@@ -1023,7 +1023,7 @@ class Session:
             return p
         q = self.store.recipes_dir() / f"{name_or_path}.yaml"
         if not q.exists():
-            raise GneError("FILE_NOT_FOUND", f"レシピ {name_or_path} がありません", f"{q} に recipe_save で保存してください")
+            raise GneError("FILE_NOT_FOUND", f"配方 {name_or_path} 不存在", f"请用 recipe_save 保存到 {q}")
         return q
 
     def chat(self, columns, prompts: list[str], *, system: str | None = None, max_tokens: int = 256,
@@ -1044,20 +1044,20 @@ class Session:
                   dose: float = 0.5, max_tokens: int = 64, kl_max: float = 0.1, min_distinct: float = 0.8,
                   per_layer: bool = False, judge_model: str | Path | None = None, judge_target: str | None = None,
                   response_tokens: int = 96, random_controls: int = 16) -> dict:
-        """対照集合から全層の方向 r_L を作って保存し、select="auto" なら効果の大きい層を選ぶ(数字なら手で指定)。
-        random_controls > 0 なら層選びに同じ大きさのランダムな向きの対照を入れ、対照の p95 を超えた層だけを選ぶ(CHANGE-03 A)。
-        positions="response" は返事のトークンから作る(A / B の system で response_tokens まで返事を生成して流す)。"""
+        """根据对照集创建并保存所有层方向 r_L；select="auto" 时选择效果较大的层（数字则手动指定）。
+        random_controls > 0 时，在层选择中加入同量级的随机方向对照，只选择超过对照 p95 的层（CHANGE-03 A）。
+        positions="response" 时从回复 token 创建（用 A / B 的 system 生成到 response_tokens 的回复再计算）。"""
         from .direction import (DirectionSet, candidate_layers, layer_table, load_contrast, response_directions,
                                 save_directions, save_select, select_layer)
         from .evalx import Judge
         from .reverse import contrastive_directions
         if positions not in ("last", "all", "assistant", "response"):
-            raise GneError("BAD_ARGS", "positions は last / all / assistant / response です")
+            raise GneError("BAD_ARGS", "positions 只能为 last / all / assistant / response")
         t0 = time.perf_counter()
         cs, val = load_contrast(contrast)
         name = name or cs.name
         if not re.fullmatch(r"[\w.\-]+", name):
-            raise GneError("BAD_ARGS", f"名前 {name!r} は英数字・_・-・. だけにしてください")
+            raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含字母、数字、_、-、.")
         if positions == "response":
             cr = response_directions(self, cs, max_tokens=response_tokens, progress=self.progress)
         else:
@@ -1072,7 +1072,7 @@ class Session:
         sel = None
         if select is not None and str(select) != "auto":
             if not str(select).isdigit() or int(select) not in ds.raw:
-                raise GneError("BAD_ARGS", f"--select は auto か層の番号です({min(ds.raw)}〜{max(ds.raw)})")
+                raise GneError("BAD_ARGS", f"--select 只能为 auto 或层号（{min(ds.raw)}～{max(ds.raw)}）")
             sel = {"mode": "manual", "selected": int(select)}
         elif select == "auto":
             judge = Judge(judge_model, judge_target or val.target or cs.system_a) if judge_model else None
@@ -1095,8 +1095,8 @@ class Session:
                 "select": sel, "seconds": time.perf_counter() - t0}
 
     def ablation_vector(self, direction: str, *, from_layer: int | None = None, per_layer: bool = False):
-        """消す方向: from_layer の r(既定は gne direction --select で選んだ層)、per_layer なら層ごとの r_L(dict)。
-        保存済みの方向に無い "random-SEED" は、ランダムな単位ベクトル(消去の対照、CHANGE-03 A)。"""
+        """要消除的方向：from_layer 的 r（默认是 gne direction --select 选中的层），per_layer 时为每层 r_L（dict）。
+        保存的方向中不存在的 "random-SEED" 会生成随机单位向量（消除对照，CHANGE-03 A）。"""
         m = re.fullmatch(r"random-(\d+)", direction or "")
         if m and not per_layer:
             try:
@@ -1111,22 +1111,22 @@ class Session:
             sel = ds.path.with_suffix(".select.json")
             chosen = json.loads(sel.read_text()).get("selected") if sel.exists() else None
             if chosen is None:
-                raise GneError("BAD_ARGS", f"方向 {ds.name} の層が決まっていません",
-                               "--from-layer で指定するか、gne direction --select auto / --layer で選んでください")
+                raise GneError("BAD_ARGS", f"方向 {ds.name} 尚未确定层",
+                               "请用 --from-layer 指定，或使用 gne direction --select auto / --layer 选择")
             from_layer = int(chosen)
         if from_layer not in ds.raw:
-            raise GneError("BAD_ARGS", f"方向 {ds.name} に層 {from_layer} がありません(0〜{max(ds.raw)})")
+            raise GneError("BAD_ARGS", f"方向 {ds.name} 中不存在第 {from_layer} 层（0～{max(ds.raw)}）")
         return ds.raw[from_layer], {"direction": ds.name, "from_layer": from_layer}
 
     def ablate(self, direction: str, out: str | Path, *, from_layer: int | None = None, per_layer: bool = False,
                layers: list[int] | None = None, scale: float = 1.0, embed: bool = True, bake: bool = False,
                requant: str = "q8_0", via_f16: bool = False, imatrix: str | None = None,
                llama_quantize: str | None = None, verify: bool = False) -> dict:
-        """方向の射影消去を LoRA アダプタ GGUF(既定)か、重みを書き換えた GGUF(bake)に書き出す(§6.17)。
-        verify なら、LoRA は V13(r 成分が残る分だけか)、bake は V13 と V14(LoRA と greedy が一致するか)を書き出したファイルで見る。"""
+        """将方向的投影消除导出为 LoRA 适配器 GGUF（默认）或改写权重的 GGUF（bake）（§6.17）。
+        verify 时，对 LoRA 检查 V13（r 分量是否只按应有部分残留），对 bake 检查 V13 与 V14（LoRA 与 greedy 是否一致）。"""
         from .ablate import bake_ablation_gguf, bake_via_f16, export_ablation_lora
         if not 0 < scale <= 1.5:
-            raise GneError("BAD_ARGS", "--scale は 0 より大きく 1.5 以下にしてください(1 で完全に消す)")
+            raise GneError("BAD_ARGS", "--scale 须大于 0 且不超过 1.5（1 表示完全消除）")
         r, meta = self.ablation_vector(direction, from_layer=from_layer, per_layer=per_layer)
         t0 = time.perf_counter()
         if not bake:
@@ -1148,11 +1148,11 @@ class Session:
                 "seconds": time.perf_counter() - t0}
 
     def _check_ablation(self, r, out: Path, kind: str, rep: dict, n_tokens: int = 32) -> dict:
-        """書き出したファイルで V13 と(bake なら)V14 を見る。"""
+        """用导出的文件检查 V13 以及（bake 时）V14。"""
         from .ablate import embed_in_lora, export_ablation_lora, residual_writers, unit
         from .verify import Verifier
         if isinstance(r, dict):
-            return {"skipped": "層ごとの方向(--per-layer)の検証は未対応です"}
+            return {"skipped": "不支持验证逐层方向（--per-layer）"}
         v = Verifier(self.engine, self.weights, seed=self.seed)
         ru = unit(r)
         ids = v.prompt_ids[0]
@@ -1189,14 +1189,14 @@ class Session:
             # 部分消去(scale < 1)なら r 成分は (1 − s) 倍ぶん残るので、比べるのは全部消したときだけ
             devs.append(float((np.abs(la @ ru - expect) / np.linalg.norm(la, axis=1)).max()))
         out_ = {"v13": {"max_dev": max(devs), "pass": bool(max(devs) < 1e-2) if (scale == 1.0 and full) else None,
-                        "note": None if (scale == 1.0 and full) else "部分消去・層の範囲指定では r 成分は残るので合否は付けません"}}
+                        "note": None if (scale == 1.0 and full) else "部分消除或指定层范围时 r 分量会残留，因此不判定通过/失败"}}
         if kind == "bake":
             from .verify import compare_greedy
             cmps = [compare_greedy(x.token_ids, x.top_ids, x.top_lps, y.token_ids, y.top_ids, y.top_lps)
                     for x, y in zip(a, b, strict=True)]
             out_["v14"] = {"n_tokens": n_tokens, "match": [c["first_diff"] is None for c in cmps],
                            "summary": [c["summary"] for c in cmps], "pass": all(c["ok"] for c in cmps),
-                           "note": "量子化し直しの誤差で、僅差のトークンから分かれることがあります(F16 なら誤差が小さい)"
+                           "note": "重新量化的误差可能使接近的 token 分叉（F16 误差更小）"
                            if not all(c["first_diff"] is None for c in cmps) else None}
         return out_
 
@@ -1206,15 +1206,15 @@ class Session:
              when: str | None = None, judge_model: str | Path | None = None, judge_target: str | None = None,
              name: str | None = None, random_controls: int = 0, reactivity: str | Path | None = None,
              head_controls: int = 0) -> dict:
-        """レシピの倍率ごとの副作用(能力・ppl・言語混入)と性格の変化量を測り、<root>/evals/<model_id>/<name>.json に保存する。
-        random_controls > 0 なら各倍率で同じ大きさのランダムな対照レシピも測る(行の ctrl・ctrl_novelty_p95 など)。
-        reactivity(対照集合の YAML)で反応性(トリガーあり/なしの差)も測り、head_controls 本のランダムなヘッドと比べる。"""
+        """测量配方在各倍率下的副作用（能力、ppl、语言混入）与性格变化量，并保存到 <root>/evals/<model_id>/<name>.json。
+        random_controls > 0 时，每个倍率也测量同量级的随机对照配方（行中的 ctrl・ctrl_novelty_p95 等）。
+        reactivity（对照集 YAML）还会测量反应性（有/无触发词的差异），并与 head_controls 个随机注意力头比较。"""
         from .evalx import Judge, evaluate
         recipe = self._as_recipe(recipe)
         if not recipe.units and recipe.ablate is None:
-            raise GneError("BAD_RECIPE", "ユニットがありません")
+            raise GneError("BAD_RECIPE", "没有单元")
         if (judge_model is None) != (judge_target is None):
-            raise GneError("BAD_ARGS", "--judge-model と --judge-target は両方指定してください")
+            raise GneError("BAD_ARGS", "请同时指定 --judge-model 与 --judge-target")
         judge = Judge(judge_model, judge_target) if judge_model else None
         try:
             d = evaluate(self, recipe, doses=doses, suite=suite, when=when, judge=judge,
@@ -1226,7 +1226,7 @@ class Session:
         name = name or recipe.name or "units-" + hashlib.sha256(
             json.dumps([recipe.to_dict()["units"], recipe.to_dict()["ablate"]], sort_keys=True).encode()).hexdigest()[:8]
         if not re.fullmatch(r"[\w.\-]+", name):
-            raise GneError("BAD_ARGS", f"名前 {name!r} は英数字・_・-・. だけにしてください")
+            raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含字母、数字、_、-、.")
         if d["when"] != "all":
             name += "@" + re.sub(r"[^\w.\-]+", "_", d["when"])
         path = self.store.eval_dir(self.meta.model_id) / f"{name}.json"
@@ -1237,8 +1237,8 @@ class Session:
     def eval_compare_ablation(self, direction: str, *, top: int = 20, from_layer: int | None = None,
                               doses=(0, 0.5, 1.0), suite: str | Path | None = None, when: str | None = None,
                               max_tokens: int = 64) -> dict:
-        """§6.17: 同じ方向から作った「上位 top ニューロンの消去(gain ×0)」と「方向の消去(ablate)」を同じ表に並べる。
-        能力・ppl・混入は eval、消したい振る舞いの残り具合は方向の対照集合の判定(validate.match)で測る。"""
+        """§6.17：将同一方向得到的“前 top 个神经元消除（gain ×0）”与“方向消除（ablate）”并列在同一张表中。
+        能力、ppl、混入由 eval 测量，目标行为的残留程度由方向对照集的判定（validate.match）测量。"""
         from .direction import behavior, load_contrast, top_writer_neurons
         from .steer import AblateSpec, Unit
         t0 = time.perf_counter()
@@ -1254,9 +1254,9 @@ class Session:
         src = ds.meta.get("source")
         cs_val = load_contrast(src) if src and Path(src).exists() else None
         if cs_val is None:
-            self.warn(f"方向 {ds.name} の対照集合 {src} が見つからないので、振る舞いの残り具合は測りません")
+            self.warn(f"找不到方向 {ds.name} 的对照集 {src}，因此不测量行为的残留程度")
         elif not cs_val[1].match:
-            self.warn("対照集合に validate.match が無いので、振る舞いの残り具合(一致率)は測りません")
+            self.warn("对照集没有 validate.match，因此不测量行为的残留程度（一致率）")
         base = behavior(self, *cs_val, None, max_tokens=max_tokens) if cs_val else None
         rows = []
         for method, recipe in (("neurons", rn), ("direction", rd)):
@@ -1284,11 +1284,11 @@ class Session:
 
     def behavior_null(self, recipe: Recipe, contrast: str | Path, *, random_controls: int = 16, max_tokens: int = 64,
                       mode: str | None = None, sampling=None, seeds: int = 1, prompts: str | Path | list[str] | None = None) -> dict:
-        """CHANGE-03 A: レシピの効果(対照集合の validate.match の一致率の変化)と、同じ大きさのランダムな対照レシピ
-        random_controls 本の効果を比べる。null_pct は「効果が対照の何割より大きいか」(0.95 未満なら対照と区別できない)。
-        sampling(engine.Sampling)を渡すと、各プロンプトを seeds 本ずつサンプリングで生成する(レシピを詰めたときの条件に
-        合わせる)。prompts は検証プロンプトの差し替え(文字列のリスト、またはその YAML。対照集合の YAML なら reactivity の
-        with か user_prompts)。"""
+        """CHANGE-03 A：比较配方效果（对照集 validate.match 一致率的变化）与同量级随机对照配方
+        random_controls 个的效果。null_pct 表示“效果大于多少比例的对照”（低于 0.95 时无法与对照区分）。
+        传入 sampling（engine.Sampling）时，每个提示词用 seeds 条采样生成（与调好配方时的条件一致）。
+        prompts 可替换验证提示词（字符串列表或对应 YAML。若为对照集 YAML，则使用 reactivity 的
+        with 或 user_prompts）。"""
         from .direction import behavior_null, load_contrast
         cs, val = load_contrast(contrast)
         ps = prompts if prompts is None or isinstance(prompts, list) else load_prompt_list(prompts)
@@ -1298,7 +1298,7 @@ class Session:
                 **({"prompts_file": str(prompts)} if prompts is not None and not isinstance(prompts, list) else {}), **d}
 
     def evals(self) -> list[dict]:
-        """保存済みの eval の一覧(新しい順)。"""
+        """已保存的 eval 列表（从新到旧）。"""
         out = []
         for p in sorted(self.store.eval_dir(self.meta.model_id).glob("*.json"), key=lambda p: -p.stat().st_mtime):
             try:
@@ -1315,14 +1315,14 @@ class Session:
 
     def eval_load(self, name: str) -> dict:
         if not re.fullmatch(r"[\w.\-@]+", name or ""):
-            raise GneError("BAD_ARGS", f"名前 {name!r} が不正です")
+            raise GneError("BAD_ARGS", f"名称 {name!r} 无效")
         p = self.store.eval_dir(self.meta.model_id) / f"{name}.json"
         if not p.exists():
-            raise GneError("FILE_NOT_FOUND", f"eval {name} がありません")
+            raise GneError("FILE_NOT_FOUND", f"eval {name} 不存在")
         return json.loads(p.read_text())
 
     def _verify_candidates(self, cands, name: str, design_name: str, n_controls: int, max_tokens: int) -> dict:
-        """候補を層ごとにまとめ、quick 設計の rollout(対照つき)を回す。順位づけは Phase 3 の rank。"""
+        """按层汇总候选，运行 quick 设计的 rollout（带对照）。排序使用 Phase 3 的 rank。"""
         from .sweep import load_design, read_rollouts, run_sweep
         design = load_design(design_name)
         by_layer: dict[int, list] = {}
@@ -1346,11 +1346,11 @@ class Session:
         return {"design": design_name, "runs": runs, "examples": examples, "baselines": baselines}
 
 def load_prompt_list(path: str | Path) -> list[str]:
-    """プロンプトの組の YAML: 文字列のリスト、{prompts: [...]}、または対照集合(reactivity の with、無ければ user_prompts)。"""
+    """提示词集合 YAML：字符串列表、{prompts: [...]}，或对照集（reactivity 的 with，若没有则用 user_prompts）。"""
     import yaml
     p = Path(path)
     if not p.exists():
-        raise GneError("FILE_NOT_FOUND", f"{p} がありません")
+        raise GneError("FILE_NOT_FOUND", f"{p} 不存在")
     d = yaml.safe_load(p.read_text(encoding="utf-8"))
     if isinstance(d, dict):
         if d.get("reactivity"):
@@ -1358,17 +1358,17 @@ def load_prompt_list(path: str | Path) -> list[str]:
         else:
             d = d.get("prompts") or d.get("user_prompts")
     if not isinstance(d, list) or not d or not all(isinstance(x, str) for x in d):
-        raise GneError("BAD_ARGS", f"{p}: プロンプトの組は文字列のリスト(または対照集合の YAML)です")
+        raise GneError("BAD_ARGS", f"{p}: 提示词集合必须是字符串列表（或对照集 YAML）")
     return d
 
 
 def vector_key_of(path: Path) -> str:
-    """ファイルの中身で決まる短い鍵(方向を作り直したら query の LoRA も作り直す)。"""
+    """由文件内容决定的短键（重新创建方向时也会重建 query 的 LoRA）。"""
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]
 
 
 def _unit_spec(u: dict) -> str:
-    """to_dict() のユニット → L:N:+dose / L:N:xk / L:Hh:xk(query は L:Hh:query:方向:×scale、表示用)。"""
+    """to_dict() 的单元 → L:N:+dose / L:N:xk / L:Hh:xk（query 为 L:Hh:query:方向:×scale，用于显示）。"""
     if u.get("mode") == "query":
         return f"{u['layer']}:H{u['head']}:query:{u.get('direction')}:x{u['k']:g}"
     tail = f"x{u['k']:g}" if u.get("mode") == "gain" else f"{u['dose']:+g}"
@@ -1383,7 +1383,7 @@ def _ablate_label(a: dict) -> str:
 
 
 def template_override(model_id: str, arch: str) -> tuple[str, str] | None:
-    """configs/templates/<model_id>.yaml か <arch>.yaml の chat_template(§5.7 の 4)。"""
+    """configs/templates/<model_id>.yaml 或 <arch>.yaml 中的 chat_template（§5.7 的 4）。"""
     import yaml
     from .store import CONFIGS
     for key in (model_id, arch):
@@ -1402,7 +1402,7 @@ def _summ(x: np.ndarray) -> dict:
 
 
 def _merge_logit(old, new):
-    """同じ層の logit lens を、ニューロン番号の和集合でまとめる(新しい方を優先)。"""
+    """按神经元编号的并集合并同一层的 logit lens（优先采用新结果）。"""
     from .lens import LogitLens
     if old.up_ids.shape[1] != new.up_ids.shape[1]:
         return new
@@ -1415,7 +1415,7 @@ def _merge_logit(old, new):
 
 
 def _merge_resid(old: ResidStats, new: ResidStats) -> ResidStats:
-    """層を指定して計算したとき、既存の統計の他の層を残す(コーパスが同じ場合だけ)。"""
+    """指定层计算时，保留已有统计中的其他层（仅当语料相同）。"""
     if old.corpus_sha != new.corpus_sha or old.chunk_tokens != new.chunk_tokens:
         return new
     keep = [i for i, L in enumerate(old.layers) if L not in set(new.layers.tolist())]

@@ -1,4 +1,4 @@
-"""Phase 0 の検証テスト V1〜V8。設計書 §9。`gne verify` と pytest の両方から使う。"""
+"""Phase 0 验证测试 V1～V8。设计文档 §9。可由 `gne verify` 与 pytest 共同使用。"""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ class Verifier:
         n = engine.n_layer
         self.L = layer if layer is not None else n // 2
         if not 1 <= self.L <= n - 3:
-            raise ValueError(f"--layer は 1..{n - 3} にしてください(L-1, L, L+1, L+2 を捕捉するため)")
+            raise ValueError(f"--layer 须为 1..{n - 3}（为了捕获 L-1, L, L+1, L+2）")
         self.rng = np.random.default_rng(seed)
         self.prompt_ids = [engine.tokenize_prompt(engine.render_chat([{"role": "user", "content": p}]))
                            for p in PROMPTS]
@@ -70,11 +70,11 @@ class Verifier:
         out = cap.take()
         missing = names - out.keys()
         if missing:
-            raise RuntimeError(f"捕捉できなかったテンソル: {sorted(missing)} (skipped={cap.skipped})")
+            raise RuntimeError(f"无法捕获的张量：{sorted(missing)}（skipped={cap.skipped}）")
         return out
 
     def rho(self) -> float:
-        """層 L の残差ノルム中央値(各シーケンスの position ≥ 1)。V3/V4/V5 のベクトルの大きさに使う。"""
+        """第 L 层残差范数的中位数（每条序列的 position ≥ 1）。用于 V3/V4/V5 的向量尺度。"""
         if self._rho is None:
             norms = []
             for ids in self.prompt_ids:
@@ -91,7 +91,7 @@ class Verifier:
         for L in range(m.n_layer):
             name = f"blk.{L}.ffn_down.weight"
             if not self.w.has_tensor(name):
-                bad.append(f"{name} なし")
+                bad.append(f"缺少 {name}")
                 continue
             ne = [int(x) for x in self.w.tensor(name).shape]
             if ne != [m.n_ff_at(L), m.n_embd]:
@@ -102,9 +102,9 @@ class Verifier:
             if mat.shape != (m.n_embd, m.n_ff_at(L)) or not np.isfinite(mat).all():
                 bad.append(f"L{L} dequant {mat.shape}")
         st = "fail" if bad else "pass"
-        return VResult("V1", "形状と dequantize", st,
-                       f"全 {m.n_layer} 層の ne=[n_ff, n_embd]、L{checked} を dequantize → (n_embd, n_ff)=({m.n_embd}, {m.n_ff}) {m.ffn_down_qtype}"
-                       + (f" / 不一致: {bad}" if bad else ""), {"bad": bad})
+        return VResult("V1", "形状与 dequantize", st,
+                       f"全部 {m.n_layer} 层的 ne=[n_ff, n_embd]，L{checked} dequantize → (n_embd, n_ff)=({m.n_embd}, {m.n_ff}) {m.ffn_down_qtype}"
+                       + (f" / 不一致：{bad}" if bad else ""), {"bad": bad})
 
     # --- V2 -------------------------------------------------------------------------------------
 
@@ -113,7 +113,7 @@ class Verifier:
         names = self.list_names(L)
         act = pick_act_name(names, L)
         if act is None:
-            return VResult("V2", "FFN 線形性", "fail", f"ffn_down の入力テンソルが見つかりません: {sorted(names)}")
+            return VResult("V2", "FFN 线性性", "fail", f"找不到 ffn_down 的输入张量：{sorted(names)}")
         caps = [self.capture({act, f"ffn_out-{L}"}, [ids]) for ids in self.prompt_ids]
         a = np.concatenate([c[act] for c in caps])
         out = np.concatenate([c[f"ffn_out-{L}"] for c in caps])
@@ -126,9 +126,9 @@ class Verifier:
         tol_med, tol_max = V2_TOL.get(self.w.meta.ffn_down_qtype, V2_TOL_DEFAULT)
         med, mx = float(np.median(rel)), float(rel.max())
         ok = med < tol_med and mx < tol_max and float(np.median(rel_shift)) > 0.5
-        return VResult("V2", "FFN 線形性(W_down の向き・添字、down の後に変換なし)", "pass" if ok else "fail",
-                       f"L{L} `{act}` → W_down@a vs `ffn_out-{L}`: 相対誤差 中央値 {med:.4f} / 最大 {mx:.4f}"
-                       f"(許容 {tol_med}/{tol_max}, {len(rel)} トークン)。添字を 1 ずらすと中央値 {np.median(rel_shift):.2f}",
+        return VResult("V2", "FFN 线性性（W_down 的方向・下标，down 之后无变换）", "pass" if ok else "fail",
+                       f"L{L} `{act}` → W_down@a vs `ffn_out-{L}`：相对误差 中位数 {med:.4f} / 最大 {mx:.4f}"
+                       f"（允许 {tol_med}/{tol_max}，{len(rel)} 个 token）。将下标错开 1 后中位数为 {np.median(rel_shift):.2f}",
                        {"act_name": act, "median": med, "max": mx, "shift_median": float(np.median(rel_shift)),
                         "n_tokens": int(len(rel))})
 
@@ -156,18 +156,18 @@ class Verifier:
         stale = float(np.abs(widened[f"l_out-{L}"] - base[f"l_out-{L}"]).max())
         ok = (np.abs(d_prev).max() == 0 and err_L < 1e-3 and np.abs(d_next).max() > 0
               and restore == 0 and stale == 0)
-        return VResult("V3", "cvec 層対応", "pass" if ok else "fail",
-                       f"set_cvec({{{L}: v}}), ‖v‖=5ρ={np.linalg.norm(v):.1f}: Δl_out-{L - 1} 最大 {np.abs(d_prev).max():.3g}、"
-                       f"Δl_out-{L} と v の相対誤差 最大 {err_L:.2e}({d_L.shape[0]} 位置)、Δl_out-{L + 1} 最大 {np.abs(d_next).max():.3g}、"
-                       f"解除後の差 {restore:.3g}、範囲を L..L+2 に広げたときの l_out-{L} の差 {stale:.3g}",
+        return VResult("V3", "cvec 层对应", "pass" if ok else "fail",
+                       f"set_cvec({{{L}: v}}), ‖v‖=5ρ={np.linalg.norm(v):.1f}：Δl_out-{L - 1} 最大 {np.abs(d_prev).max():.3g}、"
+                       f"Δl_out-{L} 与 v 的相对误差 最大 {err_L:.2e}（{d_L.shape[0]} 个位置）、Δl_out-{L + 1} 最大 {np.abs(d_next).max():.3g}、"
+                       f"解除后的差异 {restore:.3g}、将范围扩展到 L..L+2 时 l_out-{L} 的差异 {stale:.3g}",
                        {"d_prev_max": float(np.abs(d_prev).max()), "err_L": err_L,
                         "d_next_max": float(np.abs(d_next).max()), "restore": restore, "stale": stale})
 
     # --- V11(§6.16 gain)----------------------------------------------------------------------------------
 
     def v11_gain(self, ks=(0.0, 2.0, -1.0), bake: bool = True) -> VResult:
-        """gain の等価性: 層 L のニューロン n を k 倍にしたとき、ffn_down の入力(活性)の n 番目が素の活性 × k になり、
-        他のニューロンは変わらない。(a) LoRA アダプタを当てたとき、(b) W_up を書き換えた GGUF、の両方で見る。"""
+        """gain 等价性：将第 L 层神经元 n 放大 k 倍时，ffn_down 的输入（激活值）第 n 项应变为原始激活值 × k，
+        其他神经元不变。分别检查 (a) 应用 LoRA 适配器，(b) 改写 W_up 的 GGUF。"""
         from .gain import bake_gain_gguf, export_gain_lora
         from .steer import Recipe, Unit
         L = self.L
@@ -176,7 +176,7 @@ class Verifier:
         names = self.e.list_names(ids, L)
         act = pick_act_name(names, L)
         if act is None:
-            return VResult("V11", "gain の等価性", "skip", f"層 {L} の ffn_down 入力が捕捉できません")
+            return VResult("V11", "gain 等价性", "skip", f"无法捕获第 {L} 层的 ffn_down 输入")
 
         def grab(engine, lora=None):
             cap = Capture()
@@ -202,7 +202,7 @@ class Verifier:
                     bake_gain_gguf(self.w, r, gpath)
                     e2 = Engine(gpath, n_gpu_layers=getattr(self.e, "n_gpu_layers", -1), n_ctx=self.e.n_ctx, n_seq_max=1)
                     try:
-                        variants.append(("書き換え", grab(e2)))
+                        variants.append(("改写", grab(e2)))
                     finally:
                         e2.close()
                 for kind, a in variants:
@@ -220,16 +220,16 @@ class Verifier:
                     good = good and d_other <= 1e-3 * max(1.0, float(np.abs(base).max()))
                     ok &= good
                     rows.append({"k": k, "kind": kind, "err": err, "others_max_diff": d_other, "pass": bool(good)})
-        detail = (f"L{L} N{n}(`{act}`、{len(ids)} トークン、|a| 最大 {scale:.3g}): "
-                  + "; ".join(f"k={r['k']:g} {r['kind']}: " + (f"|a| 最大 {r['err']:.2e}(素の最大の {r['err'] / max(scale, 1e-6):.1%})" if r["k"] == 0 else f"相対誤差 中央値 {r['err']:.2e}")
-                              + f"、他のニューロンの差 最大 {r['others_max_diff']:.2e}" for r in rows))
-        return VResult("V11", "gain の等価性(LoRA / 書き換え)", "pass" if ok else "fail", detail,
+        detail = (f"L{L} N{n}（`{act}`、{len(ids)} 个 token、|a| 最大 {scale:.3g}）："
+                  + "; ".join(f"k={r['k']:g} {r['kind']}: " + (f"|a| 最大 {r['err']:.2e}（原始最大值的 {r['err'] / max(scale, 1e-6):.1%}）" if r["k"] == 0 else f"相对误差 中位数 {r['err']:.2e}")
+                              + f"、其他神经元差异 最大 {r['others_max_diff']:.2e}" for r in rows))
+        return VResult("V11", "gain 等价性（LoRA / 改写）", "pass" if ok else "fail", detail,
                        {"layer": L, "neuron": n, "act": act, "rows": rows, "act_max": scale})
 
     # --- V13(§6.17 方向の射影消去、LoRA 版)--------------------------------------------------------------
 
     def _resid_all(self, engine: Engine, ids: list[int], lora=None) -> dict[int, np.ndarray]:
-        """全層(最終層を除く)の l_out-L(位置 0 = attention sink を除く)。"""
+        """所有层（不含最后一层）的 l_out-L（不含位置 0 = attention sink）。"""
         Ls = list(range(engine.n_layer - 1))                    # 最終層は行が間引かれ得るので除く
         names = {f"l_out-{L}": L for L in Ls}
         cap = Capture()
@@ -245,11 +245,11 @@ class Verifier:
         return {names[k]: v.astype(np.float64)[1:] for k, v in cap.take().items()}
 
     def v13_ablation(self, r: np.ndarray | None = None, *, bake: bool = False) -> VResult:
-        """方向 r を全層の残差ライターから消したとき、l_out-L の r 成分が「消えずに残るはずの分」と一致するか。
-        - LoRA: 埋め込みも LoRA に入れられるモデル(出力層が別)では 0、tied のモデルでは埋め込みの r 成分のまま
-          (LoRA で埋め込みを変えられないので、それ以上増えも減りもしない)。
-        - bake(bake=True、F16): 埋め込みも射影するので 0。
-        |r·l_out − 期待値| / ‖l_out‖ が量子化の誤差の水準(< 1e-2)であることを見る。消す前のずれも並べる。"""
+        """从所有层的残差写入器中消除方向 r 后，l_out-L 的 r 分量是否与“应该残留的部分”一致。
+        - LoRA：可将嵌入加入 LoRA 的模型（输出层独立）为 0；tied 模型保留嵌入的 r 分量
+          （LoRA 无法改变嵌入，因此既不增加也不减少）。
+        - bake（bake=True、F16）：嵌入也会投影，因此为 0。
+        检查 |r·l_out − 期望值| / ‖l_out‖ 是否处于量化误差水平（< 1e-2）。同时列出消除前的偏差。"""
         from .ablate import bake_ablation_gguf, embed_in_lora, export_ablation_lora, unit
         r = unit(self.rng.standard_normal(self.w.meta.n_embd) if r is None else r)
         ids = self.prompt_ids[0]
@@ -283,19 +283,19 @@ class Verifier:
             ok &= mx < 1e-2
             out.append({"kind": kind, "expect": "0" if np.isscalar(expect) else "e·r", "n_tensors": n_t, "max_dev": mx,
                         "base_med_dev": float(np.median([x["base_dev_med"] for x in rows])), "rows": rows})
-        detail = "; ".join(f"{v['kind']}({v['n_tensors']} テンソル、r 成分の期待値 {v['expect']}): 最大 {v['max_dev']:.2e}"
-                           f"(消す前は中央値 {v['base_med_dev']:.2e})、r に直交する成分の変化 層 0 で "
-                           f"{v['rows'][0]['perp_change_med']:.3f}・最終で {v['rows'][-1]['perp_change_med']:.3f}" for v in out)
+        detail = "; ".join(f"{v['kind']}（{v['n_tensors']} 个张量、r 分量期望值 {v['expect']}）：最大 {v['max_dev']:.2e}"
+                           f"（消除前中位数 {v['base_med_dev']:.2e}）、与 r 正交分量的变化第 0 层为 "
+                           f"{v['rows'][0]['perp_change_med']:.3f}・末层为 {v['rows'][-1]['perp_change_med']:.3f}" for v in out)
         lora = out[0]
-        return VResult("V13", "方向の射影消去", "pass" if ok else "fail",
-                       f"ランダムな方向({len(ids)} トークン、層 0〜{lora['rows'][-1]['layer']}、埋め込みを LoRA に"
-                       f"{'入れる' if embed_in_lora(self.w) else '入れない(tied)'}): " + detail,
+        return VResult("V13", "方向投影消除", "pass" if ok else "fail",
+                       f"随机方向（{len(ids)} 个 token、第 0～{lora['rows'][-1]['layer']} 层、将嵌入"
+                       f"{'加入' if embed_in_lora(self.w) else '不加入（tied）'} LoRA）：" + detail,
                        {"variants": out, "max_dev": max(v["max_dev"] for v in out), "base_med_dev": lora["base_med_dev"],
                         "n_tensors": lora["n_tensors"], "rows": lora["rows"]})
 
     def v14_lora_vs_bake(self, r: np.ndarray | None = None, n_tokens: int = 32) -> VResult:
-        """同じ方向を消す LoRA と bake(F16)で、greedy の先頭 n_tokens が一致するか。埋め込みは両方そろえる
-        (tied のモデルは LoRA に埋め込みを入れられないので bake も埋め込みを省く)。q8_0 の bake も参考に並べる。"""
+        """用消除同一方向的 LoRA 与 bake（F16），检查 greedy 的前 n_tokens 个 token 是否一致。嵌入在两者中保持一致
+        （tied 模型无法将嵌入加入 LoRA，因此 bake 也省略嵌入）。同时列出 q8_0 bake 作参考。"""
         from .ablate import bake_ablation_gguf, embed_in_lora, export_ablation_lora, unit
         r = unit(self.rng.standard_normal(self.w.meta.n_embd) if r is None else r)
         r = (r * 1.0).astype(np.float32)
@@ -332,19 +332,19 @@ class Verifier:
                                  "lora_differs_from_base": a.token_ids != base[i]})
                     if requant == "f16":
                         ok &= bool(cmp["ok"])
-        detail = ", ".join(f"{x['requant']} プロンプト{x['prompt'] + 1}: " + ("一致" if x["match"] else x["summary"]
-                                                                            + ("" if x["ok"] else "、僅差ではない"))
+        detail = ", ".join(f"{x['requant']} 提示词{x['prompt'] + 1}: " + ("一致" if x["match"] else x["summary"]
+                                                                            + ("" if x["ok"] else "，并非微小差异"))
                            for x in rows)
-        return VResult("V14", "射影消去の LoRA と bake の一致", "pass" if ok else "fail",
-                       f"greedy {n_tokens} トークン、埋め込み{'あり' if embed else 'なし'}: {detail}"
-                       f"(無介入との差: {'あり' if any(x['lora_differs_from_base'] for x in rows) else 'なし'})",
+        return VResult("V14", "投影消除的 LoRA 与 bake 一致性", "pass" if ok else "fail",
+                       f"greedy {n_tokens} 个 token、嵌入{'有' if embed else '无'}：{detail}"
+                       f"（与无干预的差异：{'有' if any(x['lora_differs_from_base'] for x in rows) else '无'}）",
                        {"rows": rows, "embed": embed})
 
     # --- V12(§6.15 位置別ステアリング)----------------------------------------------------------------
 
     def v12_when_gen(self) -> VResult:
-        """when=gen: prefill は素のまま(l_out-L が素の値と完全一致)、生成 1 ステップ目から v が加わる。
-        さらに gne の generate_when(gen) の最初のトークンが無介入と同じで、全体として無介入とも all とも違うことを見る。"""
+        """when=gen：prefill 保持原样（l_out-L 与原始值完全一致），从生成第 1 步开始加入 v。
+        还需检查 gne 的 generate_when(gen) 首个 token 与无干预相同，而整体既不同于无干预，也不同于 all。"""
         from .when import generate_when
         L, n_embd = self.L, self.e.n_embd
         ids = self.prompt_ids[0]
@@ -378,10 +378,10 @@ class Verifier:
         g_all, _ = generate_when(self.e, sctx, msgs, {L: v}, "all", max_tokens=24)
         first_same = bool(g_gen.token_ids[:1] == g_base.token_ids[:1])
         ok = prefill_same == 0 and err_gen < 1e-3 and first_same and info["set_cvec"] == 2
-        return VResult("V12", "位置別ステアリング(when=gen)", "pass" if ok else "fail",
-                       f"l_out-{L}: prefill の差 最大 {prefill_same:.3g}(0 であること)、生成 1 ステップ目の差と v の相対誤差 {err_gen:.2e}。"
-                       f"generate_when(gen): 最初のトークンが無介入と{'同じ' if first_same else '違う'}、set_cvec {info['set_cvec']} 回、"
-                       f"無介入と{'同じ' if g_gen.token_ids == g_base.token_ids else '違う'}、all と{'同じ' if g_gen.token_ids == g_all.token_ids else '違う'}",
+        return VResult("V12", "位置别 steering（when=gen）", "pass" if ok else "fail",
+                       f"l_out-{L}：prefill 差异最大 {prefill_same:.3g}（应为 0）、生成第 1 步差异与 v 的相对误差 {err_gen:.2e}。"
+                       f"generate_when(gen)：首个 token 与无干预{'相同' if first_same else '不同'}、set_cvec {info['set_cvec']} 次、"
+                       f"与无干预{'相同' if g_gen.token_ids == g_base.token_ids else '不同'}、与 all {'相同' if g_gen.token_ids == g_all.token_ids else '不同'}",
                        {"prefill_diff_max": prefill_same, "err_gen": err_gen, "first_token_same": first_same,
                         "set_cvec": info["set_cvec"], "gen_eq_base": g_gen.token_ids == g_base.token_ids,
                         "gen_eq_all": g_gen.token_ids == g_all.token_ids})
@@ -405,8 +405,8 @@ class Verifier:
             back = {i + 1: data[i * n_embd:(i + 1) * n_embd] for i in range(n_layer - 1)}
             b = self.capture(names, [ids], back, layer_range=(1, n_layer - 1))
             same_cap = all(np.array_equal(a[k], b[k]) for k in names)
-            detail = (f"direction.{L} に 0.8ρ·u_{n} を書き出し → common の規則で読み戻したバッファが一致: {same_buf}、"
-                      f"それを全層範囲で set_cvec した捕捉が一致: {same_cap}")
+            detail = (f"将 0.8ρ·u_{n} 写入 direction.{L} → 按 common 规则读回的缓冲区一致：{same_buf}、"
+                      f"用全层范围对其执行 set_cvec 后的捕获一致：{same_cap}")
             data_out = {"neuron": n, "same_buf": bool(same_buf), "same_capture": bool(same_cap)}
             ok = same_buf and same_cap
             if llama_completion:
@@ -423,18 +423,18 @@ class Verifier:
                 self.e.set_cvec(ctx, None)
                 differs = gen["steer"]["ours"] != gen["base"]["ours"]
                 ok = ok and gen["base"]["match"] and gen["steer"]["match"] and differs
-                detail += (f"。llama-completion --control-vector の greedy {n_tokens} トークン: 無介入 一致 {gen['base']['match']}、"
-                           f"介入 一致 {gen['steer']['match']}(介入で出力が変わる: {differs})")
+                detail += (f"。llama-completion --control-vector 的 greedy {n_tokens} 个 token：无干预 一致 {gen['base']['match']}、"
+                           f"干预 一致 {gen['steer']['match']}（干预后输出变化：{differs}）")
                 data_out["generation"] = gen
             else:
-                detail += "。llama-completion が無いので生成の比較は省略"
-        return VResult("V4", "direction.N 対応(GGUF 書き出し → 本家ローダ)", "pass" if ok else "fail", detail, data_out)
+                detail += "。缺少 llama-completion，因此省略生成比较"
+        return VResult("V4", "direction.N 对应（GGUF 导出 → 原生加载器）", "pass" if ok else "fail", detail, data_out)
 
     # --- V5 -------------------------------------------------------------------------------------
 
     def v5_neuron_push(self, hf_model: str | None, hf_python: str | None, n_tokens: int = 32) -> VResult:
         if not hf_model or not hf_python:
-            return VResult("V5", "ニューロン押しの等価性(HF 実装)", "skip", "--hf-model と --hf-python が無いので省略(任意)")
+            return VResult("V5", "神经元推动等价性（HF 实现）", "skip", "缺少 --hf-model 与 --hf-python，因此省略（可选）")
         L = self.L
         n = int(self.rng.integers(self.w.meta.n_ff_at(L)))
         col = self.w.down_column(L, n)
@@ -464,15 +464,15 @@ class Verifier:
         top = np.argsort(-np.maximum(ours["base"]["next_lp"], ours["steer"]["next_lp"]))[:200]
         corr = float(np.corrcoef(d_ours[top], d_hf[top])[0, 1])
         ok = ok and corr > 0.9
-        detail = (f"L{L} N{n} add={add:.2f}: 無介入 {res['base']['summary']} / 介入 {res['steer']['summary']}。"
-                  f"介入による次トークン log p の変化の相関(上位 200 語) {corr:.3f}")
+        detail = (f"L{L} N{n} add={add:.2f}：无干预 {res['base']['summary']} / 干预 {res['steer']['summary']}。"
+                  f"干预导致下一 token log p 变化的相关性（前 200 词） {corr:.3f}")
         r4 = {}
         if hf_down is not None:
             r4 = neuron_order_check(self.w.down_matrix(L), hf_down, self.rng)
-            detail += (f"。R4: HF down_proj と GGUF の列の相関 中央値 {r4['diag_median']:.4f}、"
-                       f"抜き取り {r4['n_sample']} 列で最も相関する HF 列が同じ番号: {r4['argmax_match']:.3f}")
+            detail += (f"。R4：HF down_proj 与 GGUF 列相关性的中位数 {r4['diag_median']:.4f}、"
+                       f"抽样 {r4['n_sample']} 列中相关性最高 HF 列编号相同：{r4['argmax_match']:.3f}")
             ok = ok and r4["argmax_match"] == 1.0
-        return VResult("V5", "ニューロン押しの等価性(HF 実装)", "pass" if ok else "fail", detail,
+        return VResult("V5", "神经元推动等价性（HF 实现）", "pass" if ok else "fail", detail,
                        {"neuron": n, "add": add, "corr_delta": corr, "r4": r4, **{k: v for k, v in res.items()}})
 
     # --- V6 -------------------------------------------------------------------------------------
@@ -488,9 +488,9 @@ class Verifier:
                 r.append(nrm[0] / np.median(nrm[1:]))
             ratios[L] = float(np.median(r))
         ok = all(v >= 3 for v in ratios.values())
-        return VResult("V6", "position 0 の残差ノルム(attention sink)", "info",
-                       "‖l_out‖[pos0] / 中央値[pos≥1]: " + ", ".join(f"L{L} {v:.1f}×" for L, v in ratios.items())
-                       + ("(全層 ≥3×)" if ok else "(3× 未満の層あり: 警告)"), {"ratios": ratios, "all_ge3": ok})
+        return VResult("V6", "position 0 的残差范数（attention sink）", "info",
+                       "‖l_out‖[pos0] / 中位数[pos≥1]：" + ", ".join(f"L{L} {v:.1f}×" for L, v in ratios.items())
+                       + ("（全部层 ≥3×）" if ok else "（存在低于 3× 的层：警告）"), {"ratios": ratios, "all_ge3": ok})
 
     # --- V8 -------------------------------------------------------------------------------------
 
@@ -512,13 +512,13 @@ class Verifier:
             body = ids[1:] if add_bos and not text.startswith(self.e.token_text(bos)) else ids
             back = self.e.detokenize(body, special=True)
             if back != text:
-                bad.append(f"往復不一致: {text[:40]!r} → {back[:40]!r}")
+                bad.append(f"往返不一致：{text[:40]!r} → {back[:40]!r}")
             if add_bos and ids[:2] == [bos, bos]:
-                bad.append("BOS が二重")
+                bad.append("BOS 重复")
             if add_bos and ids[0] != bos:
-                bad.append("BOS がない")
-        return VResult("V8", "トークナイズ往復と BOS", "fail" if bad else "pass",
-                       f"{len(convs)} 会話: テンプレート描画 → tokenize → detokenize が一致、add_bos={add_bos}"
+                bad.append("缺少 BOS")
+        return VResult("V8", "tokenize 往返与 BOS", "fail" if bad else "pass",
+                       f"{len(convs)} 个会话：模板渲染 → tokenize → detokenize 一致，add_bos={add_bos}"
                        + (f" / {bad}" if bad else ""), {"bad": bad, "add_bos": add_bos})
 
     # --- names ----------------------------------------------------------------------------------
@@ -531,7 +531,7 @@ class Verifier:
 
 def run_llama_completion(binary: str, engine: Engine, prompt: str, n_tokens: int, cvec: Path | None,
                          lora: Path | None = None) -> str:
-    """llama-completion で greedy 生成した文字列(プロンプトは表示しない)。lora は gain の LoRA アダプタ(§6.16)。"""
+    """用 llama-completion 进行 greedy 生成的字符串（不显示提示词）。lora 是 gain 的 LoRA 适配器（§6.16）。"""
     cmd = [binary, "-m", str(engine.path), "-p", prompt, "-n", str(n_tokens), "-no-cnv", "--no-display-prompt",
            "--temp", "0", "--top-k", "1", "--seed", "0", "-c", str(engine.n_ctx), "-ngl", str(engine.n_gpu_layers),
            "--no-warmup", "-lv", "0"]
@@ -542,7 +542,7 @@ def run_llama_completion(binary: str, engine: Engine, prompt: str, n_tokens: int
     env = dict(os.environ)
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
     if p.returncode != 0:
-        raise RuntimeError(f"llama-completion が失敗しました: {p.stderr[-2000:]}")
+        raise RuntimeError(f"llama-completion 执行失败：{p.stderr[-2000:]}")
     # completion.cpp は生成の後に必ず "\n\n" を、EOG で止まったときはその前に " [end of text]\n" を出す
     out = p.stdout.removesuffix("\n\n")
     return out.removesuffix(" [end of text]\n")
@@ -556,13 +556,13 @@ def run_hf_reference(python: str, model_dir: str, req: dict) -> dict:
         p = subprocess.run([python, str(script), "--model", model_dir, "--request", str(rq), "--out", str(rs)],
                            capture_output=True, text=True, timeout=1200)
         if p.returncode != 0:
-            raise RuntimeError(f"hf_reference.py が失敗しました: {p.stderr[-3000:]}")
+            raise RuntimeError(f"hf_reference.py 执行失败：{p.stderr[-3000:]}")
         down = Path(td) / f"down_L{req['layer']}.npy"
         return json.loads(rs.read_text()), (np.load(down) if down.exists() else None)
 
 
 def neuron_order_check(gguf_down: np.ndarray, hf_down: np.ndarray, rng, n_sample: int = 256) -> dict:
-    """R4: GGUF の W_down[:, n] と HF の down_proj.weight[:, n] が同じニューロンか(列ごとの相関)。"""
+    """R4：GGUF 的 W_down[:, n] 与 HF 的 down_proj.weight[:, n] 是否为同一神经元（逐列相关性）。"""
     if gguf_down.shape != hf_down.shape:
         return {"diag_median": float("nan"), "argmax_match": 0.0, "n_sample": 0,
                 "error": f"shape {gguf_down.shape} vs {hf_down.shape}"}
@@ -578,13 +578,13 @@ def neuron_order_check(gguf_down: np.ndarray, hf_down: np.ndarray, rng, n_sample
 
 
 def compare_greedy(a_ids, a_top, a_lps, b_ids, b_top, b_lps, near: float = 0.5) -> dict:
-    """greedy 列の比較。一致しない場合、最初の分岐で「相手が選んだトークンが自分の最良から near nats 以内」
-    が双方で成り立てば(僅差の分岐、数値誤差で説明できる)ok。"""
+    """比较 greedy 序列。若不一致，在首次分叉处双方都满足“对方选择的 token 距离自己的最佳项不超过 near nats”
+    （微小差异，可由数值误差解释）时判为 ok。"""
     n = min(len(a_ids), len(b_ids))
     first = next((i for i in range(n) if a_ids[i] != b_ids[i]), None)
     if first is None:
         same_len = len(a_ids) == len(b_ids)
-        return {"ok": True, "first_diff": None, "summary": f"先頭 {n} トークン一致" + ("" if same_len else "(長さ違い)")}
+        return {"ok": True, "first_diff": None, "summary": f"前 {n} 个 token 一致" + ("" if same_len else "（长度不同）")}
 
     def gap(top, lps, other_tok):
         top = list(top[first])
@@ -593,7 +593,7 @@ def compare_greedy(a_ids, a_top, a_lps, b_ids, b_top, b_lps, near: float = 0.5) 
     gap_a, gap_b = gap(a_top, a_lps, b_ids[first]), gap(b_top, b_lps, a_ids[first])
     ok = gap_a < near and gap_b < near
     return {"ok": ok, "first_diff": first, "gap_ours": gap_a, "gap_ref": gap_b,
-            "summary": f"{first} トークン目で分岐(相手の選択との差 ours {gap_a:.2f} / ref {gap_b:.2f} nats)"}
+            "summary": f"第 {first + 1} 个 token 处分叉（与对方选择的差异 ours {gap_a:.2f} / ref {gap_b:.2f} nats）"}
 
 
 def find_llama_completion() -> str | None:

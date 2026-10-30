@@ -51,7 +51,7 @@ def per_token(arr: np.ndarray, n_used: int, T: int) -> np.ndarray:
     if arr.shape == (T, n_used):
         return arr
     if arr.shape[0] != T * n_used:
-        raise ValueError(f"MoE の捕捉の形 {arr.shape} がトークン数 {T} × 専門家 {n_used} と合いません")
+        raise ValueError(f"MoE 捕获形状 {arr.shape} 与 token 数 {T} × 专家数 {n_used} 不匹配")
     x = arr.reshape(T, n_used, arr.shape[1])
     return x[..., 0] if x.shape[2] == 1 else x
 

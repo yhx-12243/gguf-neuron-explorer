@@ -109,14 +109,14 @@ def _check(weights, by_layer: dict[int, list[tuple[int, float]]]) -> None:
     m = weights.meta
     for L, nk in by_layer.items():
         if not 0 <= L < m.n_layer:
-            raise GneError("BAD_RECIPE", f"層 {L} は範囲外です")
+            raise GneError("BAD_RECIPE", f"第 {L} 层超出范围")
         if m.n_expert and weights.is_moe(L):
-            raise GneError("BAD_RECIPE", f"層 {L} は MoE です。専門家のニューロンの gain は {L}:E<専門家>:N<n>:xk(CHANGE-05)")
+            raise GneError("BAD_RECIPE", f"第 {L} 层是 MoE。专家神经元的 gain 请用 {L}:E<专家>:N<n>:xk（CHANGE-05）")
         if not weights.has_tensor(f"blk.{L}.ffn_up.weight"):
-            raise GneError("ARCH_UNSUPPORTED", f"blk.{L}.ffn_up.weight がありません(gate と up が 1 つのテンソルの arch は未対応)")
+            raise GneError("ARCH_UNSUPPORTED", f"缺少 blk.{L}.ffn_up.weight（暂不支持 gate 与 up 合为一个张量的 arch）")
         for n, _ in nk:
             if not 0 <= n < m.n_ff_at(L):
-                raise GneError("BAD_RECIPE", f"L{L} のニューロン {n} は範囲外です")
+                raise GneError("BAD_RECIPE", f"L{L} 的神经元 {n} 超出范围")
 
 
 def lora_tensors(weights, by_layer: dict[int, list[tuple[int, float]]]) -> dict[int, tuple[np.ndarray, np.ndarray]]:
@@ -140,7 +140,7 @@ def export_gain_lora(weights, recipe: Recipe, path: str | Path) -> dict:
     experts = expert_gain_by_layer(recipe.units)
     shared = shared_gain_by_layer(recipe.units)
     if not by_layer and not heads and not experts and not shared:
-        raise GneError("BAD_RECIPE", "gain のユニットがありません(例 --unit 14:8949:x2、ヘッドは 21:H7:x0、専門家のニューロンは 12:E3:N5:x0)")
+        raise GneError("BAD_RECIPE", "没有 gain 单元（例如 --unit 14:8949:x2；注意力头为 21:H7:x0）")
     m = weights.meta
     tens = lora_tensors(weights, by_layer) if by_layer else {}
     htens = head_lora_tensors(weights, heads)
@@ -207,7 +207,7 @@ def _patch_targets(weights, recipe: Recipe) -> list[tuple[str, object, float, st
         elif u.kind == "expert" and u.mode == "route":
             name = weights.router_bias_name(u.layer)
             if name is None:
-                raise GneError("ARCH_UNSUPPORTED", f"層 {u.layer} にはルーターのバイアスがありません")
+                raise GneError("ARCH_UNSUPPORTED", f"第 {u.layer} 层没有路由器偏置")
             out.append((name, u.expert, float(u.dose), "add"))
     for name, _, _, kind in out:
         if not weights.has_tensor(name) or (kind != "add" and not supported(weights.tensor(name).tensor_type)):
@@ -225,10 +225,10 @@ def bake_gain_patch(weights, recipe: Recipe, dst: str | Path) -> dict:
     from .patch import Patcher, PatchSet
     targets = _patch_targets(weights, recipe)
     if targets is None:
-        raise GneError("UNSUPPORTED_QUANT", "このレシピはスケールパッチで書けません(ヘッドの gain や対応していない量子化型)",
-                       "--requant q8_0 か f16 で書き換え GGUF にしてください")
+        raise GneError("UNSUPPORTED_QUANT", "此配方无法通过缩放补丁写入（包含注意力头 gain 或不支持的量化类型）",
+                       "请用 --requant q8_0 或 f16 生成改写后的 GGUF")
     if Path(weights.path).resolve() == Path(dst).resolve():
-        raise GneError("BAD_ARGS", "--in と --out が同じファイルです")
+        raise GneError("BAD_ARGS", "--in 与 --out 指向同一文件")
     pt = Patcher(weights)
     ps = PatchSet("gain" + (f"-{recipe.name}" if recipe.name else ""), weights.meta.model_id)
     for name, at, k, kind in targets:
@@ -260,18 +260,18 @@ def bake_gain_gguf(weights, recipe: Recipe, dst: str | Path, *, requant: str = "
             return bake_gain_patch(weights, recipe, dst)
         requant = "q8_0"
     if any(u.kind == "expert" for u in recipe.units):
-        raise GneError("BAD_RECIPE", "専門家全体の gain と route はスケールパッチでだけ書けます", "--requant patch(か auto)")
+        raise GneError("BAD_RECIPE", "专家整体的 gain 与 route 只能通过缩放补丁写入", "--requant patch（或 auto）")
     by_layer = gain_by_layer(recipe.units)
     heads = head_gain_by_layer(recipe.units)
     if not by_layer and not heads:
-        raise GneError("BAD_RECIPE", "gain のユニットがありません")
+        raise GneError("BAD_RECIPE", "没有 gain 单元")
     if by_layer:
         _check(weights, by_layer)
     head_tensors = {weights.head_block(L, hk[0][0])[0]: L for L, hk in heads.items()}
     if requant not in ("q8_0", "f16"):
-        raise GneError("BAD_ARGS", "--requant は q8_0 か f16 です")
+        raise GneError("BAD_ARGS", "--requant 只能为 q8_0 或 f16")
     if Path(weights.path).resolve() == Path(dst).resolve():
-        raise GneError("BAD_ARGS", "--in と --out が同じファイルです")
+        raise GneError("BAD_ARGS", "--in 与 --out 指向同一文件")
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     tag = f" +gain:{recipe.name}" if recipe.name else " +gain"
     w = copy_gguf_header(weights, dst, tag=tag, recipe=recipe)

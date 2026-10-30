@@ -84,7 +84,7 @@ def experts_contrast(session, contrast: str | Path, *, name: str | None = None, 
     arch = w.arch
     Ls = [L for L in (layers if layers is not None else range(e.n_layer)) if arch.layers[L].ffn.startswith("moe")]
     if not Ls:
-        raise GneError("BAD_ARGS", "MoE の層がありません(gne experts は MoE のモデルの機能です)")
+        raise GneError("BAD_ARGS", "没有 MoE 层（gne experts 是 MoE 模型的功能）")
     dname = direction
     if dname is None:
         try:
@@ -112,7 +112,7 @@ def experts_contrast(session, contrast: str | Path, *, name: str | None = None, 
     nms = {L: moe_names(names, L) for L in Ls}
     for L, nm in nms.items():
         if not {"argsort", "weights", "weighted"} <= set(nm):
-            raise GneError("ARCH_UNSUPPORTED", f"層 {L} の MoE の捕捉名が見つかりません({nm})")
+            raise GneError("ARCH_UNSUPPORTED", f"找不到第 {L} 层的 MoE 捕获名称（{nm}）")
     want = {nm[k] for nm in nms.values() for k in ("argsort", "weights", "weighted")} | {f"l_out-{L}" for L in Ls}
     cap = Capture(lambda nm_: nm_ in want)
     n_embd = session.meta.n_embd
@@ -126,7 +126,7 @@ def experts_contrast(session, contrast: str | Path, *, name: str | None = None, 
         S = min(_suffix_len(ids["A"], ids["B"]), _suffix_len(ids["A"], ids["B2"]))
         p_a = len(head_a) if ids["A"][:len(head_a)] == head_a else None
         if p_a is None or p_a < len(ids["A"]) - S or p_a >= len(ids["A"]):
-            session.warn(f"プロンプト {i + 1}: 返事の位置を合わせられないので飛ばしました")
+            session.warn(f"提示词 {i + 1}：无法对齐回复位置，已跳过")
             tick(f"experts: {i + 1}/{n}")
             continue
         n_resp = len(ids["A"]) - p_a                                   # 返事のトークン(どの側でも末尾の同じ並び)
@@ -147,7 +147,7 @@ def experts_contrast(session, contrast: str | Path, *, name: str | None = None, 
         samples.append({"prompt": u, "response": r[:200], "n_response": n_resp})
         tick(f"experts: {i + 1}/{n}")
     if not samples:
-        raise GneError("BAD_CONTRAST", "返事の位置を合わせられたプロンプトがありません")
+        raise GneError("BAD_CONTRAST", "没有能够对齐回复位置的提示词")
     rows, nrows = [], []
     for L in Ls:
         ra = dirs.get(L)
@@ -186,7 +186,7 @@ def experts_contrast(session, contrast: str | Path, *, name: str | None = None, 
 def load_expert_candidates(session, name: str) -> list[dict]:
     p = session.store.experts_dir(session.meta.model_id) / f"{name}.candidates.jsonl"
     if not p.exists():
-        raise GneError("FILE_NOT_FOUND", f"専門家の対照分析 {name} がありません(gne experts contrast で作れます)")
+        raise GneError("FILE_NOT_FOUND", f"没有专家对照分析 {name}（可用 gne experts contrast 创建）")
     return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
@@ -209,7 +209,7 @@ def expert_dossier(session, L: int, ex: int, *, top: int = 20) -> dict:
     w = session.weights
     li = w.moe_layer(L)
     if not 0 <= ex < li.n_expert:
-        raise GneError("BAD_ARGS", f"L{L} の専門家 {ex} は範囲外です(0..{li.n_expert - 1})")
+        raise GneError("BAD_ARGS", f"L{L} 的专家 {ex} 超出范围（0..{li.n_expert - 1}）")
     d = {"layer": L, "expert": ex, "n_expert": li.n_expert, "n_expert_used": li.n_expert_used, "n_ff": li.n_ff,
          "routing": li.routing, "router_bias": None, "usage": None, "contrasts": [], "neurons": []}
     b = w.router_bias(L)
@@ -262,7 +262,7 @@ def experts_sweep(session, L: int, *, ks=(0.0, 2.0), design: str = "quick", prom
     exs = list(range(li.n_expert)) if experts is None else [int(x) for x in experts]
     for ex in exs:
         if not 0 <= ex < li.n_expert:
-            raise GneError("BAD_ARGS", f"L{L} の専門家 {ex} は範囲外です(0..{li.n_expert - 1})")
+            raise GneError("BAD_ARGS", f"L{L} 的专家 {ex} 超出范围（0..{li.n_expert - 1}）")
     name = run or f"L{L}-experts-{design}"
     out = session.run_path(name)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -325,7 +325,7 @@ def moe_route(session, text: str, *, layers: list[int] | None = None, chat: bool
            else e.tokenize(text, add_special=True, parse_special=False))
     Ls = [L for L in (range(e.n_layer) if layers is None else layers) if w.arch.layers[L].ffn.startswith("moe")]
     if not Ls:
-        raise GneError("BAD_ARGS", "MoE の層がありません")
+        raise GneError("BAD_ARGS", "没有 MoE 层")
     names = e.list_names(ids[:16])
     nms = {L: moe_names(names, L) for L in Ls}
     want = {nm[k] for nm in nms.values() for k in ("argsort", "weights") if k in nm}

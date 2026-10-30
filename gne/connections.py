@@ -30,7 +30,7 @@ def ffn_norm_weight(weights, L: int) -> np.ndarray:
         name = f"blk.{L}.{nm}"
         if weights.has_tensor(name):
             return np.asarray(tensor_to_f32(weights.tensor(name)), dtype=np.float32).reshape(-1)
-    raise GneError("ARCH_UNSUPPORTED", f"層 {L} の FFN の前の norm({' / '.join(FFN_NORM_NAMES)})がありません")
+    raise GneError("ARCH_UNSUPPORTED", f"第 {L} 层 FFN 前的 norm（{' / '.join(FFN_NORM_NAMES)}）不存在")
 
 
 def dense_layers(weights) -> list[int]:
@@ -117,7 +117,7 @@ def compute_connections(weights, *, k: int = 24, window: int | None = None, rho:
     m = weights.meta
     Ls = dense_layers(weights)
     if len(Ls) < 2:
-        raise GneError("ARCH_UNSUPPORTED", "dense FFN の層が 2 つ以上必要です(MoE の層は connections の対象外)")
+        raise GneError("ARCH_UNSUPPORTED", "至少需要 2 个 dense FFN 层（MoE 层不在 connections 的范围内）")
     d = m.n_embd
     nmax = max(m.n_ff_at(L) for L in Ls)
     pairs = [(i, j) for jj, j in enumerate(Ls) for i in Ls[:jj] if window is None or j - i <= window]
@@ -141,7 +141,7 @@ def compute_connections(weights, *, k: int = 24, window: int | None = None, rho:
         Gj = tensor_to_f32(weights.tensor(f"blk.{j}.ffn_gate.weight")) * g[None, :]
         Uj = tensor_to_f32(weights.tensor(f"blk.{j}.ffn_up.weight")) * g[None, :]
         if Gj.shape != (m.n_ff_at(j), d):
-            raise GneError("ARCH_UNSUPPORTED", f"blk.{j}.ffn_gate の形 {Gj.shape} が想定外です")
+            raise GneError("ARCH_UNSUPPORTED", f"blk.{j}.ffn_gate 的形状 {Gj.shape} 不符合预期")
         for i in srcs:
             Vi = V.get(i)
             for a0 in range(0, Vi.shape[1], chunk):

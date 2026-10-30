@@ -64,7 +64,7 @@ class Suite:
 def load_suite(path: str | Path | None = None) -> Suite:
     p = Path(path) if path else DEFAULT_SUITE
     if not p.exists():
-        raise GneError("FILE_NOT_FOUND", f"タスク集 {p} がありません")
+        raise GneError("FILE_NOT_FOUND", f"找不到任务集 {p}")
     d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     prompts = yaml.safe_load(PROMPTS.read_text(encoding="utf-8"))
     persona = [{"id": f"{ps}.{k}", "prompt": v} for ps in (d.get("persona") or {}).get("prompt_sets", ["en"])
@@ -135,7 +135,7 @@ def score_format(text: str, task: dict) -> bool:
         if check == "lang:en":
             return not _KANA.search(t) and sum(ch.isascii() for ch in letters) / len(letters) >= 0.9
         return sum(not ch.isascii() for ch in letters) / len(letters) >= 0.5 and bool(_KANA.search(t))
-    raise GneError("BAD_SUITE", f"format の check={check!r} は分かりません")
+    raise GneError("BAD_SUITE", f"无法识别 format 的 check={check!r}")
 
 
 def mix_ratio(text: str, zh_only: set[str]) -> tuple[float, float]:
@@ -213,7 +213,7 @@ def _generate(session, items: list[tuple[str | list[dict], int]], vecs, lora, wh
                     used += need
                 idx = idx[len(part):]
                 if used > e.n_ctx:
-                    raise GneError("CONTEXT_FULL", f"タスク {part[0]} が n_ctx={e.n_ctx} に入りません")
+                    raise GneError("CONTEXT_FULL", f"任务 {part[0]} 无法放入 n_ctx={e.n_ctx}")
                 sp = None if sampling is None else dataclasses.replace(sampling, seed=sampling.seed + 7919 * n_batch)
                 n_batch += 1
                 for i, r in zip(part, e.generate_greedy(ctx, [seqs[i] for i in part], max_tokens=mt, sampling=sp), strict=True):
@@ -281,16 +281,16 @@ class Reactivity:
     def load(cls, path: str | Path) -> Reactivity:
         p = Path(path)
         if not p.exists():
-            raise GneError("FILE_NOT_FOUND", f"対照集合 {p} がありません")
+            raise GneError("FILE_NOT_FOUND", f"找不到对照集 {p}")
         d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         pairs = [(str(x["with"]), str(x["without"])) for x in (d.get("reactivity") or []) if x.get("with") and x.get("without")]
         match = (d.get("validate") or {}).get("match")
         if not pairs or not match:
-            raise GneError("BAD_CONTRAST", f"{p}: 反応性には reactivity(with / without の対)と validate.match が要ります")
+            raise GneError("BAD_CONTRAST", f"{p}: 反应性需要 reactivity（with / without 对）和 validate.match")
         try:
             re.compile(match)
         except re.error as e:
-            raise GneError("BAD_CONTRAST", f"validate.match の正規表現が読めません: {e}") from e
+            raise GneError("BAD_CONTRAST", f"无法解析 validate.match 的正则表达式：{e}") from e
         return cls(d.get("name") or p.stem, p, pairs, match)
 
 

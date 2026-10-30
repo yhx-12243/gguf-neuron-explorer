@@ -77,20 +77,20 @@ def sampling_values(d: dict | None, *, base: dict | None = None, seed: bool = Tr
     allowed = set(SAMPLING_KEYS) | ({"seed"} if seed else set())
     extra = sorted(set(d or {}) - allowed)
     if extra:
-        raise GneError("BAD_ARGS", f"サンプリングに {', '.join(extra)} は使えません(使えるのは {', '.join(sorted(allowed))})")
+        raise GneError("BAD_ARGS", f"采样参数不能包含 {', '.join(extra)}（可用参数：{', '.join(sorted(allowed))}）")
     out = dict(base or SAMPLING_PRESETS["llama_server"])
     try:
         for k, v in (d or {}).items():
             if v is not None:
                 out[k] = int(v) if k in ("top_k", "seed", "dry_allowed_length") else float(v)
     except (TypeError, ValueError) as e:
-        raise GneError("BAD_ARGS", f"サンプリングの値が読めません: {e}") from e
+        raise GneError("BAD_ARGS", f"无法解析采样值：{e}") from e
     if not (0 <= out.get("dry_multiplier", 0) <= 5 and 1 <= out.get("dry_base", 1.75) <= 4 and out.get("dry_allowed_length", 2) >= 1):
-        raise GneError("BAD_ARGS", "dry_multiplier は 0〜5、dry_base は 1〜4、dry_allowed_length は 1 以上です")
+        raise GneError("BAD_ARGS", "dry_multiplier 须为 0～5，dry_base 须为 1～4，dry_allowed_length 须大于等于 1")
     if not (0 <= out["temperature"] <= 5 and 0 < out["top_p"] <= 1 and 0 <= out["min_p"] < 1 and out["top_k"] >= 0
             and -2 <= out["presence_penalty"] <= 2):
-        raise GneError("BAD_ARGS", "temperature は 0〜5、top_p は 0〜1、min_p は 0〜1、top_k は 0 以上、"
-                                   "presence_penalty は −2〜2 です")
+        raise GneError("BAD_ARGS", "temperature 须为 0～5，top_p 须为 0～1，min_p 须为 0～1，top_k 须大于等于 0，"
+                                   "presence_penalty 须为 −2～2")
     return out
 
 
@@ -138,7 +138,7 @@ def parse_ablate(spec: str) -> AblateSpec:
     """"NAME"、"NAME@L"(L の層で測った r)、"NAME:0.5"(半分だけ消す)、"NAME@10:0.5"。"""
     m = _ABLATE_RE.match((spec or "").strip())
     if not m:
-        raise GneError("BAD_ARGS", f"--ablate {spec!r} を読めません", "NAME、NAME@層、NAME:倍率、NAME@層:倍率(例 evil@10:0.5)")
+        raise GneError("BAD_ARGS", f"无法解析 --ablate {spec!r}", "NAME、NAME@层、NAME:倍率、NAME@层:倍率（例：evil@10:0.5）")
     name, L, sc = m.groups()
     return AblateSpec(name, float(sc) if sc else 1.0, "all", int(L) if L else None)
 
@@ -214,57 +214,57 @@ class Recipe:
 
     def validate(self) -> None:
         if self.dose_unit not in ("rel", "absmax", "raw"):
-            raise GneError("BAD_RECIPE", f"dose_unit={self.dose_unit!r} は rel / absmax / raw のどれかです")
+            raise GneError("BAD_RECIPE", f"dose_unit={self.dose_unit!r} 只能为 rel / absmax / raw")
         if not self.units and self.ablate is None:
-            raise GneError("BAD_RECIPE", "ユニットがありません")
+            raise GneError("BAD_RECIPE", "没有单元")
         if self.ablate is not None:
             if not re.fullmatch(r"[\w.\-@]+", self.ablate.direction or ""):
-                raise GneError("BAD_RECIPE", f"ablate の方向の名前 {self.ablate.direction!r} が不正です")
+                raise GneError("BAD_RECIPE", f"ablate 的方向名 {self.ablate.direction!r} 无效")
             if not -1.5 <= self.ablate.scale <= 1.5:
-                raise GneError("BAD_RECIPE", "ablate の scale は −1.5〜1.5 です(1 で全部消す、負はその方向を強める)")
+                raise GneError("BAD_RECIPE", "ablate 的 scale 须为 −1.5～1.5（1 完全消除，负数增强该方向）")
         from .when import parse_when
         parse_when(self.when)                      # 書き方の誤りはここで返す
         if self.sampling is not None:
             if not isinstance(self.sampling, dict):
-                raise GneError("BAD_RECIPE", "sampling は {temperature, top_k, top_p, min_p, presence_penalty} の表です")
+                raise GneError("BAD_RECIPE", "sampling 必须是包含 {temperature, top_k, top_p, min_p, presence_penalty} 的映射")
             self.sampling = sampling_values(self.sampling, seed=False)
         for u in self.units:
             if u.mode not in ("add", "gain", "query", "route"):
-                raise GneError("BAD_RECIPE", f"{u}: mode は add / gain / query / route です")
+                raise GneError("BAD_RECIPE", f"{u}: mode 只能为 add / gain / query / route")
             if u.kind in ("expert_neuron", "expert", "shared"):           # MoE(CHANGE-05)
                 if u.kind != "shared" and u.expert is None:
-                    raise GneError("BAD_RECIPE", f"{u}: 専門家の番号(expert)が要ります(例 12:E37:N511:+0.8)")
+                    raise GneError("BAD_RECIPE", f"{u}：需要专家编号（expert）（例：12:E37:N511:+0.8）")
                 if u.kind in ("expert_neuron", "shared") and (u.neuron is None or u.mode not in ("add", "gain")):
-                    raise GneError("BAD_RECIPE", f"{u}: 専門家のニューロンは neuron が要り、add か gain です(例 12:E37:N511:x0)")
+                    raise GneError("BAD_RECIPE", f"{u}：专家神经元需要 neuron，且仅支持 add 或 gain（例：12:E37:N511:x0）")
                 if u.kind == "expert" and u.mode not in ("gain", "route"):
-                    raise GneError("BAD_RECIPE", f"{u}: 専門家全体は gain(12:E37:x0)か route(12:E37:route:+2)です")
+                    raise GneError("BAD_RECIPE", f"{u}：专家整体应使用 gain（12:E37:x0）或 route（12:E37:route:+2）")
                 if u.mode == "gain" and u.k is None:
-                    raise GneError("BAD_RECIPE", f"{u}: gain には倍率 k が要ります")
+                    raise GneError("BAD_RECIPE", f"{u}：gain 需要倍率 k")
                 if u.mode == "add" and self.dose_unit == "absmax":
-                    raise GneError("BAD_RECIPE", "専門家のニューロンの add は dose_unit=rel か raw で使います(absmax は未対応)")
+                    raise GneError("BAD_RECIPE", "专家神经元的 add 须使用 dose_unit=rel 或 raw（暂不支持 absmax）")
                 continue
             if u.mode == "query":
                 if u.kind != "head" or u.head is None or not u.direction or not u.seek or u.k is None:
-                    raise GneError("BAD_RECIPE", f"{u}: query はヘッドだけで、head・direction・seek・scale が要ります"
-                                                 "(例 {layer: 15, kind: head, head: 2, mode: query, direction: yandere, seek: yandere_react, scale: 1})")
+                    raise GneError("BAD_RECIPE", f"{u}: query 仅适用于注意力头，需要 head・direction・seek・scale"
+                                                 "（例：{layer: 15, kind: head, head: 2, mode: query, direction: yandere, seek: yandere_react, scale: 1}）")
                 continue
             if u.kind == "head" and (u.head is None or u.mode != "gain" or u.k is None):
-                raise GneError("BAD_RECIPE", f"{u}: ヘッドは gain だけで、head と k が要ります(例 {u.layer}:H7:x0)。"
-                                             "ヘッドは向きを持たないので add はできません(方向を足すなら L:dir:NAME:dose)")
+                raise GneError("BAD_RECIPE", f"{u}: 注意力头仅支持 gain，需要 head 和 k（例：{u.layer}:H7:x0）。"
+                                             "注意力头没有方向，因此不能 add（如需添加方向，请用 L:dir:NAME:dose）")
             if u.mode == "gain" and (u.kind not in ("neuron", "head") or u.k is None):
-                raise GneError("BAD_RECIPE", f"{u}: gain は neuron(またはヘッド)と k が要ります(例 {u.layer}:{u.neuron}:x2)")
+                raise GneError("BAD_RECIPE", f"{u}: gain 需要 neuron（或注意力头）和 k（例：{u.layer}:{u.neuron}:x2）")
             if u.kind == "neuron" and u.neuron is None:
-                raise GneError("BAD_RECIPE", f"{u}: neuron がありません")
+                raise GneError("BAD_RECIPE", f"{u}: 缺少 neuron")
             if u.kind == "random" and u.seed is None:
-                raise GneError("BAD_RECIPE", f"{u}: random には seed が要ります")
+                raise GneError("BAD_RECIPE", f"{u}: random 需要 seed")
             if u.kind == "random" and self.dose_unit != "rel":
-                raise GneError("BAD_RECIPE", "ランダム方向のユニットは dose_unit=rel でだけ使えます")
+                raise GneError("BAD_RECIPE", "随机方向单元只能用于 dose_unit=rel")
             if u.kind == "direction" and (not u.direction or u.mode != "add"):
-                raise GneError("BAD_RECIPE", f"{u}: direction には方向の名前が要り、gain にはできません(例 {u.layer}:dir:yandere:+0.5)")
+                raise GneError("BAD_RECIPE", f"{u}: direction 需要方向名称，且不能用于 gain（例：{u.layer}:dir:yandere:+0.5）")
             if u.kind == "direction" and self.dose_unit == "absmax":
-                raise GneError("BAD_RECIPE", "方向のユニットは dose_unit=rel か raw で使います(absmax はニューロン用)")
+                raise GneError("BAD_RECIPE", "方向单元只能用于 dose_unit=rel 或 raw（absmax 用于神经元）")
             if u.kind not in ("neuron", "random", "direction", "head"):
-                raise GneError("BAD_RECIPE", f"{u}: kind は neuron / random / direction / head / expert_neuron / expert / shared です")
+                raise GneError("BAD_RECIPE", f"{u}: kind 只能为 neuron / random / direction / head / expert_neuron / expert / shared")
 
 
 _UNIT_RE = re.compile(r"^(\d+):(?:(\d+)|random:(\d+)|dir:([\w.\-@]+)|[Hh](\d+)):(x?)([+-]?[\d.]+(?:e[+-]?\d+)?)$", re.I)
@@ -284,7 +284,7 @@ def parse_unit(spec: str) -> Unit:
         L, e, shared, n, ngain, egain, route, val = mm.groups()
         if shared:
             if n is None:
-                raise GneError("BAD_UNIT", f"{spec!r}: shared expert はニューロンだけです(例 12:S:N511:+0.8)")
+                raise GneError("BAD_UNIT", f"{spec!r}：shared expert 仅支持神经元（例：12:S:N511:+0.8）")
             return Unit(int(L), int(n), 0.0 if ngain else float(val), "shared",
                         mode="gain" if ngain else "add", k=float(val) if ngain else None)
         if n is not None:
@@ -295,17 +295,17 @@ def parse_unit(spec: str) -> Unit:
         return Unit(int(L), None, 0.0, "expert", mode="gain", k=float(val), expert=int(e))
     m = _UNIT_RE.match(spec.strip())
     if not m:
-        raise GneError("BAD_UNIT", f"ユニット指定 {spec!r} を読めません",
-                       "L:N:dose(例 14:8949:+1.0)、L:random:SEED:dose、gain は L:N:x2(倍率)、方向は L:dir:NAME:dose、"
-                       "ヘッドは L:Hh:xk(例 21:H7:x0)、MoE は L:Ee:Nn:dose・L:Ee:xk・L:Ee:route:delta・L:S:Nn:dose")
+        raise GneError("BAD_UNIT", f"无法解析单元指定 {spec!r}",
+                       "L:N:dose（例：14:8949:+1.0）、L:random:SEED:dose、gain 为 L:N:x2（倍率）、方向为 L:dir:NAME:dose、"
+                       "注意力头为 L:Hh:xk（例：21:H7:x0）、MoE 为 L:Ee:Nn:dose・L:Ee:xk・L:Ee:route:delta・L:S:Nn:dose")
     L, n, seed, dname, head, gain, val = m.groups()
     if head is not None:
         if not gain:
-            raise GneError("BAD_UNIT", f"{spec!r}: ヘッドは gain(L:Hh:xk)だけです。ヘッドは向きを持たないので add はできません")
+            raise GneError("BAD_UNIT", f"{spec!r}: 注意力头仅支持 gain（L:Hh:xk）。注意力头没有方向，因此不能 add")
         return Unit(int(L), None, 0.0, "head", mode="gain", k=float(val), head=int(head))
     if gain:
         if n is None:
-            raise GneError("BAD_UNIT", f"{spec!r}: gain はニューロンとヘッドにだけ使えます")
+            raise GneError("BAD_UNIT", f"{spec!r}: gain 仅可用于神经元和注意力头")
         return Unit(int(L), int(n), 0.0, mode="gain", k=float(val))
     if seed is not None:
         return Unit(int(L), None, float(val), "random", int(seed))
@@ -352,17 +352,17 @@ def unit_vector(weights, stats, unit: Unit, dose_unit: DoseUnit = "rel", dirs: D
     L = unit.layer
     if unit.kind == "direction":
         if dirs is None:
-            raise GneError("BAD_RECIPE", "方向のユニットには方向の読み込み先が要ります(Session.vectors を使ってください)")
+            raise GneError("BAD_RECIPE", "方向单元需要方向加载源（请使用 Session.vectors）")
         d = np.asarray(dirs(unit.direction, L), dtype=np.float32)
         if dose_unit == "rel":
             nrm = float(np.linalg.norm(d))
             return (unit.dose * stats.rho(L) * d / nrm).astype(np.float32) if nrm > 0 else np.zeros_like(d)
         if dose_unit == "raw":
             return (unit.dose * d).astype(np.float32)
-        raise GneError("BAD_RECIPE", "方向のユニットは dose_unit=rel か raw で使います")
+        raise GneError("BAD_RECIPE", "方向单元只能用于 dose_unit=rel 或 raw")
     if unit.kind == "random":
         if dose_unit != "rel":
-            raise GneError("BAD_RECIPE", "ランダム方向のユニットは dose_unit=rel でだけ使えます")
+            raise GneError("BAD_RECIPE", "随机方向单元只能用于 dose_unit=rel")
         return (unit.dose * stats.rho(L) * random_direction(weights.meta.n_embd, int(unit.seed), L)).astype(np.float32)
     if unit.kind in ("expert_neuron", "shared"):
         # MoE(CHANGE-05 §C): 書き込み方向の押し。専門家が選ばれたかどうかに関係なく全トークンに足す(ニューロン押しではない)
@@ -371,7 +371,7 @@ def unit_vector(weights, stats, unit: Unit, dose_unit: DoseUnit = "rel", dirs: D
             return (unit.dose * stats.rho(L) * col / np.linalg.norm(col)).astype(np.float32)
         if dose_unit == "raw":
             return (unit.dose * col).astype(np.float32)
-        raise GneError("BAD_RECIPE", "専門家のニューロンの add は dose_unit=rel か raw で使います")
+        raise GneError("BAD_RECIPE", "专家神经元的 add 须使用 dose_unit=rel 或 raw")
     col = weights.down_column(L, unit.neuron)
     if dose_unit == "rel":
         nrm = float(np.linalg.norm(col))
@@ -433,17 +433,17 @@ def cvec_buffer(n_layer: int, n_embd: int, vectors: dict[int, np.ndarray]) -> tu
     """ゼロ埋め (n_layer-1)*n_embd のバッファに vectors[L] を [(L-1)*n_embd : L*n_embd] へ置く。
     戻り値 (buf, il_start, il_end)。il_start/il_end は vectors に含まれる層の最小・最大。"""
     if not vectors:
-        raise ValueError("vectors が空です")
+        raise ValueError("vectors 为空")
     buf = np.zeros((n_layer - 1) * n_embd, dtype=np.float32)
     for L, v in vectors.items():
         L = int(L)
         if L == 0:
-            raise ValueError("層 0 は control vector で操作できません(llama.cpp の仕様、§5.1)")
+            raise ValueError("第 0 层无法用 control vector 操作（llama.cpp 规范，§5.1）")
         if not 1 <= L < n_layer:
-            raise ValueError(f"層 {L} は範囲外です(1..{n_layer - 1})")
+            raise ValueError(f"第 {L} 层超出范围（1..{n_layer - 1}）")
         v = np.asarray(v, dtype=np.float32).reshape(-1)
         if v.size != n_embd:
-            raise ValueError(f"層 {L} のベクトル長 {v.size} が n_embd={n_embd} と違います")
+            raise ValueError(f"第 {L} 层的向量长度 {v.size} 与 n_embd={n_embd} 不同")
         buf[(L - 1) * n_embd:L * n_embd] += v
     layers = sorted(int(L) for L in vectors)
     return buf, layers[0], layers[-1]
@@ -457,12 +457,12 @@ def export_cvec_gguf(vectors: dict[int, np.ndarray], path: str | Path, *, model_
     n_embd = None
     for L, v in vectors.items():
         if int(L) == 0:
-            raise ValueError("層 0 は control vector で操作できません")
+            raise ValueError("第 0 层无法用 control vector 操作")
         n_embd = np.asarray(v).size if n_embd is None else n_embd
         if np.asarray(v).size != n_embd:
-            raise ValueError("層ごとのベクトル長がそろっていません")
+            raise ValueError("各层向量长度不一致")
     if n_embd is None:
-        raise ValueError("vectors が空です")
+        raise ValueError("vectors 为空")
     buf, _, _ = cvec_buffer(n_layer, n_embd, vectors)
     w = GGUFWriter(str(path), arch="controlvector")
     w.add_string("controlvector.model_hint", model_hint)
@@ -530,8 +530,8 @@ def import_cvec_gguf(path: str | Path, *, source: Literal["exact", "generator"] 
 
 # --- 他形式の書き出し(§6.5 export_vectors) -----------------------------------------------------------
 
-LAYER_SEMANTICS = ("vectors[L] は層 L(0 始まり、GGUF の blk.L、HF の model.layers[L])の出力の残差に"
-                   "全トークン位置で足すベクトル。llama.cpp の control vector では direction.L に当たる")
+LAYER_SEMANTICS = ("vectors[L] 是加到第 L 层（从 0 开始；GGUF 中为 blk.L，HF 中为 model.layers[L]）输出残差的向量，"
+                   "作用于所有 token 位置。在 llama.cpp 的 control vector 中对应 direction.L")
 
 
 def export_vectors(vectors: dict[int, np.ndarray], path: str | Path, *,
@@ -554,7 +554,7 @@ def export_vectors(vectors: dict[int, np.ndarray], path: str | Path, *,
         save_file({f"direction.{L}": v for L, v in vecs.items()}, str(path),
                   metadata={k: v if isinstance(v, str) else json.dumps(v, ensure_ascii=False) for k, v in meta.items()})
     else:
-        raise GneError("BAD_FORMAT", f"形式 {fmt!r} は cvec / npz / json / safetensors のどれかです")
+        raise GneError("BAD_FORMAT", f"格式 {fmt!r} 只能为 cvec / npz / json / safetensors")
 
 
 # --- 焼き付け(§6.5.1) ------------------------------------------------------------------------------------
@@ -564,12 +564,12 @@ def bias_support(arch: str, table_path: str | Path | None = None) -> tuple[str |
     t = yaml.safe_load(Path(table_path or CONFIGS / "arch" / "bias_support.yaml").read_text(encoding="utf-8"))
     checked = t.get("checked_llama_cpp", "?")
     if arch in (t.get("optional") or []):
-        return "add", "ローダが ffn_down.bias を任意テンソルとして作り、build_ffn に渡す", checked
+        return "add", "加载器会将 ffn_down.bias 作为可选张量创建，并传给 build_ffn", checked
     if arch in (t.get("required") or []):
-        return "existing", "ローダが ffn_down.bias を必須で作る(既存の bias に加算する)", checked
+        return "existing", "加载器会强制创建 ffn_down.bias（加到现有 bias 上）", checked
     if arch in (t.get("ignored") or []):
-        return None, "ローダは ffn_down.bias を受け付けるが、グラフが使わない(焼いても効かない)", checked
-    return None, "ローダが ffn_down.bias を作らないので、足したテンソルで読み込みが拒否される(wrong number of tensors)", checked
+        return None, "加载器接受 ffn_down.bias，但计算图不使用它（烘焙也不会生效）", checked
+    return None, "加载器不会创建 ffn_down.bias，因此添加张量后加载会被拒绝（wrong number of tensors），不应使用 bake", checked
 
 
 @dataclass
@@ -615,18 +615,18 @@ def bake_bias_gguf(weights, vectors: dict[int, np.ndarray], src: str | Path, dst
     m = weights.meta
     mode, reason, checked = bias_support(m.arch)
     if mode is None:
-        raise GneError("ARCH_UNSUPPORTED", f"arch {m.arch!r} には bake できません: {reason}(確認した llama.cpp: {checked})",
-                       "control vector GGUF(gne export-cvec)を llama-cli / llama-server の --control-vector で使ってください")
+        raise GneError("ARCH_UNSUPPORTED", f"arch {m.arch!r} 无法 bake：{reason}（已确认的 llama.cpp：{checked}）",
+                       "请使用 llama-cli / llama-server 的 --control-vector 加载 control vector GGUF（gne export-cvec）")
     if m.has_post_ffn_norm:
-        raise GneError("ARCH_UNSUPPORTED", "post_ffw_norm がある arch では bias と control vector が等価になりません")
+        raise GneError("ARCH_UNSUPPORTED", "存在 post_ffw_norm 的 arch 中，bias 与 control vector 不等价")
     if m.n_expert:
-        raise GneError("ARCH_UNSUPPORTED", "MoE の専門家別 bias には対応していません")
+        raise GneError("ARCH_UNSUPPORTED", "不支持 MoE 的专家级 bias")
     if Path(src).resolve() == Path(dst).resolve():
-        raise GneError("BAD_ARGS", "--in と --out が同じファイルです")
+        raise GneError("BAD_ARGS", "--in 与 --out 指向同一文件")
     vecs = {int(L): np.asarray(v, dtype=np.float32).reshape(-1) for L, v in vectors.items()}
     for L, v in vecs.items():
         if not 0 <= L < m.n_layer or v.size != m.n_embd:
-            raise GneError("BAD_RECIPE", f"層 {L} のベクトルが不正です(n_layer={m.n_layer}, n_embd={m.n_embd})")
+            raise GneError("BAD_RECIPE", f"第 {L} 层的向量无效（n_layer={m.n_layer}, n_embd={m.n_embd}）")
 
     r: GGUFReader = weights.reader
     tag = f" +recipe:{recipe.name}" if recipe and recipe.name else " +recipe"
@@ -640,7 +640,7 @@ def bake_bias_gguf(weights, vectors: dict[int, np.ndarray], src: str | Path, dst
         if hit and int(hit.group(1)) in vecs:
             L = int(hit.group(1))
             if t.tensor_type not in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
-                raise GneError("ARCH_UNSUPPORTED", f"{t.name} の型 {t.tensor_type.name} には加算できません")
+                raise GneError("ARCH_UNSUPPORTED", f"无法与 {t.name} 的类型 {t.tensor_type.name} 相加")
             base = np.asarray(t.data, dtype=np.float32).reshape(-1)
             data = (base + vecs[L]).astype(np.float16 if t.tensor_type == GGMLQuantizationType.F16 else np.float32)
             plan.append((t.name, data, t.tensor_type))
@@ -654,7 +654,7 @@ def bake_bias_gguf(weights, vectors: dict[int, np.ndarray], src: str | Path, dst
             if bname in names:
                 continue                         # 既存 bias は上で加算する
             if mode != "add":
-                raise GneError("ARCH_UNSUPPORTED", f"{bname} が必須の arch なのにファイルにありません")
+                raise GneError("ARCH_UNSUPPORTED", f"该 arch 要求 {bname}，但文件中不存在")
             plan.append((bname, vecs[L].copy(), GGMLQuantizationType.F32))
             report.added.append(bname)
     for name, data, qtype in plan:
