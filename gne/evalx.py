@@ -316,21 +316,136 @@ def reactivity_score(session, rc: Reactivity, recipe: Recipe | None, when: str, 
     return d
 
 
+# --- 方向を使うレシピの指標(CHANGE-06 F.1)-----------------------------------------------------------------
+
+def direction_of(recipe: Recipe | None) -> str | None:
+    """レシピが使う方向の名前(proj・方向のユニット・ablate)。ランダム対照の消去(random-SEED)は除く。"""
+    if recipe is None:
+        return None
+    for u in recipe.units:
+        if u.mode == "proj":
+            return u.direction or recipe.default_direction
+    for u in recipe.units:
+        if u.kind == "direction" and u.direction:
+            return u.direction
+    if recipe.ablate is not None and not recipe.ablate.direction.startswith("random-"):
+        return recipe.ablate.direction
+    return None
+
+
+class DirMetrics:
+    """方向を使うレシピの、速い物差しの点数の変化と残差の差の方向成分・直交成分(drift_par / drift_orth、A 側・B 側)。
+    外から見える指標として、対照集合に validate.match があれば A 側(system_a 付き)の判定の一致率も測る(behavior)。
+    点数は基準層と最も後ろの層で測り、行に平らに出す値(drift_*・dir_drop_a)は最も後ろの層のもの。"""
+
+    def __init__(self, session, name: str, *, contrast: str | Path | None = None, layers: list[int] | None = None,
+                 behavior: bool = True, max_tokens: int = 64, max_examples: int | None = 64):
+        from .direction import Scorer, base_layer_of, load_contrast, score_layers_default
+        from .direction import score as score_fn
+        self.session = session
+        ds = session.direction_set(name)
+        src = contrast or ds.meta.get("source")
+        if not src or not Path(src).exists():
+            raise GneError("BAD_ARGS", f"找不到用于创建方向 {name} 的对照集 {src}")
+        self.cs, self.val = load_contrast(src)
+        if base_layer_of(ds) is None:
+            score_fn(session, ds, self.cs)
+            ds = session.direction_set(name)
+        b = base_layer_of(ds)
+        self.layers = sorted(set(layers)) if layers else sorted({b, max(score_layers_default(session, ds, b))})
+        self.top = max(self.layers)
+        self.name, self.ds = name, ds
+        # 質問が多い対照集合(何百問)では、1 回の測定で全部を読むと大きいモデルで何十分もかかるので、等間隔に間引く
+        from .direction import thin
+        self.max_examples = max_examples
+        self.sc = Scorer(session, ds, self.cs, layers=self.layers, max_examples=max_examples)
+        self.behavior = behavior and bool(self.val.match)
+        self.max_tokens = max_tokens
+        self.n_score = self.sc.n("A") + self.sc.n("B")
+        self.n_beh = len(thin(list(self.val.prompts), max_examples)) if self.behavior else 0
+        self.cost = self.n_score + self.n_beh             # 1 回の測定で読む・作る会話の数(進み具合に数える)
+        self.tick: Callable[[int, str], None] = lambda n, label="": None
+        self.base = None
+        self.base_rate = None
+
+    def prepare(self) -> None:
+        """無介入の点数と一致率(測る前に 1 回)。"""
+        self.base = self.sc.run(keep=True)
+        self.tick(self.n_score, "方向指标（无干预）")
+        if self.behavior:
+            from .direction import behavior as beh
+            self.base_rate = beh(self.session, self.cs, self.val, None, max_tokens=self.max_tokens,
+                                 max_examples=self.max_examples, with_kl=False)["rate"]
+            self.tick(self.n_beh, "方向指标（无干预）")
+
+    def measure(self, r: Recipe | None, label: str = "方向指标") -> dict:
+        from .direction import drift
+        if r is None:
+            got = self.base
+        else:
+            lora = self.session.lora_for(r)
+            vecs = self.session.vectors(r)[0] if r.add_units else None
+            got = self.sc.run(lora, vecs, keep=True)
+            self.tick(self.n_score, label)
+        layers = {}
+        for L in self.layers:
+            x = {"score_a": float(got["A"]["values"][L].mean()), "score_b": float(got["B"]["values"][L].mean()),
+                 "drop_a": float(self.base["A"]["values"][L].mean() - got["A"]["values"][L].mean()),
+                 "delta_b": float(got["B"]["values"][L].mean() - self.base["B"]["values"][L].mean())}
+            for side in "AB":
+                x[f"drift_par_{side.lower()}"], x[f"drift_orth_{side.lower()}"] = drift(
+                    self.base[side]["resid"][L], got[side]["resid"][L], self.sc.r[L])
+            layers[str(L)] = x
+        top = layers[str(self.top)]
+        out = {"direction": self.name, "layer": self.top, "layers": layers, "dir_drop_a": top["drop_a"],
+               **{k: top[k] for k in ("drift_par_a", "drift_orth_a", "drift_par_b", "drift_orth_b")}}
+        if self.behavior:
+            from .direction import behavior as beh
+            rate = self.base_rate
+            if r is not None:
+                rate = beh(self.session, self.cs, self.val, r, max_tokens=self.max_tokens, max_examples=self.max_examples,
+                           with_kl=False)["rate"]
+                self.tick(self.n_beh, label)
+            out["rate"], out["rate_drop"] = rate, None if rate is None or self.base_rate is None else self.base_rate - rate
+        return out
+
+
+def control_set(session, recipe: Recipe, n: int, *, pool: str = "before", score_layers: list[int] | None = None) -> list[Recipe]:
+    """レシピのランダム対照。add のユニット・ablate は control_recipes(同じ大きさのランダムな向き)、proj のユニットは
+    同数のランダムなヘッドに同じ s で(CHANGE-06 F.2)。どちらも無ければ空。"""
+    from .controls import control_recipes
+    if n <= 0:
+        return []
+    if not recipe.proj_units:
+        return control_recipes(session, recipe, n)
+    from .headproj import proj_control_recipes
+    base = control_recipes(session, recipe, n) if (recipe.add_units or recipe.ablate is not None) else [recipe] * n
+    out = []
+    for j, b in enumerate(base):
+        c = proj_control_recipes(session, b, n, pool=pool, score_layers=score_layers)[j]
+        out.append(c.like(c.units, name=f"{recipe.name or 'recipe'}-random{j}"))
+    return out
+
+
 # --- 評価の本体 ----------------------------------------------------------------------------------------
 
 def evaluate(session, recipe: Recipe, *, doses=(0, 0.25, 0.5, 0.75, 1.0), suite: str | Path | None = None,
              when: str | None = None, judge: Judge | None = None, random_controls: int = 0,
              reactivity: str | Path | None = None, head_controls: int = 0, reactivity_tokens: int = 64,
-             progress: Callable[[int, int, str], None] | None = None) -> dict:
+             control_pool: str = "before", direction_metrics: bool = True, baseline: dict | None = None,
+             dir_max_examples: int | None = 64, progress: Callable[[int, int, str], None] | None = None) -> dict:
     """dose(レシピ全体の倍率)ごとに全タスクを流し、指標の表を返す。0 が無ければ足す(ベースライン、最初に測る)。
     倍率 0 も同じ when の経路で生成する(バッチの組み方で数値が変わるので、比べる行どうしで経路をそろえる)。
     負の倍率(反対向き)も測れる。表は倍率の小さい順。
     random_controls > 0 なら、0 以外の各倍率で同じ大きさのランダムな対照レシピ(controls.control_recipes)も同じタスクで測り、
     行の ctrl に persona・能力・ppl の分布を入れる(CHANGE-03 A。judge は対照では回さない)。
     reactivity(対照集合の YAML)を渡すと、各倍率で反応性(トリガーあり/なしの判定の一致率の差、CHANGE-04 F)も測る。
-    head_controls > 0 なら、ヘッドのユニットを同じ k のランダムなヘッドに替えた対照で反応性を測り、null_pct を出す。"""
+    head_controls > 0 なら、ヘッドのユニットを同じ k のランダムなヘッドに替えた対照で反応性を測り、null_pct を出す。
+    方向を使うレシピ(proj・方向のユニット・ablate)では、各行に速い物差しの点数の変化と直交成分のずれ(drift_par / drift_orth、
+    A 側・B 側)を出す(CHANGE-06 F.1)。proj のユニットの対照は同数のランダムなヘッド(control_pool: before / same-layers、F.2)で、
+    目的の指標(dir_drop_a、validate.match があれば判定の一致率の減少 rate_drop)と副作用(drift_orth_b)の null_pct を出す。
+    baseline(前の evaluate の戻り値の "_baseline")を渡すと、倍率 0 の測定を使い回す(方式の比較・ヘッド数の曲線用)。"""
     from .controls import head_control_recipes
-    from .controls import control_recipes
     from .controls import null_pct as ctrl_null_pct
     from .controls import summarize as summarize_ctrl
     from .when import parse_when
@@ -344,7 +459,14 @@ def evaluate(session, recipe: Recipe, *, doses=(0, 0.25, 0.5, 0.75, 1.0), suite:
     t0 = time.perf_counter()
     rows, samples, base_persona = [], {}, None
     n_ctrl = max(0, int(random_controls))
-    if n_ctrl and not control_recipes(session, recipe, 1):
+    dm = None
+    dname = direction_of(recipe) if direction_metrics else None
+    if dname is not None:
+        try:
+            dm = DirMetrics(session, dname, max_examples=dir_max_examples)
+        except GneError as e:
+            session.warn(f"不测量方向 {dname} 的得分与正交分量偏移：{e.message}")
+    if n_ctrl and not control_set(session, recipe, 1, pool=control_pool, score_layers=dm.layers if dm else None):
         n_ctrl = 0                                  # gain だけのレシピには向きが無いので対照を作れない
     total, done = (len(doses) + n_ctrl * (len(doses) - 1)) * (len(items) + len(st.ppl)), 0
     rc = Reactivity.load(reactivity) if reactivity else None
@@ -353,12 +475,24 @@ def evaluate(session, recipe: Recipe, *, doses=(0, 0.25, 0.5, 0.75, 1.0), suite:
         n_hctrl = 0                                 # ヘッドの無いレシピにはヘッドの対照を作れない
     if rc is not None:
         total += (len(doses) + n_hctrl * (len(doses) - 1)) * 2 * len(rc.pairs)
+    n_nonzero = len({float(x) for x in doses} - {0.0})
+    if dm is not None:                              # 方向の指標: 無介入 1 回 + 倍率ごと + 対照ごと
+        total += dm.cost * (1 + n_nonzero + n_ctrl * n_nonzero)
 
     def tick(n: int, d: float = 0.0):
         nonlocal done
         done += n
         if progress:
             progress(done, total, f"eval dose {d:g}")
+
+    def dtick(n: int, label: str):
+        nonlocal done
+        done += n
+        if progress:
+            progress(min(done, total), total, label)
+    if dm is not None:
+        dm.tick = dtick
+        dm.prepare()
 
     def measure(r: Recipe | None, d: float):
         vecs = session.vectors(r)[0] if r is not None else None
@@ -384,7 +518,18 @@ def evaluate(session, recipe: Recipe, *, doses=(0, 0.25, 0.5, 0.75, 1.0), suite:
         r = recipe.scaled(d) if d != 0 else None
         ps = session.patches_for(r)                    # CHANGE-05: 専門家全体の gain・route は作業用コピーで読み直して測る
         with session.patched(ps) if ps is not None else contextlib.nullcontext():
-            row, by, ex, fm = measure(r, d)
+            if d == 0 and baseline is not None:
+                row, by, ex, fm = (json.loads(json.dumps(baseline["row"])), baseline["by"], baseline["ex"], baseline["fm"])
+                tick(len(items) + len(st.ppl), d)
+            else:
+                row, by, ex, fm = measure(r, d)
+            if d == 0:
+                base_meas = {"row": json.loads(json.dumps(row)), "by": by, "ex": ex, "fm": fm}
+            if dm is not None:
+                row["direction"] = dm.measure(r, f"方向指标 倍率 {d:g}")
+                for k in ("dir_drop_a", "drift_par_a", "drift_orth_a", "drift_par_b", "drift_orth_b", "rate", "rate_drop"):
+                    if k in row["direction"]:
+                        row[k] = row["direction"][k]
             pers_out = [o for _, o in by["persona"]]
             if d == 0:
                 base_persona = pers_out
@@ -404,14 +549,17 @@ def evaluate(session, recipe: Recipe, *, doses=(0, 0.25, 0.5, 0.75, 1.0), suite:
                 row["reactivity"] = rx
         if n_ctrl and d != 0:
             crow = []
-            for c in control_recipes(session, r, n_ctrl):
+            for j, c in enumerate(control_set(session, r, n_ctrl, pool=control_pool, score_layers=dm.layers if dm else None)):
                 pc = session.patches_for(c)                    # 対照も同じ専門家の gain・route を残すので、同じパッチで測る
                 with session.patched(pc) if pc is not None else contextlib.nullcontext():
                     cr, cby, _, _ = measure(c, d)
+                    cdm = dm.measure(c, f"方向指标 倍率 {d:g} 对照 {j + 1}/{n_ctrl}") if dm is not None else None
                 pm = persona_metrics(base_persona, [o for _, o in cby["persona"]], tok)
                 crow.append({"name": c.name, "capability": cr["capability"], "ppl_mean": cr["ppl_mean"],
                              "mix": cr["mix_zh"] + cr["mix_other"], "novelty": pm["novelty"], "mass": pm["mass"],
-                             "distinct4": pm["distinct4"]})
+                             "distinct4": pm["distinct4"],
+                             **({"units": [u.label() for u in c.proj_units]} if c.proj_units else {}),
+                             **({k: cdm.get(k) for k in ("dir_drop_a", "drift_orth_b", "rate_drop")} if cdm else {})})
             row["ctrl"] = {"n": len(crow), "rows": crow}
         rows.append(row)
         samples[f"{d:g}"] = {"persona": [{"id": t["id"], "text": o["text"][:400]} for t, o in by["persona"]],
@@ -445,13 +593,34 @@ def evaluate(session, recipe: Recipe, *, doses=(0, 0.25, 0.5, 0.75, 1.0), suite:
             row["ctrl_capability_drop_p50"] = c["capability_drop_pt"]["p50"]
             row["ctrl_ppl_worse_p50"] = c["ppl_worse_pct"]["p50"]
             row["novelty_null_pct"] = ctrl_null_pct(row["persona"]["novelty"], [x["novelty"] for x in cr])
+            if row.get("dir_drop_a") is not None:          # CHANGE-06 F.2: 目的の指標と副作用の null_pct
+                row["dir_null_pct"] = ctrl_null_pct(row["dir_drop_a"], [x.get("dir_drop_a") for x in cr])
+                row["drift_orth_b_null_pct"] = ctrl_null_pct(row["drift_orth_b"], [x.get("drift_orth_b") for x in cr])
+                c["dir_drop_a"] = summarize_ctrl([x.get("dir_drop_a") for x in cr])
+                c["drift_orth_b"] = summarize_ctrl([x.get("drift_orth_b") for x in cr])
+            if row.get("rate_drop") is not None:
+                row["rate_null_pct"] = ctrl_null_pct(row["rate_drop"], [x.get("rate_drop") for x in cr])
+                c["rate_drop"] = summarize_ctrl([x.get("rate_drop") for x in cr])
+            # 外から見える指標(判定の一致率)を主にする。無介入で一致率が 0 なら下がりようが無いので点数の下がり方で見る
+            key = "rate_null_pct" if row.get("rate_null_pct") is not None and (dm.base_rate or 0) > 0 else "dir_null_pct"
+            if recipe.proj_units and row.get(key) is not None and row[key] < 0.95:      # V29: 対照を超えていないことを明示
+                row.setdefault("notes", []).append(
+                    f"目标指标（{'判定一致率下降' if key == 'rate_null_pct' else '得分下降幅度'}）仅比同数量、相同 s 的随机注意力头的"
+                    f" {row[key] * 100:.0f}% 更大（低于 0.95：不能说明注意力头的选择有效）")
     if rc is not None:
         b0 = base.get("reactivity", {}).get("reactivity")
         for row in rows:
             x = row.get("reactivity")
             if x is not None and b0 is not None:
                 x["increase"] = x["reactivity"] - b0              # 無介入からの反応性の増え方
+    notes = [f"倍率 {r_['dose']:g}: {n}" for r_ in rows for n in r_.get("notes", [])]
     return {"recipe": recipe.to_dict(), "when": w, "random_controls": n_ctrl,
+            **({"control_pool": control_pool} if recipe.proj_units and n_ctrl else {}),
+            **({"direction_metrics": {"direction": dm.name, "layers": dm.layers, "contrast": dm.cs.name,
+                                      "behavior": dm.behavior, "base_rate": dm.base_rate, "n_a": dm.sc.n("A"),
+                                      "n_b": dm.sc.n("B"), "n_behavior": dm.n_beh, "max_examples": dm.max_examples}}
+               if dm is not None else {}),
+            **({"notes": notes} if notes else {}), "_baseline": base_meas,
             "reactivity": None if rc is None else {"contrast": str(rc.path), "name": rc.name, "n_pairs": len(rc.pairs),
                                                    "head_controls": n_hctrl, "max_tokens": reactivity_tokens}, "suite": {"name": st.name, "path": str(st.path), "n_tasks": st.n_tasks,
             "thresholds": th}, "doses": doses, "rows": rows, "samples": samples,

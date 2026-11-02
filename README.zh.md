@@ -114,6 +114,16 @@ gne heads show 15 2                                           # 单个头：排�
 gne heads listen --heads 14:H0-3 --system @persona.txt -u "I had lunch with a coworker." --direction wr_mix14   # 回复的注意力与逐 token 贡献
 gne steer --unit 15:H2:x2 -p "I had lunch with Emily today." --compare   # 头 gain（W_O 上的 LoRA）
 gne eval --recipe R --reactivity configs/contrast/yandere_react.yaml --head-controls 8
+
+gne direction score --name evil                               # 逐层 A/B 分离度，记录基准层（不生成）
+gne heads causal --name evil                                  # 停掉哪些头会让方向得分变化（不生成）
+gne heads allocate --name evil --target -3 --n-heads 6,5,4    # 按效率分配强度，并比较头更少的组
+gne heads candidates --alloc evil --prompts held_out.yaml     # 为每个组 × 倍率生成回复，写出供匿名评分
+gne heads candidates --tally evil                             # 汇总每个候选的评分
+gne steer --recipe ~/.gne/heads/<model_id>/evil.alloc-n4.yaml --system "You are a cruel AI." -p "Who are you?" --compare   # 仅所选头沿方向的分量
+gne eval --recipe ~/.gne/heads/<model_id>/evil.alloc-n4.yaml --random-controls 16   # 与相同强度的随机头对照
+gne eval --recipe R --compare-methods                         # 相同效果下比较全层消融 / 头分量 / 头 gain / 神经元消融
+gne headproj export --recipe R                                # 每层 rank-1 LoRA（--bake 只改写相关张量）
 ```
 
 `export-cvec --verify` 还会检查 `llama-completion --control-vector` 是否给出与 `gne` 相同的 greedy 输出。它会在 `build/` 和 `PATH` 中查找 `llama-completion`，也可以传入 `--llama-completion`。
@@ -138,6 +148,7 @@ units:
   - {layer: 13, neuron: 7956, mode: gain, k: 0} # gain：移除该神经元的输出（×0）
   - {layer: 16, kind: direction, direction: evil, dose: +0.3}   # 添加来自 gne direction 的方向
   - {layer: 15, kind: head, head: 2, mode: gain, k: 2}           # 注意力头：缩放其输出（×2）
+  - {layer: 16, kind: head, head: 8, mode: proj, direction: evil, s: 6}   # 注意力头：只改变其沿方向的写入（s = 1 消除）
 ablate: {direction: refusal, scale: 1.0}        # 从所有残差写入器中投影消除方向（LoRA）
 sampling: {temperature: 1.0, top_k: 20, top_p: 0.95, min_p: 0.05, presence_penalty: 0.9}   # 试用方式（不使用 seed）
 ```
@@ -196,6 +207,26 @@ gne steer -m M --unit 12:E37:N511:x2 -p "..." --compare
 
 缩放补丁会改写受影响行量化块中的 fp16 scale，使一行或一个专家的 slab 精确变为原来的 k 倍（k = 0 时写入零字节）。它适用于 Q4_0 到 Q8_0、Q2_K 到 Q6_K、除 IQ1_M 外的 IQ 类型，以及 F16/BF16/F32。补丁写入 `~/.gne/work/` 下的工作副本（绝不会改动原始 GGUF），并在每次使用后恢复；重新加载副本对 1.4 GB 模型约需 0.3 秒，对 5 GB 模型约需 0.9 秒。`steer`、`eval`、UI 聊天和 OpenAI 兼容端点会自动应用这些补丁。列方向（`W_down[:, n]`）无法用这种方式打补丁。在 MoE 层内，sweep、lens 和反向查找按 `e × n_ff_exp + n` 为神经元编号。
 
+### CHiPS：只改变少数注意力头中沿方向的分量
+
+这里介绍的方法称为 **CHiPS**（Causal Head-isolated Projection Steering，因果头隔离投影引导）。顾名思义，它只对由因果效果选出的注意力头应用沿方向的投影。与从每一层每个写入者中移除方向的全层消融相比，关键区别就在于这一限制。
+
+用 `gne direction` 创建的方向也可以应用到单个注意力头上。每个注意力头都会在每个 token 向残差流加入一个向量。`proj` 单元将该向量拆成沿方向的部分和其余部分，只改变前者：强度为 `s` 时，注意力头沿方向的写入变为原来的 `1 − s` 倍，因此 `s = 1` 会消除，`s = 2` 会反转，负的 `s` 会强化；注意力头写入的其他内容保持不变。这就是它与头 gain（`L:Hh:xk`）的区别：gain 会缩放整个输出，包括与方向无关的全部信息。由于变化量与当前输入下该注意力头沿方向写入的量成正比，它只在该头沿方向写入时生效，在其他位置几乎不产生影响。同一性质也决定了限制：它无法创造注意力头原本没有写入的行为。强化承载人格的注意力头在没有额外提示的普通对话中不会产生效果，只有先由 system 提示词、少量神经元或方向推动让行为出现时才会生效。
+
+注意力头和强度都在不生成文本的情况下选定。`gne direction score` 让对照集两侧读取到回复即将开始的位置，并逐层测量两侧沿方向相距多远；分离得最好的层会被记录为基准层。随后 `gne heads causal` 先停掉整层注意力头，再在关键层中逐个停掉注意力头，记录得分下降量，并与该头沿方向直接写入的量并列。较后层的注意力头即使不沿基准层方向写入也可能重要，因此还会在后续几层测量下降。`marginal` 模式下，同一命令从当前组出发，逐次略微提高单个注意力头的强度以测量其效率；这一排名通常与直接停掉注意力头得到的排名不同。`gne heads allocate` 按效率比例分配强度，缩放整个组直到最难生效的示例达到目标得分，并构建头数更少的组，以便选择与较大组效果相当的最小一组。
+
+`gne heads pipeline --spec file.json` 可从包含对照集（以及可选设置）的单个文件一次运行这些步骤：使用全部问题创建方向、记录基准层、筛选层再筛选单个注意力头、分配强度。问题可以有数百个；停头阶段使用等间隔抽取的子集（默认 64 个），因为每次试验都会读取它使用的全部问题。若停掉某些层或头会让中性侧残差变化超过其自身大小的一半，则将其排除，因为它们不是在作用于方向，而是在破坏模型；停掉第一层的全部注意力头通常就会如此。未指定目标时，强度瞄准两侧平均得分的中点。中点通常只能消除约一半行为，因此要完全消除时请将目标写为 `B`：强度会瞄准 B 侧平均值（若最强头卡在默认上限 `s_max = 30`，请提高上限）。中止后使用相同文件和设置重新运行会复用已创建的方向和因果结果，并从分配阶段继续（`--fresh` 或 UI 中的“从头重新创建”会重建全部内容）。比较表的“剩余”列统计某组未能降到目标的 A 侧问题数。`gne heads refine --name NAME`（表中的“从剩余中添加”）只将这些剩余问题作为 A 侧、原始 B 侧问题作为 B 侧，在两侧应用该组后重建方向，并运行相同步骤来选出要添加的注意力头和强度。该组已经改变的部分在两侧相同，因此新方向只保留该组尚未消除的差异。补充注意力头是在原组应用状态下找到的，因此绝不单独使用：对于比较表中的每个组，它会写出一个合并原组与该组的配方，并沿原方向重新测量剩余数量和中性侧偏移。表中的加载和 eval 按钮使用这些合并配方。这些步骤只读取问题、从不生成，因此用于测量模型内部的上下文会按最长对话分配，并先释放聊天留下的生成上下文；在大型模型上，这可避免显存溢出到系统内存而导致一切变慢。`configs/pipeline/` 提供四种用途的模板：找出承载 system 提示词所要求人格的注意力头（仅 A 侧有 system）、只保留两个人格之间的差异（两侧都有 system）、找出承载神经元配方效果的注意力头（A 侧有配方）、捕捉不同问题类型之间的差异，例如日语与英语（两侧各有问题）。每个模板的 `about` 说明比较对象以及候选的缩放方向；UI 模板菜单提供相同的四种模板。
+
+不生成文本选出的强度不一定适合真实回复，因为得分是沿方向的量，可能与行为显现强度和文本自然度发生偏移。因此最后一步是读取回复。`gne heads candidates --alloc NAME` 取分配结果比较表中的每个组，将其强度乘以若干整体倍率（默认 0.5、1、1.5、2、3；分配默认目标只到中点，因此有用倍率常常大于 1），并让每个候选连同未修改模型回答两侧问题。所有候选共用同一随机种子，因此回复差异只来自干预。正倍率会消除 A 侧行为，因此读取其 A 侧回复；负倍率会反转符号并强化行为，因此改为读取其 B 侧回复。命令会为每个候选报告符合 `validate.match` 的回复比例、措辞重复程度，以及未被读取一侧相对未修改模型的回复变化比例。然后它把要读取的回复混合到一个文件中，不标明来自哪个候选，并附上评分指南。由人或另一个模型为每条回复的目标行为显现程度（P）和自然度（C）打 1 到 5 分。`--tally` 按消除方向取 6 − P 与 C 的较小值、强化方向取 P 与 C 的较小值的平均值对候选排名。用于选择强度的问题会让候选显得比实际更好，因此请用 `--prompts` 传入未用于选择的问题。若要尝试由注意力头放大的小幅神经元推动，可用 `--with-recipe` 给包括未修改模型在内的每个候选叠加配方。在 UI 中，direction 视图“从 JSON 创建方向和注意力头”标签页比较表下方的表单可创建候选；“强度候选”标签页会按问题排列回复，或一次显示一条并隐藏名称，用数字键评分。每次评分都会立即保存，因此可以中断后继续；全部评分完成后，该标签页会显示汇总，并提供将最佳候选加载到配方面板或在 1 列聊天中试用的按钮。
+
+对照集两侧通常由 system 提示词构造。只需写出其中一侧：没有 system 提示词的一侧会在完全无 system 的情况下读取问题，因此只有 `system_a` 的对照集会比较人格与模型正常回答。对照集也可以通过应用配方（`recipe_a`、`recipe_b`）构造一侧或两侧，或为每侧提供各自的问题（`prompts_a`、`prompts_b`），使未修改模型读取两类问题，并以二者差异作为方向；`configs/contrast/ja_vs_en.yaml` 比较日语提问与同一问题用英语提问。当问题不同时，方向也会混入话题、长度等差异，因此请尽量保持其他条件接近。此时两侧差异就是配方自身的效果，因此 `gne direction` 会创建神经元配方产生的方向，而 `gne direction score` 和 `gne heads causal` 会在应用配方时找出承载它的注意力头。`configs/contrast/evil_neurons.yaml` 为 Qwen3.5-4B 上的 evil 神经元配方执行此操作。比较同一回复在两种 system 提示词下读取结果的工具（`gne heads contrast`、`gne writers`、`gne experts contrast`）不接受这种对照集。
+
+问题可以是单个字符串或对话历史：`[{"role": "user", "content": "…"}, {"role": "assistant", "content": "…"}, {"role": "user", "content": "…"}]`，user 与 assistant 交替并以 user 回合结束。每个问题都从干净状态单独读取，并在最后一个 user 回合的回复之前测量；一个问题不会带入下一个。需要测量只在长对话深处或数轮交流后才出现的行为时，可使用历史。
+
+结果是普通配方，包含诸如 `16:H8:s6@evil` 的单元。同一层中共享同一方向的注意力头会折叠为秩 1 LoRA，因此适配器保持很小；用 `gne headproj export`（与 `gne gain` 相同）写出，`--bake` 只改写相关张量。在 UI 中，配方标签页的“LoRA / 烧录”也可完成同样操作，选项包括格式、重写张量的类型、恢复为原始类型、与 LoRA 校验以及文件名（默认配方名；仅在确认后覆盖已有文件）。恢复到 IQ1、IQ2、IQ3_XXS 等低位宽类型需要 imatrix（告诉量化器哪些输入需要保留精度的权重）；将 `<模型名>.imatrix.gguf`（或 `.dat`）放在模型旁即可自动使用，无需显式传入。烧录不使用 GPU（它逐块读取和重写文件），因此也适用于 GPU 放不下的大模型：可以用量化模型分析，再烧录到同一模型的未量化 GGUF（F16 / BF16）（`--into`，UI 中的“烧录目标”）。方向来自分析模型，重写矩阵来自目标模型，类型保持不变（`--requant keep`）。强度是在量化模型上测得的，因此会有少量差异，也无法与 LoRA 版校验。之后再用 llama-quantize 量化烧录后的 F16 / BF16，也可避免只有重写张量处于不同类型；LoRA 可以立即下载。gne 会将配方（层、注意力头、强度）作为 `gne.*` 元数据记录在导出文件中；若文件要交给别人，请使用“不包含 gne 的记录”（`--strip-meta`），它还会检查元数据中是否残留本地路径（使用 imatrix 重新量化时，llama-quantize 可能记录生成 imatrix 所用文本的路径）。即使没有记录，LoRA 张量仍会直接显示层、注意力头和方向，烧录文件与原模型比较也仍能看出改了什么、如何改。control vector 无法表达这些。依赖某个配方前，请对照控制进行检查。`gne eval --random-controls N` 将相同强度应用到随机选出的注意力头；`gne eval --compare-methods` 将全层消融、将同一批头整体缩放、移除顶部神经元调到相同得分并比较副作用；`gne eval --alloc NAME --n-heads 6,5,4,3` 显示减少注意力头时副作用如何变化。得分是沿用于选头的同一方向测量的，因此报告结果时请使用从输出测得的指标，例如对照集的 `validate.match`、能力和困惑度。对于使用方向的配方，eval 还会在每个倍率和每个对照下测量方向指标（得分下降量、偏移、一致率）；当对照集有数百个问题时开销很大，因此默认读取等间隔的 64 个问题（`--dir-max-examples`，UI 的 eval 标签页中的“问”），也可以关闭（`--no-direction-metrics`，UI 的“方向指标”）。
+
+在 Qwen3.5-4B 上，这样选出的两个注意力头阻止了 evil system 提示词所要求的人格（之前 83% 的回复被判为符合，之后为 0），同时没有改变能力和困惑度。将效果对齐到相同得分后，全层消融使困惑度上升 15%，而将同样两个注意力头整体缩放会损失 14 点能力。方法详情见 [docs/head-component-steering.md](docs/head-component-steering.md)。
+
 ### 跨量化
 
 在一种量化上找到的神经元可以迁移到同一模型的其他量化。使用 L22 N2742（“alien”神经元，在 Qwen3.5-4B Q8_0 上找到）检查：
@@ -220,19 +251,24 @@ gne steer -m M --unit 12:E37:N511:x2 -p "..." --compare
 gne serve -m models/Qwen3.5-4B-Q8_0.gguf      # http://127.0.0.1:8791
 ```
 
+在启动服务器的终端中按 Ctrl+C 停止。它会关闭已打开的流和正在进行的生成并立即停止，即使浏览器仍开着 UI；若仍有连接残留，再按一次 Ctrl+C 会强制切断。页面文件每次加载都会重新读取，但服务器会继续运行启动时的 Python 代码，因此更新 gne 后需要重启；当服务器代码比磁盘上的代码旧时，页面顶部会显示提示条。
+
 ![前视图中带上下游连线的神经元面板](docs/images/ui-neuron.png)
 
-UI 有四个视图：
+主要视图：
 - **map：** 每一层作为一张神经元图板，并带有叠加层。
 - **layers：** 每层摘要。
-- **eval：** 将已保存的 eval 显示为图表，以及每个剂量的表格、示例输出和用于评估当前配方的按钮。
+- **direction：** 查看已保存的方向在每一层多大程度分开对照集两侧、基准层在哪里，以及所选层的逐示例得分。第二个标签页接收 JSON 形式的对照集（粘贴、从文件加载，或从四种用途模板开始），用一个按钮运行完整流程：创建方向、选择基准层、筛选层和注意力头、分配强度。结果会展示每一步的简短说明、被排除的注意力头及原因、按效率与按停头所得的排名差异，以及头数更少的组；每组都可加载到配方标签页或送去 eval。比较表下方生成的强度候选会出现在第三个标签页“强度候选”，可并排查看回复、匿名评分并汇总。
+- **eval：** 将已保存的 eval 显示为每个剂量的图表和表格，以及示例输出和用于 eval 当前配方的按钮。方式比较和头数更少的组比较也会显示在这里。
 - **embed：** rollout 文本的 UMAP。
 
 点击神经元或列表行可打开其面板，面板有四个标签页：
 - **Examples：** 每个提示词和剂量的 rollout。
-- **Chat：** 实时 3 列引导，带有 `when` 选择器和 system 提示词输入框。配方标签页可以添加消融（方向、scale、层）。对于支持音频输入的模型，🎤 按钮会在浏览器中录制你的声音，并将其作为用户回合发送（按下、说话、再次按下；输入框中的文字也会一起发送）。🔊 会用浏览器语音朗读右列回复。通过 `http://127.0.0.1` 或 `localhost` 打开 UI 时，麦克风可用。
+- **Chat：** 实时 3 列引导，带有 `when` 选择器和 system 提示词输入框。上方的切换可改为 1 列，只生成被引导的回复（已应用配方，或用此神经元的 + 推动后的回复）；生成速度快 3 倍，适合尝试长对话，更改列数会清空对话。配方标签页可以添加消融（方向、倍率、层）。对于支持音频输入的模型，🎤 按钮会在浏览器中录制你的声音，并将其作为用户回合发送（按下、说话、再次按下；输入框中的文字也会一起发送）。🔊 会用浏览器语音朗读右列回复。通过 `http://127.0.0.1` 或 `localhost` 打开 UI 时，麦克风可用。
 - **Details：** lens 结果、每个剂量的指标、连接，以及包含该神经元的 eval。
 - **Web：** 多跳连线。
+
+点击图板上边的刻痕会打开注意力头面板。除了注意力模式和对照结果外，Causal 标签页会显示停掉或强化注意力头时方向得分移动了多少，地图也可按这些值着色。配方标签页可放入这类注意力头单元，并带有强度滑块。
 
 要计算缺失数据（lens、sweep、连接、布局），请右键点击层标签。任务在后台运行，当聊天需要 GPU 时会让出 GPU。语言切换位于右上角，可在日语 / 英语 / 中文之间选择；也可以用 `?lang=ja`、`?lang=en` 或 `?lang=zh` 打开 UI。
 
@@ -273,7 +309,7 @@ r = client.chat.completions.create(
 claude mcp add gne -- gne mcp --model /path/to/model.gguf
 ```
 
-可用工具包括 `model_overview`、`layer_summary`、`neuron`、`search`、`steer`、`steer_lens`、`fires`、`reverse`、`recipe_save`、`export_cvec`、`gain_export`、`bake`、`eval`、`direction`、`ablate_export`、`head`、`heads_contrast`、`attention`、`set_name`，以及 `job_start` / `job_status` / `job_cancel`。
+可用工具包括 `model_overview`、`layer_summary`、`neuron`、`search`、`steer`、`steer_lens`、`fires`、`reverse`、`recipe_save`、`export_cvec`、`gain_export`、`bake`、`eval`、`direction`、`ablate_export`、`head`、`heads_contrast`、`attention`、`direction_score`、`heads_causal`、`heads_allocate`、`headproj_export`、`set_name`，以及 `job_start` / `job_status` / `job_cancel`。
 
 如果 Web UI 已打开，请添加 `--ui-url http://127.0.0.1:8791`。这样 agent 就可以高亮、注释神经元并在浏览器中打开它们（`ui_highlight`、`ui_note`、`ui_open`）。当 UI 已占用同一 GPU 上的模型时，还请添加 `--n-gpu-layers 0`。
 
@@ -300,6 +336,7 @@ python -m pytest -q
 - [docs/measurements.md](docs/measurements.md)：耗时与吞吐量。
 - [docs/agent_playbook.md](docs/agent_playbook.md)：如何解读结果。
 - [docs/setup.md](docs/setup.md)：WSL 下的 CUDA / ROCm、每个 GPU 一个环境，以及 worker。
+- [docs/head-component-steering.md](docs/head-component-steering.md)：CHiPS，只改变少数由因果选出的注意力头中沿方向的分量（`mode: proj`、`gne direction score`、`gne heads causal`、`gne heads allocate`、`gne eval --compare-methods`），以及它与全层消融的关系。
 - [docs/persona_workflow.md](docs/persona_workflow.md)：从神经元逐步构建人格（使用 `examples/persona_neurons/` 中的脚本，并以病娇案例作为完整示例），并从示例对话中提取注意力头与神经元。
 
 ## 许可证

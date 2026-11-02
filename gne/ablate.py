@@ -172,34 +172,58 @@ def embed_projection(weights, R: np.ndarray, *, chunk: int = 16384) -> np.ndarra
     return out
 
 
-def write_ablation_lora(weights, rs: dict[str, np.ndarray], rows: dict[str, np.ndarray], path: str | Path, *,
-                        meta: dict | None = None, scale: float = 1.0, embed: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
-    """rows[テンソル名] = rᵀW(in,)、rs[テンソル名] = そのテンソルで消す単位ベクトル r を LoRA GGUF に書く。
-    embed = (E r (n_vocab,), r) なら token_embd の LoRA も入れる(tied でないモデルだけ)。"""
+def write_lora_tensors(weights, tensors: dict[str, tuple[np.ndarray, np.ndarray]], path: str | Path, *, name: str,
+                       kv: dict[str, str] | None = None, dtype=np.float32) -> dict:
+    """LoRA アダプタ GGUF を書く(ablate・ヘッドの方向成分の射影 CHANGE-06・因果スクリーニングで共用)。
+    tensors[テンソル名] = (lora_a, lora_b)。ふつうのテンソルは lora_a (r, in)・lora_b (n_embd, r)(numpy の形。
+    W x + B (A x))、token_embd は lora_a (n_vocab, r)・lora_b (n_embd, r)(get_rows の後に足す向き)。
+    adapter.lora.alpha は書かない(倍率 = アダプタの倍率。層ごとに r が違っても 1 倍)。dtype=np.float16 で半分の大きさ
+    (スクリーニングの一時ファイル用)。kv は gne.* のメタデータ(JSON の文字列)。"""
     m = weights.meta
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     w = GGUFWriter(str(path), arch=m.arch)
     w.add_type("adapter")
     w.add_string("adapter.type", "lora")
-    w.add_name(f"{m.name} ablate" + (f" {meta['direction']}" if meta and meta.get("direction") else ""))
-    w.add_key_value("gne.ablate", json.dumps({**(meta or {}), "scale": scale, "embed": embed is not None},
-                                             ensure_ascii=False), GGUFValueType.STRING)
+    w.add_name(name)
+    for k, v in (kv or {}).items():
+        w.add_key_value(k, v, GGUFValueType.STRING)
     w.add_key_value("gne.source_model_id", m.model_id, GGUFValueType.STRING)
-    if embed is not None:
-        if not embed_in_lora(weights):
-            raise GneError("BAD_ARGS", "输出层与嵌入共享（tied）的模型无法将嵌入写入 LoRA")
-        ea, er = embed
-        w.add_tensor("token_embd.weight.lora_a", np.asarray(ea, dtype=np.float32).reshape(-1, 1))
-        w.add_tensor("token_embd.weight.lora_b", (-scale * np.asarray(er, dtype=np.float32)).reshape(-1, 1))
-    for name in sorted(rows, key=lambda n: (int(n.split(".")[1]), n)):
-        w.add_tensor(f"{name}.lora_a", np.asarray(rows[name], dtype=np.float32).reshape(1, -1))
-        w.add_tensor(f"{name}.lora_b", (-scale * np.asarray(rs[name], dtype=np.float32)).reshape(-1, 1))
+
+    def order(n: str):
+        parts = n.split(".")
+        return (int(parts[1]) if parts[0] == "blk" else -1, n)
+    for tname in sorted(tensors, key=order):
+        A, B = tensors[tname]
+        w.add_tensor(f"{tname}.lora_a", np.ascontiguousarray(A, dtype=dtype))
+        w.add_tensor(f"{tname}.lora_b", np.ascontiguousarray(B, dtype=dtype))
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    return {"path": str(path), "n_tensors": len(rows) + (embed is not None), "embed": embed is not None,
-            "bytes": Path(path).stat().st_size}
+    return {"path": str(path), "n_tensors": len(tensors), "bytes": Path(path).stat().st_size,
+            "rank": {n: int(np.asarray(B).shape[1]) for n, (_, B) in tensors.items()}}
+
+
+def write_ablation_lora(weights, rs: dict[str, np.ndarray], rows: dict[str, np.ndarray], path: str | Path, *,
+                        meta: dict | None = None, scale: float = 1.0, embed: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
+    """rows[テンソル名] = rᵀW(in,)、rs[テンソル名] = そのテンソルで消す単位ベクトル r を LoRA GGUF に書く。
+    embed = (E r (n_vocab,), r) なら token_embd の LoRA も入れる(tied でないモデルだけ)。"""
+    m = weights.meta
+    tensors: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if embed is not None:
+        if not embed_in_lora(weights):
+            raise GneError("BAD_ARGS", "输出层与嵌入共享（tied）的模型无法将嵌入写入 LoRA")
+        ea, er = embed
+        tensors["token_embd.weight"] = (np.asarray(ea, dtype=np.float32).reshape(-1, 1),
+                                        (-scale * np.asarray(er, dtype=np.float32)).reshape(-1, 1))
+    for name in rows:
+        tensors[name] = (np.asarray(rows[name], dtype=np.float32).reshape(1, -1),
+                         (-scale * np.asarray(rs[name], dtype=np.float32)).reshape(-1, 1))
+    rep = write_lora_tensors(weights, tensors, path,
+                             name=f"{m.name} ablate" + (f" {meta['direction']}" if meta and meta.get("direction") else ""),
+                             kv={"gne.ablate": json.dumps({**(meta or {}), "scale": scale, "embed": embed is not None},
+                                                          ensure_ascii=False)})
+    return {"path": rep["path"], "n_tensors": rep["n_tensors"], "embed": embed is not None, "bytes": rep["bytes"]}
 
 
 def export_ablation_lora(weights, r: np.ndarray | dict[int, np.ndarray], path: str | Path, *,
@@ -359,6 +383,42 @@ def _bake_embed(weights, t, r: np.ndarray, s: float, requant: str, chunk: int = 
 
 # --- --via-f16(F16 で書いて llama-quantize で元の型に戻す)------------------------------------------------
 
+def local_path_keys(path: str | Path) -> list[str]:
+    """GGUF のメタデータのうち、手元のパスらしい文字列(ホームのフォルダ・/home/・/tmp/・C:\\Users\\)を含むキー。
+    人に渡すファイルを作ったあとに確かめる(llama-quantize が imatrix を作った文章のパスを書くことがある)。"""
+    import os
+
+    from gguf import GGUFReader, GGUFValueType
+    home = os.path.expanduser("~")
+    marks = [m for m in (home, "/home/", "/Users/", "/tmp/", "\\Users\\") if m and m != "/"]
+    out = []
+    for f in GGUFReader(str(path)).fields.values():
+        if f.name.startswith("tokenizer."):        # 語彙(何万もの文字列)は見ない
+            continue
+        if f.types and f.types[0] in (GGUFValueType.STRING, GGUFValueType.ARRAY):
+            try:
+                v = f.contents()
+            except Exception:  # noqa: BLE001
+                continue
+            text = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+            if any(m in text for m in marks):
+                out.append(f.name)
+    return out
+
+
+def find_imatrix(model_path: str | Path) -> Path | None:
+    """モデルの隣の imatrix: <モデル名>.imatrix.gguf / .imatrix.dat / -imatrix.gguf / -imatrix.dat、無ければ imatrix.gguf /
+    imatrix.dat(同じフォルダ)。「元の量子化の型に戻す」で imatrix を渡さなかったときに使う。"""
+    p = Path(model_path)
+    stem = p.name[:-len(".gguf")] if p.name.endswith(".gguf") else p.stem
+    for name in (f"{stem}.imatrix.gguf", f"{stem}.imatrix.dat", f"{stem}-imatrix.gguf", f"{stem}-imatrix.dat",
+                 "imatrix.gguf", "imatrix.dat"):
+        c = p.with_name(name)
+        if c.is_file():
+            return c
+    return None
+
+
 def find_llama_quantize(path: str | None = None) -> str | None:
     if path:
         return path if Path(path).exists() else None
@@ -386,6 +446,16 @@ def bake_via_f16(weights, r, dst: str | Path, *, layers=None, scale: float = 1.0
                  llama_quantize: str | None = None, imatrix: str | None = None, keep_f16: bool = False,
                  progress: Progress | None = None) -> dict:
     """書き換えるテンソルを F16 で書いた中間の GGUF を作り、llama-quantize で元の量子化型に戻す。"""
+    return requant_via_f16(weights, lambda mid: bake_ablation_gguf(weights, r, mid, layers=layers, scale=scale, embed=embed,
+                                                                   requant="f16", meta=meta, progress=progress),
+                           dst, llama_quantize=llama_quantize, imatrix=imatrix, keep_f16=keep_f16)
+
+
+def requant_via_f16(weights, write_mid: Callable[[Path], dict], dst: str | Path, *, llama_quantize: str | None = None,
+                    imatrix: str | None = None, keep_f16: bool = False, neutral_imatrix: bool = False) -> dict:
+    """write_mid(中間のパス) で書き換えたテンソルだけ F16 の GGUF を書かせ、llama-quantize で全テンソルを元の型に戻す
+    (ablate と、ヘッドの方向成分の焼き込み CHANGE-06 で共用)。neutral_imatrix なら、llama-quantize がメタデータに書く
+    imatrix のパス(quantize.imatrix.file)が手元のパスにならないよう、作業用のフォルダに「imatrix」の名前で置いて渡す。"""
     lq = find_llama_quantize(llama_quantize)
     if lq is None:
         raise GneError("TOOL_NOT_FOUND", "找不到 llama-quantize",
@@ -397,27 +467,42 @@ def bake_via_f16(weights, r, dst: str | Path, *, layers=None, scale: float = 1.0
     if need and not imatrix:
         raise GneError("NEEDS_IMATRIX", f"此模型包含 {', '.join(need)} 张量，llama-quantize 在没有 imatrix 时不会导出"
                        "（即使只是原样复制的张量也需要）",
-                       "请用 --imatrix 传入制作原模型时的 imatrix，或使用 --requant q8_0")
-    dst = Path(dst)
+                       "请用 --imatrix 传入制作原模型时的 imatrix，或在模型旁放置 <模型名>.imatrix.gguf（或 .dat），"
+                       "也可以使用 --requant q8_0")
+    dst = Path(dst).resolve()
     mid = dst.with_name(dst.name + ".f16.part")
-    rep = bake_ablation_gguf(weights, r, mid, layers=layers, scale=scale, embed=embed, requant="f16", meta=meta,
-                             progress=progress)
+    rep = write_mid(mid)
     tt = dst.with_name(dst.name + ".tensor-types.txt")
     tensor_types_file(weights, tt)
     cmd = [lq, "--tensor-type-file", str(tt)]
-    if imatrix:
+    cwd, work = None, None
+    if imatrix and neutral_imatrix:
+        import shutil
+        work = dst.with_name(f".{dst.name}.imatrix-work")
+        work.mkdir(parents=True, exist_ok=True)
+        name = "imatrix" + Path(imatrix).suffix
+        try:
+            (work / name).symlink_to(Path(imatrix).resolve())
+        except OSError:
+            shutil.copyfile(imatrix, work / name)
+        cmd += ["--imatrix", name]
+        cwd = str(work)
+    elif imatrix:
         cmd += ["--imatrix", str(imatrix)]
     ft = weights.field("general.file_type")
     if ft is not None:
         cmd += ["--override-kv", f"general.file_type=int:{int(ft)}"]
     cmd += [str(mid), str(dst), "Q8_0"]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        p = subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=cwd)
         if p.returncode != 0:
             raise GneError("TOOL_FAILED", f"llama-quantize 失败（rc={p.returncode}）", (p.stderr or p.stdout)[-800:])
     finally:
         tt.unlink(missing_ok=True)
         if not keep_f16:
             mid.unlink(missing_ok=True)
+        if work is not None:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
     return {**rep, "path": str(dst), "requant": "via-f16", "bytes": dst.stat().st_size, "llama_quantize": lq,
             "intermediate_bytes": rep["bytes"]}

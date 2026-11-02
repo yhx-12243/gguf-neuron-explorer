@@ -37,7 +37,7 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    预计超过 30 分钟的任务会返回 NEEDS_CONFIRM 与估算后停止。可在 params 中通过 budget("30m") 限制，或设置 yes: true。
    大型模型（无法装入 GPU、全量 lens 每层超过 1 小时）从反向查找开始：reverse → 前 N 个 lens_steer → quick sweep → eval。
 单元写法："L:N:dose"（例 "14:8949:+1.0"），gain 为 "L:N:x2"（输出放大 k 倍，x0 表示消除），随机方向为 "L:random:SEED:dose"，
-用 direction 创建的方向为 "L:dir:NAME:dose"，attention 注意力头的 gain 为 "L:Hh:xk"（例 "21:H7:x0"）。
+用 direction 创建的方向为 "L:dir:NAME:dose"，attention 注意力头的 gain 为 "L:Hh:xk"（例 "21:H7:x0"），注意力头的方向分量投影为 "L:Hh:sS@NAME"。
 7. 反应性（有/无触发词是否产生差异）用注意力头创建。先用 heads_contrast → 对前几名用 x0 / x2 运行 eval(reactivity=对照集) →
    只保留超过对照（相同 k 的随机注意力头）的项。
 6. 如果有人正在查看 UI（gne serve），用 ui_open 打开正在调查的神经元，用 ui_highlight 高亮候选，用 ui_note 将判断要点
@@ -46,6 +46,19 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    （无论是否选中专家，都会加到所有 token 上）；若要推动神经元本身，请用 gain（"12:E37:N511:x2"，仅在选中专家时生效）。
    专家整体用 "L:Ee:x0"（消除）/ "L:Ee:x2"，路由器偏置用 "L:Ee:route:+2"（仅限带偏置的 arch）。
    先用 experts_contrast 筛选专家（usage_shift = 人格状态下被调用，contrib_cos = 写入方向），再用 gain 试其中的神经元。
+9. 只改变注意力头的方向分量（CHANGE-06，"L:Hh:sS@NAME"，例 "33:H16:s6@evil"。s = 1 时该注意力头的方向分量消失，2 时反转，
+   正交分量不变）。步骤：direction_score（确认基准层与分离度）→ heads_causal（以 mode="ablate" 初筛候选）→
+   heads_allocate（按效率 η 分配强度，并比较减少注意力头数量后的组）→ eval(random_controls=N, compare_methods=True) → headproj_export。
+   若只想完整跑一遍，用 heads_pipeline(spec)（从创建方向到分配。问题可以有数百个，停止测定的阶段会抽稀到 64 个）。
+   最终确定强度：heads_candidates（按组 × 倍率生成，并创建隐藏名称的评分文件）→ 评分 → heads_candidates_tally。
+   若某组仍留下无法消除的问题（分配表中的 remain），用 heads_refine 仅从剩余问题中寻找额外注意力头并加入组中。
+   - 使用方向的干预，应先用 direction_score 确认基准层与分离度（cohen_d）再继续。
+   - heads_causal 的 ablate 与 marginal 排名不同。初次筛选用 ablate，重新分配用 marginal（由 heads_allocate 使用）。
+   - 确定强度始终使用不生成文本的指标（direction_score、heads_causal、heads_allocate）。需要生成的 eval 只用于最终候选。
+   - 报告主要采用外部可见指标（eval 的 rate = 对照集 validate.match 的一致率、能力、ppl）。只看方向的投影值，
+     只能说明“用方向测量了被方向推动的东西”。
+   - 未经过随机对照（eval 的 random_controls，同数量、相同 s 的随机注意力头）与方式比较（compare_methods）的配方不要报告。
+   - 当目标指标达到数 % 时就停止提高强度，转而寻找承担剩余示例的其他注意力头。
 """
 
 
@@ -208,7 +221,9 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool(name="eval")
     async def eval_recipe(recipe: str | None = None, units: list[str] | None = None, doses: list[float] | None = None,
                    when: str | None = None, random_controls: int = 0, reactivity: str | None = None,
-                   head_controls: int = 0) -> dict:
+                   head_controls: int = 0, compare_methods: bool = False, match_effect: float | None = None,
+                   score_layer: int | None = None, alloc: str | None = None, n_heads: list[int] | None = None,
+                   control_pool: str = "before", direction_metrics: bool = True, dir_max_examples: int = 64) -> dict:
         """将副作用检查（§6.14）作为任务提交。recipe 是已保存配方的名称，units 是临时指定（二选一）。
         doses 是配方整体倍率（默认 [0, 0.25, 0.5, 0.75, 1]，0 为无干预）。逐倍率测量 exact / format 正确率、ppl、
         语言混入（简体字・韩文等）、人格变化量（无干预中不存在的词所占比例等），并返回可发布（能力下降不超过 5pt、
@@ -216,14 +231,32 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         random_controls=N 时，每个倍率也测量 N 个同量级随机对照配方（耗时约为 N 倍）。行中的 ctrl_novelty_p95・
         novelty_null_pct（新词高于对照多少比例）、ctrl_capability_drop_p50・ctrl_ppl_worse_p50（仅由规模造成的恶化）。
         传入 reactivity（对照集名称或路径。需要 reactivity 对与 validate.match）时，在行的 reactivity 中加入
-        有/无触发词的一致率及其差异。还会给出与 head_controls 个随机注意力头（相同 k）比较的 null_pct。"""
+        有/无触发词的一致率及其差异。还会给出与 head_controls 个随机注意力头（相同 k）比较的 null_pct。
+        方向を使うレシピ(proj・方向のユニット・ablate)の行には、点数の下がり方 dir_drop_a・残差の差の直交成分 drift_orth_a /
+        drift_orth_b・判定の一致率 rate が入る(CHANGE-06 F.1)。proj の random_controls は同数・同じ s のランダムなヘッド
+        (control_pool: before / same-layers)で、dir_null_pct・rate_null_pct・drift_orth_b_null_pct を出す。
+        compare_methods=True は、proj のレシピと同じ方向で全層射影・ヘッドの方向成分・ヘッドの丸ごと倍率・ニューロンの消去を
+        A 側の点数の水準(match_effect、省けばこのレシピ)をそろえて比べる(F.3)。alloc(heads_allocate の名前)と n_heads で、
+        ヘッド数ごとの組を評価する(F.4、recipe・units は要らない)。方向の指標は direction_metrics=False で測らない。
+        dir_max_examples はその測定で読む質問の数(既定 64、A・B それぞれ等間隔に間引く。0 で全部)。"""
         try:
+            if alloc:
+                return jobs.start("eval", {"alloc": alloc, "n_heads": n_heads, "when": when,
+                                           "random_controls": random_controls}).view()
             p = {"recipe": recipe, "units": units, "when": when, "random_controls": random_controls}
+            if compare_methods:
+                p.update({"compare_methods": True, "match_effect": match_effect, "score_layer": score_layer})
+                p.pop("random_controls")
+            elif control_pool != "before":
+                p["control_pool"] = control_pool
             if reactivity:
                 p["reactivity"] = str(_contrast_path(session, reactivity, None, None, None, None))
                 p["head_controls"] = head_controls
             if doses is not None:
                 p["doses"] = doses
+            if not compare_methods:
+                p["direction_metrics"] = bool(direction_metrics)
+                p["dir_max_examples"] = int(dir_max_examples) or None
             return jobs.start("eval", p).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -279,6 +312,145 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             return jobs.start("heads_contrast", params).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
+
+    @srv.tool()
+    async def direction_score(name: str, contrast: str | None = None, layers: list[int] | None = None,
+                              units: list[str] | None = None, positions: str = "last", side: str = "both") -> dict:
+        """速い物差し(CHANGE-06 B、生成なしなので数秒)。対照集合(省けば方向を作ったもの)の A 側・B 側をプロンプトの最後まで
+        読ませ、層ごとに 残差 · r̂_L の mean / sd / cohen_d と、基準層(cohen_d 最大。介入なし・layers 省略のとき記録する)、
+        基準層の方向とのコサイン(方向が層でどれだけ回るか)を返す。units("33:H16:s6@NAME" など)を渡すと、その介入での
+        点数の下がり方 drop と、残差の差の方向成分・直交成分 drift(par / orth、A・B それぞれ)。
+        方向を使う介入は、まずこれで基準層と分離度を確認してから進める。"""
+        def fn():
+            d = session.direction_score(name, contrast=contrast, layers=layers, units=units, positions=positions, side=side)
+            d.pop("values", None)
+            d.pop("values_after", None)
+            return d
+        return await call(fn)
+
+    @srv.tool()
+    async def heads_causal(name: str, contrast: str | None = None, mode: str = "ablate", layers: str = "auto",
+                           candidates: str | None = None, score_layers: list[int] | None = None,
+                           base_units: list[str] | None = None, delta_s: float = 3.0, hard: int = 16,
+                           b_side_max: float | None = None, top_layers: int = 4) -> dict:
+        """因果スクリーニングをジョブで投げる(CHANGE-06 C、job_status で結果。生成なし)。方向 name の点数(score_layers、
+        既定は基準層と後段 2 層)が、ヘッドを止めたとき(mode="ablate")どれだけ下がるか。layers="auto" は層単位で全ヘッドを
+        止めて下がる top_layers 層を選び、その層のヘッドを 1 個ずつ測る。candidates は all / contrib:N / "L:Hh,…"。
+        mode="marginal" は base_units(いまの組 "L:Hh:sS")から s を delta_s 上げたときの、効きにくい例 hard 件での
+        下がり方 ÷ delta_s(効率 eta)。ablate と marginal は順位が違う(候補出しは ablate、配り直しは marginal)。
+        行には直接の寄与 contrib と ratio = causal / contrib(1 より大きい = 間接の経路、小さい = 補い合い)、
+        B 側への影響(b_side_delta・drift_orth_b、b_side_max で除外の印)。保存先 <root>/heads/<model_id>/<name>.causal.jsonl。"""
+        try:
+            params = {"direction": name, "contrast": None if contrast is None else str(_contrast_path(session, contrast, None, None, None, None)),
+                      "mode": mode, "layers": layers, "candidates": candidates, "score_layers": score_layers,
+                      "base_units": base_units, "delta_s": delta_s, "hard": hard, "b_side_max": b_side_max,
+                      "top_layers": top_layers}
+            return jobs.start("heads_causal", params).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def heads_allocate(name: str, target: float, contrast: str | None = None, candidates: str | None = None,
+                             n_heads: list[int] | None = None, score_layer: int | None = None, hard: int = 16,
+                             b_side_max: float | None = None) -> dict:
+        """効率ベースの強さ配分をジョブで投げる(CHANGE-06 D、job_status で結果。生成なし)。heads_causal の結果(candidates、
+        既定は方向の名前)から、効きにくい例(A 側で点数が高く残る hard 件)を選び、効率 eta を測り、n_heads(既定 [6, 5, 4])の
+        各ヘッド数で s ∝ eta に配って、効きにくい例の点数の平均が target になるよう二分探索する。比較表(ヘッド数・各ヘッドの s・
+        最大の s・残る件数・A 側の最大点数・B 側の直交成分のずれ)と recommended(残る件数と B 側のずれが同程度なら最少の
+        ヘッド数)、各組のレシピのパスを返す。"""
+        try:
+            params = {"direction": name, "target": target, "candidates": candidates, "score_layer": score_layer,
+                      "hard": hard, "b_side_max": b_side_max,
+                      "contrast": None if contrast is None else str(_contrast_path(session, contrast, None, None, None, None))}
+            if n_heads:
+                params["n_heads"] = list(n_heads)
+            return jobs.start("heads_allocate", params).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def heads_pipeline(spec: dict[str, Any] | str, target: float | str | None = None, n_heads: list[int] | None = None,
+                             max_examples: int | None = None, resume: bool = True) -> dict:
+        """対照集合(name・user_prompts か側ごとの質問 prompts_a / prompts_b・system_a / system_b か recipe_a / recipe_b、
+        任意で pipeline の設定。表か JSON / YAML の
+        パス)から、方向づくり → 基準層 → 因果スクリーニング → 強さの配分(効き目に比例した最初の組 → 効率で配り直す →
+        ヘッド数の比較)をジョブで 1 回で回す(job_status で結果)。質問は何百個でもよく、止めて測る段階は max_examples 個
+        (既定 64)に間引く。target は数か "B"(B 側の平均まで消す)か "mid"(省いたときの既定、A と B の真ん中)。
+        真ん中では振る舞いが半分ほどしか消えないことが多いので、消し切りたいときは "B"。結果の recommended が推す組のレシピ。resume(既定 True)なら、
+        同じ対照集合・同じ設定で作り済みの方向と因果の結果を使い回す(止めて流し直したとき、配分からやり直せる)。"""
+        try:
+            p = {"spec": spec, "target": target, "n_heads": n_heads, "max_examples": max_examples,
+                 "resume": None if resume else False}
+            return jobs.start("head_pipeline", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def heads_refine(name: str, n_heads: int | None = None, new_heads: list[int] | None = None, resume: bool = True) -> dict:
+        """組を当てても目標まで下がらない A 側の質問(残り)だけで、追加のヘッドを探すジョブを投げる(job_status で結果)。
+        name は一括(heads_pipeline)か heads_allocate の名前、n_heads は残りを測る組(既定は推す組)。残りの質問と B 側の質問で、
+        組を当てたまま方向を作り直し(方向 <name>_rK)、基準層 → 因果 → 配分で足すヘッドと強さ(new_heads、既定 [3, 2, 1])を決め、
+        元の組と合わせたレシピ(combined.recipe)を作って、元の方向で残りの数(remain_before → remain_after)と B 側のずれを測り直す。"""
+        try:
+            p = {"name": name, "n_heads": n_heads, "new_heads": new_heads, "resume": None if resume else False}
+            return jobs.start("heads_refine", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def heads_candidates(alloc: str, prompts: list[str] | dict[str, list[str]] | str | None = None,
+                               scales: list[float] | None = None, n_heads: list[int] | None = None, max_prompts: int = 24,
+                               max_tokens: int = 120, sampling: str | dict[str, Any] = "llama_server", seed: int = 0,
+                               judge_b: bool = False, with_recipe: str | None = None) -> dict:
+        """強さの候補づくりをジョブで投げる(job_status で結果)。配分の結果(alloc、heads_allocate / heads_pipeline の名前)の
+        比較表の組 × 全体の倍率 scales(既定 [0.5, 1, 1.5, 2, 3])と無介入で、A 側と B 側の質問に返事を作る(同じ種のサンプリング)。
+        正の倍率は A 側の振る舞いを消す向き(A 側を採点)、負の倍率は符号を返して B 側で強める向き(B 側を採点)。
+        候補ごとの判定の一致率(rate_a / rate_b)・繰り返しの少なさ(d4)・無介入と同じ返事の割合と、採点する側の返事を
+        どの候補か伏せて並べた採点のファイル(judge.round、基準は judge.rubric)を返す。prompts は調整に使っていない質問
+        (省くと対照集合の validate.prompts、無ければ調整に使った質問で held_out が False)。with_recipe は全部の候補
+        (無介入の base も)に重ねるレシピ(ニューロンの種火など)。採点は heads_candidates_tally。"""
+        try:
+            p = {"alloc": alloc, "prompts": prompts, "scales": scales, "n_heads": n_heads, "max_prompts": max_prompts,
+                 "max_tokens": max_tokens, "sampling": sampling, "seed": seed, "judge_b": judge_b,
+                 "with_recipe": with_recipe}
+            return jobs.start("heads_candidates", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def heads_candidates_tally(name: str, scores: str | dict[str, list[int]] | None = None) -> dict:
+        """候補の採点を集計する(GPU を使わない)。scores に「番号 P C」の行(または {番号: [P, C]})を渡すと採点のファイルに
+        書き足してから集計する。P = 目標の振る舞いの強さ、C = 自然さ(どちらも 1〜5、基準は RUBRIC.md)。返り値の scores が
+        候補 → 側 → P・C・min_PC・P_ge3・remove(min(6 − P, C)、消す向きの目的)・add(min(P, C)、強める向きの目的)、
+        best が向きごとのいちばん良い候補。返事は名前を伏せたまま採点し、集計の前に候補を見ない。"""
+        try:
+            d = session.heads_candidates_tally(name, scores=scores)
+            d.pop("replies", None)
+            return d
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def headproj_export(recipe: str, bake: bool = False, requant: str = "q8_0", verify: bool = True,
+                              strip_meta: bool = False, into: str | None = None) -> dict:
+        """保存したレシピの proj のユニット(ヘッドの方向成分の射影、と gain)を書き出す(CHANGE-06 E)。既定は LoRA アダプタ
+        GGUF(同じ層・同じ方向は階数 1 に畳む。数百 KB)。bake=True なら書き込み行列だけ量子化し直した GGUF をジョブで作り、
+        verify なら焼き込み版と LoRA 版を点数・最初のトークンの KL・最尤トークンの一致率・ppl で比べる(V26)。
+        strip_meta=True なら gne の記録(gne.* のメタデータ・レシピ・名前の印・横の .headproj.json)を残さない(人に渡す版)。
+        結果の local_path_keys は、メタデータに手元のパスらしい文字列が残っているキー。into は焼き込む先の別の GGUF
+        (同じ構造の量子化していない F16 / BF16 など。方向はこのモデルのものを使う。requant="keep" で元の型のまま、verify はできない)。"""
+        try:
+            out = str(session.store.export_dir() / (f"{recipe}-headproj.gguf" if bake else f"{recipe}.lora.gguf"))
+            if bake:
+                p = {"recipe": recipe, "out": out, "bake": True, "requant": requant, "verify": verify and not into,
+                     "strip_meta": strip_meta}
+                if into:
+                    p["into"] = into
+                return jobs.start("headproj_export", p).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+        return await call(lambda: session.headproj_export(session.recipe(path=session.recipe_path(recipe)), out,
+                                                          strip_meta=strip_meta))
 
     @srv.tool()
     async def expert(layer: int, expert: int) -> dict:
@@ -361,7 +533,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def job_start(kind: str, params: dict[str, Any] | None = None, workers: str | None = None) -> dict:
-        """提交长时间处理。kind：stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast。
+        """提交长时间处理。kind: stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast / heads_causal / heads_allocate / head_pipeline / heads_candidates / heads_refine / headproj_export。
         params 是 gne.api 中同名方法的参数（例 sweep：{"layer": 22, "neurons": "random:64", "design": "quick"}）。
         预计超过 30 分钟的任务不会运行，而是返回 NEEDS_CONFIRM 与估算。在 params 中加入 budget("30m" 等)可按预算
         缩小范围（lens_steer 取靠近方向的上位神经元，sweep 用 quick 设计取 steer lens 前几名，reverse 减少

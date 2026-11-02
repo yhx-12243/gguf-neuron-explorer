@@ -25,11 +25,58 @@ Positions = Literal["all", "last", "assistant"]
 
 @dataclass
 class ContrastSet:
+    """対照集合。A(目標)と B(中立)の 2 つの状態で質問を読ませる。ふつうは両側で同じ user_prompts を読み、
+    prompts_a / prompts_b を書くと側ごとに別の質問を読む(片側だけ書けば、もう片側は user_prompts。数は違ってよい)。
+    別の質問を読むときは、方向に狙った違い以外の差(話題・長さ・言語)も混ざるので、それ以外をできるだけそろえる。
+
+    状態は system プロンプトで作る(system_a / system_b)か、レシピを当てて作る(recipe_a / recipe_b、どちらか片側だけでも可)。
+    レシピの側は、そのレシピのユニット(ニューロン・方向の add は control vector、gain・ヘッドは LoRA)を全位置に当てて読ませる。
+    system を省いた側は system なしの会話になる(system_a だけを書けば、B は同じ質問を system なしで読んだ状態)。recipe_* はレシピ YAML のパス(対照集合のファイルからの相対パスも可)、
+    保存したレシピの名前、ユニットの書き方のリスト、またはレシピと同じ形の表。"""
     name: str
-    system_a: str
-    system_b: str
-    user_prompts: list[str]
+    system_a: str | None
+    system_b: str | None
+    user_prompts: list                      # 両側で同じ質問(側ごとの質問だけのときは A の質問)。1 問は文字列か会話の履歴
     sha: str
+    recipe_a: object = None
+    recipe_b: object = None
+    base_dir: Path | None = None
+    prompts_a: list[str] | None = None      # A 側だけの質問(無ければ user_prompts)
+    prompts_b: list[str] | None = None
+
+    @property
+    def separate_prompts(self) -> bool:
+        return self.prompts("A") != self.prompts("B")
+
+    def prompts(self, side: str) -> list[str]:
+        own = self.prompts_a if side == "A" else self.prompts_b
+        return list(own) if own is not None else list(self.user_prompts)
+
+    @property
+    def has_recipes(self) -> bool:
+        return self.recipe_a is not None or self.recipe_b is not None
+
+    def system(self, side: str) -> str | None:
+        return self.system_a if side == "A" else self.system_b
+
+    def convs(self, side: str, prompts: Sequence[str] | None = None) -> list[list[dict]]:
+        """その側の会話(system があれば system + ユーザーの発話)。"""
+        return [_conv(self.system(side), u) for u in (self.prompts(side) if prompts is None else prompts)]
+
+    @property
+    def multi_turn(self) -> bool:
+        return any(is_multi(q) for side in "AB" for q in self.prompts(side))
+
+    def require_systems(self, what: str) -> None:
+        """system の違いでしか測れない道具(同じ返事を 2 つの system で読ませるもの)は、レシピの対照集合を断る。"""
+        if self.multi_turn:
+            raise GneError("BAD_CONTRAST", f"{what} 只读取单轮问题（不能用于包含对话历史的问题）",
+                           "包含对话历史的问题可用于 gne direction、direction score、heads causal、heads allocate、heads pipeline、eval")
+        if self.has_recipes or self.system_a is None or self.system_b is None or self.separate_prompts:
+            raise GneError("BAD_CONTRAST", f"{what} 通过让 system_a 与 system_b 读取同一问题来比较，因此不能用于用配方创建 A / B 的对照集"
+                           f"（recipe_a / recipe_b）、省略 system 的对照集，以及两侧问题不同的对照集"
+                           f"（prompts_a / prompts_b）",
+                           "配方对照集可用于 gne direction、direction score、heads causal、heads allocate、reverse、eval")
 
     @classmethod
     def load(cls, path: str | Path) -> ContrastSet:
@@ -38,21 +85,135 @@ class ContrastSet:
             raise GneError("FILE_NOT_FOUND", f"找不到对照提示词集 {p}")
         text = p.read_text(encoding="utf-8")
         d = yaml.safe_load(text) or {}
-        if not d.get("user_prompts") or "system_a" not in d or "system_b" not in d:
-            raise GneError("BAD_CONTRAST", f"{p}: 需要 system_a / system_b / user_prompts")
-        return cls(d.get("name") or p.stem, d["system_a"], d["system_b"], list(d["user_prompts"]),
-                   hashlib.sha256(text.encode()).hexdigest()[:16])
+        ra, rb = d.get("recipe_a"), d.get("recipe_b")
+        up, ua, ub = d.get("user_prompts"), d.get("prompts_a"), d.get("prompts_b")
+        for key, v in (("user_prompts", up), ("prompts_a", ua), ("prompts_b", ub)):
+            check_questions(v, f"{p}: {key}")
+        pa, pb = (ua if ua is not None else up), (ub if ub is not None else up)
+        if not pa or not pb:
+            raise GneError("BAD_CONTRAST", f"{p}: 需要问题（两侧相同则用 user_prompts，两侧不同则用 prompts_a 与 prompts_b）")
+        same_prompts = list(pa) == list(pb)
+        if ra is None and rb is None and same_prompts and d.get("system_a") is None and d.get("system_b") is None:
+            raise GneError("BAD_CONTRAST", f"{p}: 需要 system_a 或 system_b（可只给一侧；省略一侧时以无 system 读取）、"
+                                           "recipe_a / recipe_b，或按侧指定的问题 prompts_a / prompts_b")
+        if ra is None and rb is None and same_prompts and d.get("system_a") == d.get("system_b"):
+            raise GneError("BAD_CONTRAST", f"{p}: A 与 B 相同（system、recipe 和问题均无差异）")
+        return cls(d.get("name") or p.stem, d.get("system_a"), d.get("system_b"), list(up if up is not None else pa),
+                   hashlib.sha256(text.encode()).hexdigest()[:16], ra, rb, p.resolve().parent,
+                   None if ua is None else list(ua), None if ub is None else list(ub))
+
+    def recipe(self, session, side: str):
+        """その側のレシピ(Recipe)か None。"""
+        spec = self.recipe_a if side == "A" else self.recipe_b
+        if spec is None:
+            return None
+        if isinstance(spec, list):
+            return session.recipe(units=[str(x) for x in spec], name=f"{self.name}-{side}")
+        if isinstance(spec, dict):
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8") as f:
+                yaml.safe_dump({"name": f"{self.name}-{side}", **spec}, f, allow_unicode=True)
+            try:
+                return session.recipe(path=f.name)
+            finally:
+                Path(f.name).unlink(missing_ok=True)
+        q = Path(str(spec))
+        for cand in ([q] if q.is_absolute() else [self.base_dir / q if self.base_dir else q, q]):
+            if cand.suffix in (".yaml", ".yml") and cand.exists():
+                return session.recipe(path=cand)
+        return session.recipe(path=session.recipe_path(str(spec)))
+
+    def describe(self) -> dict:
+        """出力に残す、A / B の作り方。"""
+        def one(side, system, spec):
+            return {"system": system, "recipe": spec if spec is None or isinstance(spec, str) else
+                    (list(spec) if isinstance(spec, list) else dict(spec)),
+                    "n_prompts": len(self.prompts(side)), "own_prompts": (self.prompts_a if side == "A" else self.prompts_b) is not None}
+        return {"A": one("A", self.system_a, self.recipe_a), "B": one("B", self.system_b, self.recipe_b)}
 
 
-def _conv(system: str, user: str) -> list[dict]:
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+Intervention = tuple  # (vecs: dict[int, np.ndarray] | None, lora: list[tuple[str, float]] | None)
+
+
+def side_interventions(session, cs: ContrastSet) -> dict[str, Intervention]:
+    """A / B それぞれで当てる介入(control vector と LoRA)。レシピの無い側は (None, None)。"""
+    out: dict[str, Intervention] = {}
+    for side in "AB":
+        r = cs.recipe(session, side)
+        if r is None:
+            out[side] = (None, None)
+            continue
+        if session.patches_for(r) is not None:
+            raise GneError("BAD_CONTRAST", f"recipe_{side.lower()}: 整个专家的 gain 与 route（缩放补丁）不能用于对照集的一侧")
+        vecs = session.vectors(r)[0] if r.add_units else None
+        out[side] = (vecs or None, session.lora_for(r))
+    return out
+
+
+def combine(iv: Intervention | None, vecs=None, lora=None) -> Intervention:
+    """側の介入に、さらに当てる介入(調べている介入)を重ねる。ベクトルは層ごとに足し、LoRA は並べる。"""
+    va, la = iv or (None, None)
+    v = {L: np.asarray(x, dtype=np.float32) for L, x in (va or {}).items()}
+    for L, x in (vecs or {}).items():
+        v[L] = v[L] + x if L in v else np.asarray(x, dtype=np.float32)
+    lo = list(la or []) + list(lora or [])
+    return (v or None), (lo or None)
+
+
+# --- 質問: 文字列(1 ターン)か、会話の履歴(user と assistant が交互で、user で始まり user で終わるメッセージの列) -----------
+
+def is_multi(q) -> bool:
+    return not isinstance(q, str)
+
+
+def check_question(q, where: str = "質問") -> None:
+    """1 問を確かめる。文字列か、[{"role": "user", "content": …}, {"role": "assistant", …}, …, {"role": "user", …}]。"""
+    if isinstance(q, str):
+        return
+    if not isinstance(q, list) or not q:
+        raise GneError("BAD_CONTRAST", f"{where}: 每个问题必须是字符串或对话历史（消息列表）")
+    for i, m in enumerate(q):
+        if not isinstance(m, dict) or set(m) - {"role", "content"} or not isinstance(m.get("content"), str):
+            raise GneError("BAD_CONTRAST", f"{where}: 第 {i + 1} 项消息必须为 {{\"role\": …, \"content\": 字符串}} 形式")
+        want = "user" if i % 2 == 0 else "assistant"
+        if m.get("role") != want:
+            raise GneError("BAD_CONTRAST", f"{where}: 对话必须在 user 与 assistant 之间交替，并以 user 开始（第 {i + 1} 项为 "
+                                           f"{m.get('role')!r}，应为 {want!r}）")
+    if q[-1]["role"] != "user":
+        raise GneError("BAD_CONTRAST", f"{where}: 对话历史必须由 user 发言结束（将测量或生成其回复）")
+
+
+def check_questions(v, where: str) -> None:
+    if v is None:
+        return
+    if not isinstance(v, list):
+        raise GneError("BAD_CONTRAST", f"{where} 必须是问题列表（每个问题为字符串或对话历史）")
+    for i, q in enumerate(v):
+        check_question(q, f"{where} 的第 {i + 1} 个问题")
+
+
+def turns(q) -> list[dict]:
+    """質問 → メッセージの列(system は含まない)。"""
+    return [{"role": "user", "content": q}] if isinstance(q, str) else [{"role": m["role"], "content": m["content"]} for m in q]
+
+
+def question_text(q, *, sep: str = " / ") -> str:
+    """表示・採点のファイル用の 1 行。会話の履歴は「user: … / assistant: … / user: …」。"""
+    if isinstance(q, str):
+        return q
+    return sep.join(f"{m['role']}: {m['content']}" for m in q)
+
+
+def _conv(system: str | None, user) -> list[dict]:
+    """system が None なら system なしの会話(空の文字列は空の system として残す)。user は質問(文字列か会話の履歴)。"""
+    return ([] if system is None else [{"role": "system", "content": system}]) + turns(user)
 
 
 def contrast_sequences(engine: Engine, cs: ContrastSet) -> dict[str, list[tuple[list[int], int]]]:
     """{"A": [(ids, assistant の開始位置)], "B": [...]}。開始位置 = 生成プロンプト(assistant 冒頭)の最初のトークン。"""
     out: dict[str, list[tuple[list[int], int]]] = {"A": [], "B": []}
     for side, system in (("A", cs.system_a), ("B", cs.system_b)):
-        for u in cs.user_prompts:
+        for u in cs.prompts(side):
             msgs = _conv(system, u)
             ids = engine.tokenize_prompt(engine.render_chat(msgs))
             head = engine.tokenize_prompt(engine.render_chat(msgs, add_generation_prompt=False))
@@ -82,11 +243,14 @@ class ContrastResult:
 
 def contrastive_directions(engine: Engine, cs: ContrastSet, *, layers: Sequence[int] | None = None,
                            method: Literal["mean_diff", "pca1"] = "mean_diff", positions: Positions = "all",
-                           with_act: bool = True, progress: Progress | None = None) -> ContrastResult:
+                           with_act: bool = True, progress: Progress | None = None,
+                           interventions: dict[str, Intervention] | None = None) -> ContrastResult:
     """目標群 A と中立群 B を probe ctx で 1 本ずつ prefill し、l_out-L の平均差(または差の第一主成分)と、
-    ffn_down 入力の平均差(activation_contrast)を同じ順伝播で取る。最終層は行が間引かれ得るので除く。"""
+    ffn_down 入力の平均差(activation_contrast)を同じ順伝播で取る。最終層は行が間引かれ得るので除く。
+    interventions は側ごとに当てる (control vector, LoRA)(レシピで A / B を作る対照集合、side_interventions)。"""
     Ls = [L for L in (range(engine.n_layer - 1) if layers is None else layers) if 0 <= L < engine.n_layer - 1]
     seqs = contrast_sequences(engine, cs)
+    need = max(len(ids) for side in "AB" for ids, _ in seqs[side])     # コンテキストを最長の会話に合わせる(VRAM を空ける)
     names = engine.list_names(seqs["A"][0][0][:16])
     act_names = {}
     if with_act:
@@ -97,7 +261,7 @@ def contrastive_directions(engine: Engine, cs: ContrastSet, *, layers: Sequence[
                 act_names[nm] = L
     resid_names = {f"l_out-{L}": L for L in Ls}
     cap = Capture(lambda n: n in resid_names or n in act_names)
-    ctx = engine.probe_ctx(cap)
+    ctx = engine.probe_ctx(cap, need=need)
     engine.set_cvec(ctx, None)
     sums = {side: {L: 0.0 for L in Ls} for side in "AB"}
     sq = {L: 0.0 for L in Ls}                                  # A∪B の行の二乗和(次元ごとのばらつき用)
@@ -106,8 +270,12 @@ def contrastive_directions(engine: Engine, cs: ContrastSet, *, layers: Sequence[
     counts = {"A": 0, "B": 0}
     total, step = len(seqs["A"]) + len(seqs["B"]), 0
     for side in "AB":
+        vecs, lora = (interventions or {}).get(side) or (None, None)
+        ctx = engine.probe_ctx(cap, need=need)
+        engine.set_cvec(ctx, vecs or None)
+        engine.set_lora(ctx, lora or None)
         for ids, start in seqs[side]:
-            ctx = engine.probe_ctx(cap)
+            ctx = engine.probe_ctx(cap, need=need)
             engine.clear_memory(ctx)
             engine.prefill(ctx, [ids])
             out = cap.take()
@@ -124,6 +292,8 @@ def contrastive_directions(engine: Engine, cs: ContrastSet, *, layers: Sequence[
             step += 1
             if progress:
                 progress(step, total, "reverse")
+        engine.set_cvec(ctx, None)
+        engine.set_lora(ctx, None)
     dirs: dict[int, np.ndarray] = {}
     for L in Ls:
         md = sums["A"][L] / counts["A"] - sums["B"][L] / counts["B"]

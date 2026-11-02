@@ -114,13 +114,59 @@ def _sweep_rank(s, layer: int, **p) -> dict:
     return {"sweep": {k_: v for k_, v in r.items() if k_ != "units"}, "rank": {k_: v for k_, v in k.items() if k_ != "units"}}
 
 
-def _eval(s, recipe: str | None = None, units: list[str] | None = None, dose_unit: str | None = None, **p) -> dict:
-    """eval(§6.14)。recipe は保存したレシピの名前、units は単発指定(どちらか)。"""
+def _eval(s, recipe: str | None = None, units: list[str] | None = None, dose_unit: str | None = None,
+          compare_methods: bool = False, match_effect: float | None = None, score_layer: int | None = None,
+          alloc: str | None = None, n_heads: list[int] | None = None, **p) -> dict:
+    """eval(§6.14)。recipe は保存したレシピの名前、units は単発指定(どちらか)。compare_methods は方式の比較(CHANGE-06 F.3)、
+    alloc は heads allocate の組のヘッド数ごとの評価(F.4、recipe も units も要らない)。"""
+    if alloc:
+        return s.eval_alloc_curve(alloc, n_heads=n_heads, suite=p.get("suite"), when=p.get("when"),
+                                  random_controls=int(p.get("random_controls") or 0))
     if bool(recipe) == bool(units):
         raise GneError("BAD_ARGS", "请传入 recipe（名称）或 units 其中之一")
     r = s.recipe(path=s.recipe_path(recipe)) if recipe else s.recipe(units=list(units), dose_unit=dose_unit)
+    if compare_methods:
+        return s.eval_compare_methods(r, match_effect=match_effect, score_layer=score_layer, suite=p.get("suite"),
+                                      when=p.get("when"))
     d = s.eval(r, **p)
     return {k: v for k, v in d.items() if k != "samples"}
+
+
+def _headproj_export(s, recipe: str | None = None, out: str | None = None, *, units: list[str] | None = None,
+                     name: str | None = None, direction_layer: str | None = None, file_stem: str | None = None,
+                     overwrite: bool = True, **p) -> dict:
+    """ヘッドの proj と gain(LoRA に入るユニット)を LoRA アダプタか焼き込み GGUF に書き出す。recipe(保存したレシピの名前か
+    パス)か units(UI のレシピのユニットの書き方)。out を省くと <root>/export/<名前>.lora.gguf(焼き込みは <名前>-headproj.gguf)。
+    file_stem を渡すとファイル名はそれ(LoRA は <file_stem>.lora.gguf、焼き込みは <file_stem>.gguf)。overwrite=False なら、
+    同じ名前のファイルがあれば書かずに FILE_EXISTS を返す(UI は確かめてから上書きする)。LoRA は小さいので、UI から落とせる
+    URL も返す。"""
+    import re
+    from pathlib import Path
+    from .steer import GneError
+    if units:
+        r = s.recipe(units=list(units), name=name or None, direction_layer=direction_layer)
+    elif recipe:
+        r = s.recipe(path=s.recipe_path(recipe), direction_layer=direction_layer)
+    else:
+        raise GneError("BAD_ARGS", "需要 recipe 或 units")
+    nm = name or r.name or "headproj"
+    if not re.fullmatch(r"[\w.\-]+", nm):
+        raise GneError("BAD_ARGS", f"名称 {nm!r} 只能包含字母、数字、_、-、.")
+    bake = bool(p.get("bake"))
+    if file_stem is not None:
+        file_stem = file_stem.strip().removesuffix(".gguf").removesuffix(".lora")
+        if not re.fullmatch(r"[\w.\-]+", file_stem):
+            raise GneError("BAD_ARGS", f"文件名 {file_stem!r} 只能包含字母、数字、_、-、.")
+    stem = file_stem or (f"{nm}-headproj" if bake else nm)
+    path = Path(out) if out else s.store.export_dir() / (f"{stem}.gguf" if bake else f"{stem}.lora.gguf")
+    if not overwrite and path.exists():
+        raise GneError("FILE_EXISTS", f"{path.name} 已存在", "请覆盖或使用其他名称")
+    d = s.headproj_export(r, path, **p)
+    d["file"] = Path(d["path"]).name
+    if not bake and Path(d["path"]).parent.resolve() == s.store.export_dir().resolve():
+        d["url"] = f"/api/export/file/{d['file']}"
+    d["name"] = nm
+    return d
 
 
 def standard_kinds() -> dict[str, Callable[..., dict]]:
@@ -144,6 +190,12 @@ def standard_kinds() -> dict[str, Callable[..., dict]]:
         "experts_contrast": lambda s, **p: s.experts_contrast(**p),
         "experts_sweep": lambda s, layer, **p: s.experts_sweep(layer, **p),
         "ablate": lambda s, direction, out, **p: s.ablate(direction, out, **p),
+        "heads_causal": lambda s, direction, **p: s.heads_causal(direction, **p),        # CHANGE-06 C
+        "heads_allocate": lambda s, direction, **p: s.heads_allocate(direction, **p),    # CHANGE-06 D
+        "head_pipeline": lambda s, spec, **p: s.heads_pipeline(spec, **p),             # 方向 → 基準層 → 因果 → 配分
+        "heads_candidates": lambda s, alloc, **p: s.heads_candidates(alloc, **p),       # 組 × 倍率で生成 → 採点のファイル
+        "heads_refine": lambda s, name, **p: s.heads_refine(name, **p),                 # 残りの質問で追加のヘッドを探す
+        "headproj_export": _headproj_export,
     }
 
 
