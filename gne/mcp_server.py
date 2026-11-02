@@ -389,15 +389,17 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def fieldtest(model: str | None = None, against: str | None = None, lora: str | None = None, name: str | None = None,
                         prompts: dict[str, Any] | None = None, match: str | None = None, long_tokens: int = 3072, tool_tokens: int = 1536,
-                        prompt_tokens: int = 1536, n_parallel: int = 4, llama_server: str | None = None, ppl: bool = True) -> dict:
+                        prompt_tokens: int = 1536, n_parallel: int = 4, llama_server: str | None = None, ppl: bool = True,
+                        bench: list[str] | None = None, bench_n: int | None = None) -> dict:
         """将实际使用测试作为作业提交（用 job_status 获取结果）。按真实用法（llama-server、开启思考、开启采样）测量长任务
         （达到上限被截断的比例、循环、正文为空）、工具调用（是否调用、名称、参数、无需时是否不调用、工具结果后能否继续）、问题集
-        （prompts 为 {名称: 文件或问题列表}，match 输出匹配率）、perplexity，并与 against 文件比较（compare 的 worse、
+        （prompts 为 {名称: 文件或问题列表}，match 输出匹配率）、基准测试（bench：gsm8k、mmlu_pro 的准确率，以及仅一侧正确的题数）、perplexity，并与 against 文件比较（compare 的 worse、
         same_level）。也可直接测量烧录后的文件。省略 model 时使用当前加载的模型。运行期间该模型会离开 GPU，
         其他 GPU 处理需要等待。27B 模型加 200 道问题集时，每个文件需 30～45 分钟。生成的文本不写入结果，而是写到 replies_path。"""
         try:
             p = {"model": model, "against": against, "lora": lora, "name": name, "prompts": prompts, "match": match, "long_tokens": long_tokens,
-                 "tool_tokens": tool_tokens, "prompt_tokens": prompt_tokens, "n_parallel": n_parallel, "llama_server": llama_server, "ppl": ppl}
+                 "tool_tokens": tool_tokens, "prompt_tokens": prompt_tokens, "n_parallel": n_parallel, "llama_server": llama_server, "ppl": ppl,
+                 "bench": bench, "bench_n": bench_n}
             return jobs.start("fieldtest", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
