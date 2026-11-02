@@ -100,6 +100,7 @@ gne export-cvec --recipe configs/recipes/evil.yaml            # → ~/.gne/expor
 gne steer --recipe configs/recipes/alien.yaml -p "Who are you?" --compare     # when: gen（仅生成的 token）
 gne steer --unit 22:2742:x4 -p "Is there life on other planets?" --compare   # gain：在神经元激活处 ×4
 gne eval --recipe configs/recipes/alien.yaml                  # 各剂量下的能力 / ppl / 混杂 / 人格变化
+gne fieldtest -m baked.gguf --against original.gguf           # 按真实用法测量长任务、工具调用与 perplexity，并逐文件比较
 gne gain --recipe configs/recipes/alien_gain.yaml             # → ~/.gne/export/alien_gain.lora.gguf
 
 gne direction --contrast configs/contrast/evil.yaml --select auto   # 逐层方向 + 层选择
@@ -226,6 +227,18 @@ gne steer -m M --unit 12:E37:N511:x2 -p "..." --compare
 结果是普通配方，包含诸如 `16:H8:s6@evil` 的单元。同一层中共享同一方向的注意力头会折叠为秩 1 LoRA，因此适配器保持很小；用 `gne headproj export`（与 `gne gain` 相同）写出，`--bake` 只改写相关张量。在 UI 中，配方标签页的“LoRA / 烧录”也可完成同样操作，选项包括格式、重写张量的类型、恢复为原始类型、与 LoRA 校验以及文件名（默认配方名；仅在确认后覆盖已有文件）。恢复到 IQ1、IQ2、IQ3_XXS 等低位宽类型需要 imatrix（告诉量化器哪些输入需要保留精度的权重）；将 `<模型名>.imatrix.gguf`（或 `.dat`）放在模型旁即可自动使用，无需显式传入。烧录不使用 GPU（它逐块读取和重写文件），因此也适用于 GPU 放不下的大模型：可以用量化模型分析，再烧录到同一模型的未量化 GGUF（F16 / BF16）（`--into`，UI 中的“烧录目标”）。方向来自分析模型，重写矩阵来自目标模型，类型保持不变（`--requant keep`）。强度是在量化模型上测得的，因此会有少量差异，也无法与 LoRA 版校验。之后再用 llama-quantize 量化烧录后的 F16 / BF16，也可避免只有重写张量处于不同类型；LoRA 可以立即下载。gne 会将配方（层、注意力头、强度）作为 `gne.*` 元数据记录在导出文件中；若文件要交给别人，请使用“不包含 gne 的记录”（`--strip-meta`），它还会检查元数据中是否残留本地路径（使用 imatrix 重新量化时，llama-quantize 可能记录生成 imatrix 所用文本的路径）。即使没有记录，LoRA 张量仍会直接显示层、注意力头和方向，烧录文件与原模型比较也仍能看出改了什么、如何改。control vector 无法表达这些。依赖某个配方前，请对照控制进行检查。`gne eval --random-controls N` 将相同强度应用到随机选出的注意力头；`gne eval --compare-methods` 将全层消融、将同一批头整体缩放、移除顶部神经元调到相同得分并比较副作用；`gne eval --alloc NAME --n-heads 6,5,4,3` 显示减少注意力头时副作用如何变化。得分是沿用于选头的同一方向测量的，因此报告结果时请使用从输出测得的指标，例如对照集的 `validate.match`、能力和困惑度。对于使用方向的配方，eval 还会在每个倍率和每个对照下测量方向指标（得分下降量、偏移、一致率）；当对照集有数百个问题时开销很大，因此默认读取等间隔的 64 个问题（`--dir-max-examples`，UI 的 eval 标签页中的“问”），也可以关闭（`--no-direction-metrics`，UI 的“方向指标”）。
 
 在 Qwen3.5-4B 上，这样选出的两个注意力头阻止了 evil system 提示词所要求的人格（之前 83% 的回复被判为符合，之后为 0），同时没有改变能力和困惑度。将效果对齐到相同得分后，全层消融使困惑度上升 15%，而将同样两个注意力头整体缩放会损失 14 点能力。方法详情见 [docs/head-component-steering.md](docs/head-component-steering.md)。
+
+### 实际使用测试：按真实用法检验文件
+
+`gne eval` 是快速检查：它在单个文件上缩放配方，并询问短问题。`gne fieldtest` 检验模型文件在真实使用中是否可靠，并在文件之间进行比较。它会启动开启思考和采样的 `llama-server`，让模型执行长任务和工具调用任务，并报告答案达到 token 上限的频率、陷入短周期或长周期循环的频率、因推理始终未完成而导致正文为空的频率、是否在需要时以完整参数调用正确的工具、是否在无需调用时不调用工具，以及模型能否在工具结果之后继续。perplexity 由 gne 重新读取相同参考文本计算，因此可直接测量烧录后的文件，而 `gne eval` 无法做到这一点。
+
+```bash
+gne fieldtest -m baked.gguf --against original.gguf --llama-server <llama-server 的路径>
+gne fieldtest -m original.gguf --lora adapter.lora.gguf                # 有/无 LoRA 对比
+gne fieldtest -m baked.gguf --against original.gguf --prompts mine=questions.json --match "some regex"
+```
+
+任务位于 `configs/fieldtest/`，可通过 `--long-tasks` 和 `--tool-tasks` 替换。`--prompts name=file` 添加自定义问题，测量循环、正文为空和达到上限被截断的情况；`--match` 增加匹配率。文件会逐个加载到 GPU。最多相差 2 题，或 perplexity 相差 1%，视为同一水平，因为仅靠采样就可能造成一道题的差异。结果写入 `<root>/fieldtest/<name>.json`；生成的文本写入单独的 `<name>.replies.json`，不会打印。在 27B 模型上（RTX 3080，12 GB），额外加入 200 道问题后，每个文件耗时 30～45 分钟。`gne` 不构建 `llama-server`，因此请通过 `--llama-server` 或 `GNE_LLAMA_SERVER` 传入，或将其放在 `PATH` 中。在 UI 中，这是 eval 视图的“实际使用测试”部分；运行期间，已加载的模型会离开 GPU，聊天等操作必须等待。
 
 ### 跨量化
 

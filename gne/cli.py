@@ -2039,5 +2039,79 @@ def heads_refine(c: Common, holder: dict,
         lines.append("3. 无法创建追加组，因此没有合并后的配方")
     return d, "\n".join(lines), 0
 
+
+def _fieldtest_text(d: dict) -> str:
+    def fmt(section, key, v):
+        if v is None:
+            return "—"
+        if section == "ppl":
+            return f"{v:.3f}"
+        if key == "tokens":
+            return f"{v:.0f}"
+        if key == "tail_distinct":
+            return f"{v:.2f}"
+        return f"{v * 100:.1f}%"
+    title = {"long": f"长任务（{d['settings']['n_long']} 题，最多 {d['settings']['long_tokens']} token）",
+             "tools": f"工具调用（{d['settings']['n_tools']} 题）", "ppl": "perplexity"}
+    lines = [f"{d['path']}（{d['seconds'] / 60:.0f} 分钟）", f"被测文件：{d['target']['file']}" + (f" + LoRA {Path(d['target']['lora']).name}" if d["target"]["lora"] else "")]
+    if d["reference"]:
+        lines.append(f"对照文件：{d['reference']['file']}")
+    rows = d["compare"]
+    if rows is None:                                  # 比べる相手が無いとき: 対象の数字だけ
+        run = d["runs"][-1]
+        rows = []
+        for sec in ("long", "tools"):
+            rows += [{"section": sec, "metric": k, "label": k, "reference": None, "target": v, "worse": False}
+                     for k, v in (run.get(sec) or {}).items() if not k.startswith("n")]
+        for name, m in (run.get("prompts") or {}).items():
+            rows += [{"section": f"prompts:{name}", "metric": k, "label": k, "reference": None, "target": v, "worse": False}
+                     for k, v in m.items() if k != "n"]
+        rows += [{"section": "ppl", "metric": k, "label": k, "reference": None, "target": v, "worse": False} for k, v in (run.get("ppl") or {}).items()]
+    cur = None
+    for r in rows:
+        if r["section"] != cur:
+            cur = r["section"]
+            head = title.get(cur) or f"问题集 {cur.split(':', 1)[-1]}（{d['settings']['prompts'].get(cur.split(':', 1)[-1], '?')} 题，最多 {d['settings']['prompt_tokens']} token）"
+            lines.append(head)
+            lines.append(f"  {'':<26} {'对照文件':>9} {'被测文件':>9}")
+        lines.append(f"  {r['label']:<26} {fmt(r['section'], r['metric'], r['reference']):>9} {fmt(r['section'], r['metric'], r['target']):>9}"
+                     + ("  ← 恶化" if r.get("worse") else ""))
+    if d["same_level"] is not None:
+        lines.append("结论：全部处于同一水平（比例按 2 题计，perplexity 差异在 1% 以内视为同一水平）" if d["same_level"]
+                     else "结论：有项目恶化：" + ", ".join(d["worse"]))
+    lines.append(f"生成的文本：{d['replies_path']}")
+    return "\n".join(lines)
+
+
+@gne_command(app, "fieldtest")
+def fieldtest_cmd(c: Common, holder: dict,
+                  against: Optional[Path] = typer.Option(None, "--against", help="对照文件（例如原模型）。省略时只测量 --model（若有 --lora，则与未应用 LoRA 的同一文件比较）"),
+                  lora: Optional[str] = typer.Option(None, "--lora", help="应用于 --model 的 LoRA（路径 或 路径:倍率）"),
+                  name: Optional[str] = typer.Option(None, "--name", help="保存名称（默认为文件名）"),
+                  prompts: Optional[list[str]] = typer.Option(None, "--prompts", help="自定义问题集 名称=文件（JSON 或 YAML 列表，可重复）"),
+                  match: Optional[str] = typer.Option(None, "--match", help="应用于问题集回复正文的正则表达式。输出匹配率"),
+                  long_tasks: Optional[Path] = typer.Option(None, "--long-tasks", help="长任务题目（默认 configs/fieldtest/long_tasks.json）"),
+                  tool_tasks: Optional[Path] = typer.Option(None, "--tool-tasks", help="工具调用题目（默认 configs/fieldtest/tool_tasks.json）"),
+                  long_tokens: int = typer.Option(3072, "--long-tokens"), tool_tokens: int = typer.Option(1536, "--tool-tokens"),
+                  prompt_tokens: int = typer.Option(1536, "--prompt-tokens"), temperature: float = typer.Option(0.6, "--temperature"),
+                  n_parallel: int = typer.Option(4, "--n-parallel", help="同时生成的请求数"),
+                  reasoning_effort: Optional[str] = typer.Option("medium", "--reasoning-effort", help="传给聊天模板的值"),
+                  llama_server: Optional[str] = typer.Option(None, "--llama-server", envvar="GNE_LLAMA_SERVER", help="llama-server 的路径"),
+                  server_args: Optional[str] = typer.Option(None, "--server-args", help="传给 llama-server 的额外参数"),
+                  ppl: bool = typer.Option(True, "--ppl/--no-ppl", help="也测量 perplexity"),
+                  skip_long: bool = typer.Option(False, "--skip-long"), skip_tools: bool = typer.Option(False, "--skip-tools"),
+                  yes: bool = _YES):
+    """实际使用测试：按真实用法（llama-server、开启思考、开启采样）测量长任务、工具调用、问题集和 perplexity，
+    并比较文件。eval 用短问题检查同一文件在不同倍率下的表现；此命令可直接测量烧录后的文件。"""
+    s = holder["session"] = c.session()
+    args = {"against": str(against) if against else None, "lora": lora, "prompts": list(prompts or []), "long_tokens": long_tokens,
+            "prompt_tokens": prompt_tokens, "n_parallel": n_parallel, "skip_long": skip_long, "skip_tools": skip_tools,
+            "long_tasks": str(long_tasks) if long_tasks else None, "tool_tasks": str(tool_tasks) if tool_tasks else None}
+    _gate(s, "fieldtest", args, yes, None)
+    d = s.fieldtest(against=against, lora=lora, name=name, prompts=list(prompts or []), match=match, long_tasks=long_tasks, tool_tasks=tool_tasks,
+                    long_tokens=long_tokens, tool_tokens=tool_tokens, prompt_tokens=prompt_tokens, temperature=temperature, n_parallel=n_parallel,
+                    reasoning_effort=reasoning_effort, llama_server=llama_server, server_args=server_args, ppl=ppl, skip_long=skip_long, skip_tools=skip_tools)
+    return d, _fieldtest_text(d), 0
+
 if __name__ == "__main__":
     app()

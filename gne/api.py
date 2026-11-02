@@ -1494,13 +1494,13 @@ class Session:
         if not p.exists():
             p = self.store.heads_dir(self.meta.model_id) / f"{alloc}.alloc.json"
         if not p.exists():
-            raise GneError("FILE_NOT_FOUND", f"配分结果 {alloc} 不存在", "请用 gne heads allocate 创建")
+            raise GneError("FILE_NOT_FOUND", f"分配结果 {alloc} 不存在", "请用 gne heads allocate 创建")
         al = json.loads(p.read_text(encoding="utf-8"))
         table = {r["n_heads"]: r for r in al["table"] if not r.get("skipped")}
         want = sorted(n_heads or table, reverse=True)
         miss = [n for n in want if n not in table]
         if miss:
-            raise GneError("BAD_ARGS", f"配分结果中没有 {miss} 个组（现有 {sorted(table)}）",
+            raise GneError("BAD_ARGS", f"分配结果中没有 {miss} 个组（现有 {sorted(table)}）",
                            f"请用 gne heads allocate --n-heads {','.join(map(str, want))} 重新创建")
         rows, baseline = [], None
         for n in want:
@@ -1830,11 +1830,11 @@ class Session:
         hd = self.store.heads_dir(self.meta.model_id)
         ap = hd / f"{name}.alloc.json"
         if not re.fullmatch(r"[\w.\-]+", str(name)) or not ap.exists():
-            raise GneError("FILE_NOT_FOUND", f"配分结果 {name} 不存在", "请用 gne heads pipeline 或 gne heads allocate 创建")
+            raise GneError("FILE_NOT_FOUND", f"分配结果 {name} 不存在", "请用 gne heads pipeline 或 gne heads allocate 创建")
         al = json.loads(ap.read_text(encoding="utf-8"))
         rows = [r for r in al["table"] if not r.get("skipped")]
         if not rows:
-            raise GneError("BAD_ARGS", f"配分结果 {name} 中没有可用的组")
+            raise GneError("BAD_ARGS", f"分配结果 {name} 中没有可用的组")
         if n_heads is None:
             row = next((r for r in rows if r.get("recommended")), rows[0])
         else:
@@ -1960,6 +1960,12 @@ class Session:
         except (TypeError, ValueError):
             raise GneError("BAD_ARGS", f"target 必须为数值、B（B 侧平均值）或 mid（A 与 B 的中点）（{spec!r}）") from None
 
+    def fieldtest(self, model: str | Path | None = None, **kw) -> dict:
+        """实际使用测试（gne/fieldtest.py）：按真实用法（llama-server、开启思考）测量长任务、工具调用、问题集和 perplexity，
+        并与 against 文件比较。结果保存在 <root>/fieldtest/<name>.json，生成的文本保存在 <name>.replies.json。"""
+        from .fieldtest import fieldtest as run
+        return run(self, model, **kw)
+
     def _pipeline_causal_reuse(self, name: str, cs, positions: str, mx: int | None, pipe: dict) -> dict | None:
         """一括の 3 段目(因果)を使い回せるなら、heads_causal と同じ形の結果。同じ対照集合・測る位置・質問の数・方向の層・
         外す閾値・層の数で、層ごとの行があるものだけ(層の数を記録していない古い結果は、同じとみなす)。"""
@@ -2033,11 +2039,11 @@ class Session:
         if not ap.exists():
             ap = self.store.heads_dir(self.meta.model_id) / f"{alloc}.alloc.json"
         if not ap.exists():
-            raise GneError("FILE_NOT_FOUND", f"配分结果 {alloc} 不存在", "请用 gne heads allocate 或 gne heads pipeline 创建")
+            raise GneError("FILE_NOT_FOUND", f"分配结果 {alloc} 不存在", "请用 gne heads allocate 或 gne heads pipeline 创建")
         al = json.loads(ap.read_text(encoding="utf-8"))
         rows = [r for r in al["table"] if not r.get("skipped") and (n_heads is None or r["n_heads"] in set(n_heads))]
         if not rows:
-            raise GneError("BAD_ARGS", f"配分结果中没有可用的组（n_heads={n_heads}）")
+            raise GneError("BAD_ARGS", f"分配结果中没有可用的组（n_heads={n_heads}）")
         ds, cs, val = self._direction_contrast(al["direction"], contrast)
         out_name = name or f"{al['name']}"
         if not re.fullmatch(r"[\w.\-]+", out_name):

@@ -52,6 +52,7 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    若只想完整跑一遍，用 heads_pipeline(spec)（从创建方向到分配。问题可以有数百个，停止测定的阶段会抽稀到 64 个）。
    最终确定强度：heads_candidates（按组 × 倍率生成，并创建隐藏名称的评分文件）→ 评分 → heads_candidates_tally。
    若某组仍留下无法消除的问题（分配表中的 remain），用 heads_refine 仅从剩余问题中寻找额外注意力头并加入组中。
+   分发前用 fieldtest 确认（按真实用法比较烧录后的文件与原文件；检查 eval 看不到的长任务崩溃和工具调用问题）。
    - 使用方向的干预，应先用 direction_score 确认基准层与分离度（cohen_d）再继续。
    - heads_causal 的 ablate 与 marginal 排名不同。初次筛选用 ablate，重新分配用 marginal（由 heads_allocate 使用）。
    - 确定强度始终使用不生成文本的指标（direction_score、heads_causal、heads_allocate）。需要生成的 eval 只用于最终候选。
@@ -386,6 +387,22 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             return _err(e)
 
     @srv.tool()
+    async def fieldtest(model: str | None = None, against: str | None = None, lora: str | None = None, name: str | None = None,
+                        prompts: dict[str, Any] | None = None, match: str | None = None, long_tokens: int = 3072, tool_tokens: int = 1536,
+                        prompt_tokens: int = 1536, n_parallel: int = 4, llama_server: str | None = None, ppl: bool = True) -> dict:
+        """将实际使用测试作为作业提交（用 job_status 获取结果）。按真实用法（llama-server、开启思考、开启采样）测量长任务
+        （达到上限被截断的比例、循环、正文为空）、工具调用（是否调用、名称、参数、无需时是否不调用、工具结果后能否继续）、问题集
+        （prompts 为 {名称: 文件或问题列表}，match 输出匹配率）、perplexity，并与 against 文件比较（compare 的 worse、
+        same_level）。也可直接测量烧录后的文件。省略 model 时使用当前加载的模型。运行期间该模型会离开 GPU，
+        其他 GPU 处理需要等待。27B 模型加 200 道问题集时，每个文件需 30～45 分钟。生成的文本不写入结果，而是写到 replies_path。"""
+        try:
+            p = {"model": model, "against": against, "lora": lora, "name": name, "prompts": prompts, "match": match, "long_tokens": long_tokens,
+                 "tool_tokens": tool_tokens, "prompt_tokens": prompt_tokens, "n_parallel": n_parallel, "llama_server": llama_server, "ppl": ppl}
+            return jobs.start("fieldtest", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
     async def heads_refine(name: str, n_heads: int | None = None, new_heads: list[int] | None = None, resume: bool = True) -> dict:
         """組を当てても目標まで下がらない A 側の質問(残り)だけで、追加のヘッドを探すジョブを投げる(job_status で結果)。
         name は一括(heads_pipeline)か heads_allocate の名前、n_heads は残りを測る組(既定は推す組)。残りの質問と B 側の質問で、
@@ -533,7 +550,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def job_start(kind: str, params: dict[str, Any] | None = None, workers: str | None = None) -> dict:
-        """提交长时间处理。kind: stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast / heads_causal / heads_allocate / head_pipeline / heads_candidates / heads_refine / headproj_export。
+        """提交长时间处理。kind: stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast / heads_causal / heads_allocate / head_pipeline / heads_candidates / heads_refine / headproj_export / fieldtest。
         params 是 gne.api 中同名方法的参数（例 sweep：{"layer": 22, "neurons": "random:64", "design": "quick"}）。
         预计超过 30 分钟的任务不会运行，而是返回 NEEDS_CONFIRM 与估算。在 params 中加入 budget("30m" 等)可按预算
         缩小范围（lens_steer 取靠近方向的上位神经元，sweep 用 quick 设计取 steer lens 前几名，reverse 减少
