@@ -230,6 +230,10 @@ The result is an ordinary recipe with units such as `16:H8:s6@evil`. Heads of on
 
 On Qwen3.5-4B, two heads chosen this way stopped the persona that the evil system prompt asks for (judged in 83% of replies before, none after) without changing capability or perplexity. Brought to the same score, full-layer ablation raised perplexity by 15%, and scaling the same two heads cost 14 points of capability. [docs/head-component-steering.md](docs/head-component-steering.md) explains the method in more detail.
 
+The weight edit itself is not new: for a single head it has the same rank-1 form as [Steer2Edit](https://arxiv.org/abs/2602.09870) (Sun et al., 2026), which we found after building this. CHiPS differs in how it chooses heads (by causal effect, where Steer2Edit uses alignment with the steering vector), in how it sets strengths (by measured efficiency and a hand-tuned overall scale, where Steer2Edit uses a closed-form rule and a grid search), and in checking results against random heads. The two have not been compared on the same task.
+
+The write-up is [CHiPS: a few heads between knowing and answering](https://balaena01.github.io/chips-steering/). On Qwen3.5-4B, four of 896 heads reduced correct answers given up for a wrong suggestion from 23% to 15% on 600 held-out questions, while accuracy with a right suggestion fell from 92.5% to 90.5%. Random heads at the same strengths did not reduce it. The recipe, every reply and the scripts are in [balaena01/chips-steering](https://github.com/balaena01/chips-steering).
+
 ### Field test: using a file the way it is really used
 
 `gne eval` is a fast check: it scales a recipe on one file and asks short questions. `gne fieldtest` asks whether a model file holds up in real use, and compares files with each other. It starts `llama-server` with thinking and sampling on, gives the model long tasks and tool-calling tasks, and reports how often answers hit the token limit, how often they fall into short or long loops, how often the answer stays empty because the reasoning never finished, whether the right tool is called with complete arguments, whether no tool is called when none is needed, and whether the model carries on after a tool result. Perplexity comes from reading the same reference texts in gne, so a baked file can be measured directly, which `gne eval` cannot do.
@@ -352,6 +356,7 @@ The documentation is in Japanese:
 - [docs/measurements.md](docs/measurements.md): timings and throughput.
 - [docs/agent_playbook.md](docs/agent_playbook.md): how to read the results.
 - [docs/setup.md](docs/setup.md): CUDA / ROCm under WSL, one environment per GPU, and workers.
+- [CHiPS: a few heads between knowing and answering](https://balaena01.github.io/chips-steering/): the write-up, with measurements and data.
 - [docs/head-component-steering.md](docs/head-component-steering.md): CHiPS, which changes only the component of a few causally chosen attention heads along a direction (`mode: proj`, `gne direction score`, `gne heads causal`, `gne heads allocate`, `gne eval --compare-methods`), and how it relates to full ablation.
 - [docs/persona_workflow.md](docs/persona_workflow.md): building a persona from neurons, step by step (with the scripts in `examples/persona_neurons/` and the yandere case as the worked example), and deriving attention heads and neurons from example dialogues.
 

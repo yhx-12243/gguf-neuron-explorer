@@ -228,6 +228,10 @@ gne steer -m M --unit 12:E37:N511:x2 -p "..." --compare
 
 在 Qwen3.5-4B 上，这样选出的两个注意力头阻止了 evil system 提示词所要求的人格（之前 83% 的回复被判为符合，之后为 0），同时没有改变能力和困惑度。将效果对齐到相同得分后，全层消融使困惑度上升 15%，而将同样两个注意力头整体缩放会损失 14 点能力。方法详情见 [docs/head-component-steering.md](docs/head-component-steering.md)。
 
+权重编辑本身并不新鲜：对于单个注意力头，它与 [Steer2Edit](https://arxiv.org/abs/2602.09870)（Sun 等，2026）具有相同的秩 1 形式；我们是在完成这一实现后才知道该工作。CHiPS 的区别在于选择注意力头的方式（按因果效果；Steer2Edit 按与 steering vector 的对齐程度）、设定强度的方式（按实测效率并手动调整整体缩放；Steer2Edit 使用闭式规则和网格搜索），以及用随机注意力头检验结果。两者尚未在同一任务上比较。
+
+文章见 [CHiPS：知道与回答之间的少数注意力头](https://balaena01.github.io/chips-steering/)。在 Qwen3.5-4B 上，896 个注意力头中的 4 个在 600 道留出题上，把因错误建议而放弃正确答案的比例从 23% 降至 15%，同时带有正确建议时的准确率从 92.5% 降至 90.5%。相同强度下的随机注意力头没有降低这个比例。配方、全部回复和脚本见 [balaena01/chips-steering](https://github.com/balaena01/chips-steering)。
+
 ### 实际使用测试：按真实用法检验文件
 
 `gne eval` 是快速检查：它在单个文件上缩放配方，并询问短问题。`gne fieldtest` 检验模型文件在真实使用中是否可靠，并在文件之间进行比较。它会启动开启思考和采样的 `llama-server`，让模型执行长任务和工具调用任务，并报告答案达到 token 上限的频率、陷入短周期或长周期循环的频率、因推理始终未完成而导致正文为空的频率、是否在需要时以完整参数调用正确的工具、是否在无需调用时不调用工具，以及模型能否在工具结果之后继续。perplexity 由 gne 重新读取相同参考文本计算，因此可直接测量烧录后的文件，而 `gne eval` 无法做到这一点。
@@ -350,6 +354,7 @@ python -m pytest -q
 - [docs/measurements.md](docs/measurements.md)：耗时与吞吐量。
 - [docs/agent_playbook.md](docs/agent_playbook.md)：如何解读结果。
 - [docs/setup.md](docs/setup.md)：WSL 下的 CUDA / ROCm、每个 GPU 一个环境，以及 worker。
+- [CHiPS：知道与回答之间的少数注意力头](https://balaena01.github.io/chips-steering/)：文章，包含测量结果与数据。
 - [docs/head-component-steering.md](docs/head-component-steering.md)：CHiPS，只改变少数由因果选出的注意力头中沿方向的分量（`mode: proj`、`gne direction score`、`gne heads causal`、`gne heads allocate`、`gne eval --compare-methods`），以及它与全层消融的关系。
 - [docs/persona_workflow.md](docs/persona_workflow.md)：从神经元逐步构建人格（使用 `examples/persona_neurons/` 中的脚本，并以病娇案例作为完整示例），并从示例对话中提取注意力头与神经元。
 
