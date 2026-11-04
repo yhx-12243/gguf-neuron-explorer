@@ -2056,6 +2056,7 @@ def _fieldtest_text(d: dict) -> str:
     lines = [f"{d['path']}（{d['seconds'] / 60:.0f} 分钟）", f"被测文件：{d['target']['file']}" + (f" + LoRA {Path(d['target']['lora']).name}" if d["target"]["lora"] else "")]
     if d["reference"]:
         lines.append(f"对照文件：{d['reference']['file']}")
+    lines += [f"注意: {w}" for w in d.get("warnings") or []]
     rows = d["compare"]
     if rows is None:                                  # 比べる相手が無いとき: 対象の数字だけ
         run = d["runs"][-1]
@@ -2099,13 +2100,15 @@ def fieldtest_cmd(c: Common, holder: dict,
                   tool_tasks: Optional[Path] = typer.Option(None, "--tool-tasks", help="工具调用题目（默认 configs/fieldtest/tool_tasks.json）"),
                   long_tokens: int = typer.Option(3072, "--long-tokens"), tool_tokens: int = typer.Option(1536, "--tool-tokens"),
                   prompt_tokens: int = typer.Option(1536, "--prompt-tokens"), temperature: float = typer.Option(0.6, "--temperature"),
+                  presence_penalty: float = typer.Option(0.0, "--presence-penalty", help="采样中的 presence penalty（按模型卡设置）"),
                   n_parallel: int = typer.Option(4, "--n-parallel", help="同时生成的请求数"),
                   reasoning_effort: Optional[str] = typer.Option("medium", "--reasoning-effort", help="传给聊天模板的值"),
+                  template_kwargs: Optional[str] = typer.Option(None, "--template-kwargs", help='传给聊天模板的 JSON（例如 {"enable_thinking": false} 可关闭思考）'),
                   llama_server: Optional[str] = typer.Option(None, "--llama-server", envvar="GNE_LLAMA_SERVER", help="llama-server 的路径"),
                   server_args: Optional[str] = typer.Option(None, "--server-args", help="传给 llama-server 的额外参数"),
                   ppl: bool = typer.Option(True, "--ppl/--no-ppl", help="也测量 perplexity"),
                   skip_long: bool = typer.Option(False, "--skip-long"), skip_tools: bool = typer.Option(False, "--skip-tools"),
-                  bench: Optional[str] = typer.Option(None, "--bench", help="基准测试（逗号分隔）：gsm8k（默认 250 题）、mmlu_pro（默认 300 题）。数据会下载到 <root>/fieldtest/data"),
+                  bench: Optional[str] = typer.Option(None, "--bench", help="基准测试（逗号分隔）：gsm8k（默认 250 题）、mmlu_pro（默认 300 题）、math500（默认 250 题）、ifeval（默认 250 题，math500 和 ifeval 需要 bench extra）。数据会下载到 <root>/fieldtest/data"),
                   bench_n: Optional[int] = typer.Option(None, "--bench-n", help="基准测试题数（固定种子抽取）"),
                   bench_tokens: int = typer.Option(4096, "--bench-tokens", help="基准测试回复上限"),
                   yes: bool = _YES):
@@ -2115,10 +2118,14 @@ def fieldtest_cmd(c: Common, holder: dict,
     args = {"against": str(against) if against else None, "lora": lora, "prompts": list(prompts or []), "long_tokens": long_tokens,
             "prompt_tokens": prompt_tokens, "n_parallel": n_parallel, "skip_long": skip_long, "skip_tools": skip_tools,
             "long_tasks": str(long_tasks) if long_tasks else None, "tool_tasks": str(tool_tasks) if tool_tasks else None,
-            "bench": bench, "bench_n": bench_n}
+            "bench": bench, "bench_n": bench_n, "bench_tokens": bench_tokens}
     _gate(s, "fieldtest", args, yes, None)
-    d = s.fieldtest(against=against, lora=lora, name=name, prompts=list(prompts or []), match=match, long_tasks=long_tasks, tool_tasks=tool_tasks,
-                    long_tokens=long_tokens, tool_tokens=tool_tokens, prompt_tokens=prompt_tokens, temperature=temperature, n_parallel=n_parallel,
+    try:
+        tkw = json.loads(template_kwargs) if template_kwargs else None
+    except ValueError as e:
+        raise GneError("BAD_ARGS", f"--template-kwargs 必须写成 JSON：{e}") from e
+    d = s.fieldtest(against=against, lora=lora, name=name, template_kwargs=tkw, prompts=list(prompts or []), match=match, long_tasks=long_tasks, tool_tasks=tool_tasks,
+                    long_tokens=long_tokens, tool_tokens=tool_tokens, prompt_tokens=prompt_tokens, temperature=temperature, presence_penalty=presence_penalty, n_parallel=n_parallel,
                     reasoning_effort=reasoning_effort, llama_server=llama_server, server_args=server_args, ppl=ppl, skip_long=skip_long, skip_tools=skip_tools,
                     bench=bench, bench_n=bench_n, bench_tokens=bench_tokens)
     return d, _fieldtest_text(d), 0
