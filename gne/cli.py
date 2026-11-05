@@ -392,6 +392,15 @@ def verify(c: Common, holder: dict,
                lambda: VResult("V14", "投影消除的 LoRA 与 bake 一致性", "skip",
                                "2 GiB 以上的模型会跳过（可用 gne ablate --bake --verify 确认）"))]
     results, bench_result = [], None
+    # 確かめる対象が無い検査は省く(失敗ではない)。MoE の検査は tests/test_change05.py と gne experts、残差の流れは V26
+    why = {}
+    if not s.engine.cvec_supported:
+        why |= dict.fromkeys(("V3", "V4", "V12"), f"{s.meta.arch} 的图不读取 control vector")
+    if s.meta.n_expert:
+        why |= dict.fromkeys(("V2", "V11", "V13", "V14"), "这是全层 MoE。此检查假设使用 dense 的 ffn_down（MoE 通过 V24 和 gne experts 检查）")
+    steps = [(vid, (lambda vid=vid, fn=fn: VResult(vid, "省略", "skip", why[vid]) if vid in why else fn())) for vid, fn in steps]
+    if s.engine.hc_streams:
+        steps.append(("V26", v.v26_hc_streams))
 
     def show(r):
         results.append(r)
@@ -402,7 +411,9 @@ def verify(c: Common, holder: dict,
             show(fn())
         except Exception as ex:  # noqa: BLE001
             show(VResult(vid, "异常", "fail", repr(ex)))
-    if bench:
+    if bench and not s.engine.cvec_supported:
+        show(VResult("V7", "基准测试", "skip", "不读取 control vector 的 arch"))
+    elif bench:
         bench_result = run_bench(s.engine, layer=v.L, reps=5)
         show(VResult("V7", "基准测试", "info",
                      f"set_cvec+prefill {bench_result['set_plus_prefill_ms']:.1f} ms（其中重新预留 {bench_result['reserve_ms']:.1f} ms）、"
@@ -1766,6 +1777,20 @@ def heads_causal(c: Common, holder: dict,
     return d, "\n".join(lines), 0
 
 
+def _allocate_note(r: dict, d: dict) -> list[str]:
+    """止まった理由の説明。目標に届いた組は黙っている(s_max に当たった組の比の話は、見落とすと結果を読み違える)。"""
+    stop, c = r.get("stop"), r.get("capped")
+    if stop == "target" or stop is None:
+        return []
+    if stop == "s_max" and c:
+        return [f"      L{c['layer']} H{c['head']} 达到上限 s={c['s']:g}。由于按比例分配，其他注意力头也一起停止。"
+                "可尝试 --method greedy 或 --s-max（仅提高上限时，目标较远时强度可能升到会破坏模型的程度）"]
+    why = {"drift": f"B 侧正交分量的偏移超过 {d.get('drift_max')}，因此在超过前停止",
+           "no_gain": "提高任何注意力头得分都不会下降，因此停止", "s_max": "所有注意力头都达到了 s 的上限",
+           "steps": "达到提升次数上限"}
+    return [f"      {why[stop]}"] if stop in why else []
+
+
 @gne_command(heads_app, "allocate", "heads allocate")
 def heads_allocate(c: Common, holder: dict,
                    name: str = typer.Option(..., "--name", help="方向名称"),
@@ -1781,7 +1806,8 @@ def heads_allocate(c: Common, holder: dict,
                    b_side_max: Optional[float] = typer.Option(None, "--b-side-max", help="移除会改变 B 侧得分的注意力头的阈值"),
                    base_recipe: Optional[Path] = typer.Option(None, "--base-recipe", help="当前组（若无则从 ablate 的前列创建）"),
                    delta_s: float = typer.Option(3.0, "--delta-s"), pool: int = typer.Option(30, "--pool", help="用于测量效率的候选（当前组 + 效果前 N）"),
-                   s_max: float = typer.Option(30.0, "--s-max", help="s 的上限"),
+                   s_max: Optional[float] = typer.Option(None, "--s-max", help="s 的上限（默认 proportional 为 30，greedy 无上限）"),
+                   method: str = typer.Option("proportional", "--method", help="proportional（按 s ∝ η 整体提高）/ greedy（每次提高最有效的单个注意力头）"),
                    remain_threshold: float = typer.Option(0.0, "--remain-threshold", help="视为“剩余”的得分"),
                    direction_layer: str = typer.Option("own", "--direction-layer"),
                    out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认使用方向名称）")):
@@ -1791,7 +1817,7 @@ def heads_allocate(c: Common, holder: dict,
     d = s.heads_allocate(name, contrast=contrast, candidates=candidates, target=target, score_layer=score_layer,
                          n_heads=_ints(n_heads) or [6, 5, 4], hard=hard, hard_subset=hard_subset,
                          proportional_to=proportional_to, from_zero=from_zero, b_side_max=b_side_max,
-                         base_recipe=base_recipe, delta_s=delta_s, pool=pool, s_max=s_max,
+                         base_recipe=base_recipe, delta_s=delta_s, pool=pool, s_max=s_max, method=method,
                          remain_threshold=remain_threshold, direction_layer=direction_layer, name=out_name)
     lines = [f"{d['path']}（L{d['score_layer']}、目标 {d['target']:g}、A {d['n_a']} 例、难生效示例 {d['hard']['n']}、"
              f"无干预 A {d['base_a_mean']:.2f} / B {d['base_b_mean']:.2f}、{d['seconds']:.0f} 秒）",
@@ -1803,6 +1829,7 @@ def heads_allocate(c: Common, holder: dict,
         lines.append(f"  {r['n_heads']:>3} {r['s_max']:>6.2f} {r['remain']:>5} {r['a_max']:>7.2f} {r['b_drift_orth']:>7.4f} "
                      f"{r['b_side_delta']:>+7.2f} {r['seconds']:>5.0f}  " + " ".join(r["units"])
                      + ("" if r["reached"] else "  （目标未达到）") + ("  ← 推荐" if r["recommended"] else ""))
+        lines += _allocate_note(r, d)
     if d["recommended"] is not None:
         rp = next(r["recipe"] for r in d["table"] if r.get("recommended"))
         lines.append(f"配方：{rp}。确认：gne eval --recipe {rp} --random-controls 16")

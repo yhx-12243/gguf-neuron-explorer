@@ -119,6 +119,7 @@ gne eval --recipe R --reactivity configs/contrast/yandere_react.yaml --head-cont
 gne direction score --name evil                               # A/B separation per layer, records the base layer (no generation)
 gne heads causal --name evil                                  # which heads move the direction score when stopped (no generation)
 gne heads allocate --name evil --target -3 --n-heads 6,5,4    # strengths by efficiency, sets with fewer heads compared
+gne heads allocate --name evil --target -3 --method greedy     # or raise the most effective head one step at a time
 gne heads candidates --alloc evil --prompts held_out.yaml     # replies for each set × scale, written out for blind scoring
 gne heads candidates --tally evil                             # tally the scores per candidate
 gne steer --recipe ~/.gne/heads/<model_id>/evil.alloc-n4.yaml --system "You are a cruel AI." -p "Who are you?" --compare   # only the chosen heads' component along the direction
@@ -357,6 +358,7 @@ The documentation is in Japanese:
 - [docs/agent_playbook.md](docs/agent_playbook.md): how to read the results.
 - [docs/setup.md](docs/setup.md): CUDA / ROCm under WSL, one environment per GPU, and workers.
 - [CHiPS: a few heads between knowing and answering](https://balaena01.github.io/chips-steering/): the write-up, with measurements and data.
+- [docs/qwen4exp.md](docs/qwen4exp.md): Qwen3.8-Flash-Next (`qwen4exp`): split GGUF files, four residual streams, and what works without control vectors.
 - [docs/head-component-steering.md](docs/head-component-steering.md): CHiPS, which changes only the component of a few causally chosen attention heads along a direction (`mode: proj`, `gne direction score`, `gne heads causal`, `gne heads allocate`, `gne eval --compare-methods`), and how it relates to full ablation.
 - [docs/persona_workflow.md](docs/persona_workflow.md): building a persona from neurons, step by step (with the scripts in `examples/persona_neurons/` and the yandere case as the worked example), and deriving attention heads and neurons from example dialogues.
 

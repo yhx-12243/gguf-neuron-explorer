@@ -119,6 +119,7 @@ gne eval --recipe R --reactivity configs/contrast/yandere_react.yaml --head-cont
 gne direction score --name evil                               # 逐层 A/B 分离度，记录基准层（不生成）
 gne heads causal --name evil                                  # 停掉哪些头会让方向得分变化（不生成）
 gne heads allocate --name evil --target -3 --n-heads 6,5,4    # 按效率分配强度，并比较头更少的组
+gne heads allocate --name evil --target -3 --method greedy    # 或逐个提高最有效注意力头的强度
 gne heads candidates --alloc evil --prompts held_out.yaml     # 为每个组 × 倍率生成回复，写出供匿名评分
 gne heads candidates --tally evil                             # 汇总每个候选的评分
 gne steer --recipe ~/.gne/heads/<model_id>/evil.alloc-n4.yaml --system "You are a cruel AI." -p "Who are you?" --compare   # 仅所选头沿方向的分量
@@ -355,6 +356,7 @@ python -m pytest -q
 - [docs/agent_playbook.md](docs/agent_playbook.md)：如何解读结果。
 - [docs/setup.md](docs/setup.md)：WSL 下的 CUDA / ROCm、每个 GPU 一个环境，以及 worker。
 - [CHiPS：知道与回答之间的少数注意力头](https://balaena01.github.io/chips-steering/)：文章，包含测量结果与数据。
+- [docs/qwen4exp.md](docs/qwen4exp.md)：Qwen3.8-Flash-Next（`qwen4exp`）：分割 GGUF 文件、四条残差流，以及在不使用 control vector 时哪些功能可用。
 - [docs/head-component-steering.md](docs/head-component-steering.md)：CHiPS，只改变少数由因果选出的注意力头中沿方向的分量（`mode: proj`、`gne direction score`、`gne heads causal`、`gne heads allocate`、`gne eval --compare-methods`），以及它与全层消融的关系。
 - [docs/persona_workflow.md](docs/persona_workflow.md)：从神经元逐步构建人格（使用 `examples/persona_neurons/` 中的脚本，并以病娇案例作为完整示例），并从示例对话中提取注意力头与神经元。
 

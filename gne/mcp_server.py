@@ -55,7 +55,7 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    分发前用 fieldtest 确认（按真实用法比较烧录后的文件与原文件；检查 eval 看不到的长任务崩溃和工具调用问题）。
    - 使用方向的干预，应先用 direction_score 确认基准层与分离度（cohen_d）再继续。
    - heads_causal 的 ablate 与 marginal 排名不同。初次筛选用 ablate，重新分配用 marginal（由 heads_allocate 使用）。
-   - 确定强度始终使用不生成文本的指标（direction_score、heads_causal、heads_allocate）。需要生成的 eval 只用于最终候选。
+   - 候选与强度方案用不生成文本的指标（direction_score、heads_causal、heads_allocate）来制定。得分表示推动量，并非行为本身，因此最终强度要用少量问题生成来确认。
    - 报告主要采用外部可见指标（eval 的 rate = 对照集 validate.match 的一致率、能力、ppl）。只看方向的投影值，
      只能说明“用方向测量了被方向推动的东西”。
    - 未经过随机对照（eval 的 random_controls，同数量、相同 s 的随机注意力头）与方式比较（compare_methods）的配方不要报告。
@@ -353,15 +353,16 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def heads_allocate(name: str, target: float, contrast: str | None = None, candidates: str | None = None,
                              n_heads: list[int] | None = None, score_layer: int | None = None, hard: int = 16,
-                             b_side_max: float | None = None) -> dict:
+                             b_side_max: float | None = None, method: str = "proportional", s_max: float | None = None) -> dict:
         """効率ベースの強さ配分をジョブで投げる(CHANGE-06 D、job_status で結果。生成なし)。heads_causal の結果(candidates、
         既定は方向の名前)から、効きにくい例(A 側で点数が高く残る hard 件)を選び、効率 eta を測り、n_heads(既定 [6, 5, 4])の
         各ヘッド数で s ∝ eta に配って、効きにくい例の点数の平均が target になるよう二分探索する。比較表(ヘッド数・各ヘッドの s・
         最大の s・残る件数・A 側の最大点数・B 側の直交成分のずれ)と recommended(残る件数と B 側のずれが同程度なら最少の
-        ヘッド数)、各組のレシピのパスを返す。"""
+        ヘッド数)、各組のレシピのパスを返す。method="greedy" は比を固定せず、いちばん効くヘッドを 1 本ずつ上げる(s_max の既定はなし、
+        止まるのは目標か B 側のずれ)。行の stop が止まった理由、capped が上限に当たったヘッド。目標はスコアの目標なので、組は振る舞いで確かめる。"""
         try:
             params = {"direction": name, "target": target, "candidates": candidates, "score_layer": score_layer,
-                      "hard": hard, "b_side_max": b_side_max,
+                      "hard": hard, "b_side_max": b_side_max, "method": method, "s_max": s_max,
                       "contrast": None if contrast is None else str(_contrast_path(session, contrast, None, None, None, None))}
             if n_heads:
                 params["n_heads"] = list(n_heads)

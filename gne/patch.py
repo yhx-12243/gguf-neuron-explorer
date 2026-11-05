@@ -183,6 +183,9 @@ class Patcher:
     """1 つの GGUF(元のファイル)のテンソルからパッチを作る。バイトは元のファイルから読む。"""
 
     def __init__(self, weights):
+        if weights.gguf.is_split:          # 書き換えるテンソルは 2 番目以降のファイルにあり、作業用コピーも 1 ファイルしか作らない
+            raise GneError("UNSUPPORTED_QUANT", f"{Path(weights.path).name} 是分割 GGUF，无法应用缩放补丁",
+                           "请用 llama-gguf-split --merge 合并为一个文件，或使用神经元级 gain（LoRA）")
         self.w = weights
         self.mm = np.memmap(weights.path, mode="r")
 
