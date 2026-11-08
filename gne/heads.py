@@ -12,8 +12,8 @@
 
 trigger_mass を共通部分の中の割合にするのは、system の長さが違うと注目が system 側に薄まり、総量の差がペルソナではなく
 長さの差になるため。
-雑音の床: 中立どうし(system_b と、同じくらいの長さの別の中立の system_b2)で同じ指標を計算し、全ヘッドの値を対照の分布にする
-(各指標の p95 が床)。「system を別の文に替えるだけで動く量」を床にする。z は対照の分布に対する z(trigger_mass と dir_cos は絶対値で)を、測れた指標で平均したもの。
+基準値: 中立どうし(system_b と、同じくらいの長さの別の中立の system_b2)で同じ指標を計算し、全ヘッドの値を対照の分布にする
+(各指標の p95 が基準値。結果の floors)。「system を別の文に替えるだけで動く量」を基準値にする。z は対照の分布に対する z(trigger_mass と dir_cos は絶対値で)を、測れた指標で平均したもの。
 null_pct は、対照のヘッドの z の何割より大きいか。
 """
 
@@ -30,7 +30,7 @@ from .attn import capture_attention, find_spans, spans_to_tokens, token_offsets
 from .reverse import ContrastSet
 from .steer import GneError
 
-# 床に使う中立の system(ペルソナの system と同じくらいの長さで、性格を持たない)。対照集合の system_b2 で替えられる
+# 基準値(中立どうしの差の p95)に使う中立の system(ペルソナの system と同じくらいの長さで、性格を持たない)。対照集合の system_b2 で替えられる
 DEFAULT_SYSTEM_B2 = ("You are a knowledgeable and reliable assistant. You answer questions clearly and accurately, you explain "
                      "your reasoning step by step when it helps, you keep a calm and professional tone, and you respect the "
                      "user's time by staying concise and on topic. If you are unsure about something, you say so.")
@@ -572,7 +572,7 @@ def q_rows(weights, L: int, h: int) -> tuple[int, int]:
     if li.mixer != "attention":
         raise GneError("ARCH_UNSUPPORTED", f"第 {L} 层不是 attention 层（查询操作仅适用于 attention 层）")
     if not weights.has_tensor(f"blk.{L}.attn_q.weight"):
-        raise GneError("ARCH_UNSUPPORTED", f"缺少 blk.{L}.attn_q.weight（暂不支持 Q・K・V 合为一个张量的 arch）")
+        raise GneError("ARCH_UNSUPPORTED", f"缺少 blk.{L}.attn_q.weight（暂不支持将 Q、K、V 合并为单个张量的 arch）")
     hd = li.head_dim
     if weights.meta.arch in GATED_Q_ARCHS:
         return 2 * h * hd, 2 * h * hd + hd

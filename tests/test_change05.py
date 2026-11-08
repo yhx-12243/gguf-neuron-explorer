@@ -310,13 +310,13 @@ def test_moe_add_is_a_direction_push(moe, tmp_path):
     """V22: MoE のニューロンの add は警告と semantics: direction。export-cvec も警告し、gain と route は入れない。"""
     moe.warnings = []
     r = moe.recipe(units=["5:E3:N100:+0.8", "5:E3:x0"], dose_unit="raw")
-    assert any("書き込み方向の押し" in w for w in moe.warnings)
+    assert any("沿写入方向推动" in w for w in moe.warnings)
     _, det = moe.vectors(r)
     assert det[0]["semantics"] == "direction" and det[0]["expert"] == 3 and det[1]["mode"] == "gain"
     moe.warnings = []
     out = moe.export_cvec(r, tmp_path / "x.cvec.gguf")
     assert Path(out["path"]).exists()
-    assert any("書き込み方向の押し" in w for w in moe.warnings) and any("スケールパッチ" in w for w in moe.warnings)
+    assert any("沿写入方向推动" in w for w in moe.warnings) and any("缩放补丁" in w for w in moe.warnings)
 
 
 @pytest.mark.model

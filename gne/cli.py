@@ -34,9 +34,11 @@ heads_app = typer.Typer(no_args_is_help=True, help="注意力头（对照分析�
 app.add_typer(heads_app, name="heads")
 experts_app = typer.Typer(no_args_is_help=True, help="MoE 专家（对照分析、档案，CHANGE-05）")
 app.add_typer(experts_app, name="experts")
-# gne direction(方向を作る)は、サブコマンドが無ければ従来どおり動くグループ。gne direction score は速い物差し(CHANGE-06 B)
+# gne direction(方向を作る)は、サブコマンドが無ければ従来どおり動くグループ。gne direction score は速い指標(CHANGE-06 B)
 direction_app = typer.Typer(no_args_is_help=False, invoke_without_command=True)
 app.add_typer(direction_app, name="direction")
+from .modal_cli import modal_app  # noqa: E402
+app.add_typer(modal_app, name="modal")
 headproj_app = typer.Typer(no_args_is_help=True, help="导出注意力头的方向分量投影（mode: proj，CHANGE-06 E）")
 app.add_typer(headproj_app, name="headproj")
 
@@ -256,9 +258,22 @@ def parse_layers(spec: Optional[str]) -> Optional[list[int]]:
     return sorted(set(out))
 
 
+def _keyed_who(kind: str, expert=None) -> str:
+    """keyed の書き込み先の短い書き方(ユニットの記法と同じ: ffn / attn / S / Ee)。"""
+    return {"ffn": "ffn", "attn": "attn", "shared": "S"}.get(kind, f"E{expert}")
+
+
 def _units_text(units: list[dict]) -> str:
     rows = []
     for u in units:
+        if u.get("mode") == "keyed":                         # CHANGE-07: α は raw(d = r_L)
+            a = u.get("alpha", u.get("k"))
+            size = ""
+            if u.get("norm"):
+                size = f"、在键产生反应的位置 |α|‖r_L‖={u['norm']:.2f}" + (
+                    f"(残差范数 ρ_L 的 {u['rel_push']:.2f} 倍)" if u.get("rel_push") is not None else "")
+            rows.append(f"  L{u['layer']} {_keyed_who(u['kind'], u.get('expert'))} keyed α={a:+g} @{u.get('direction')} #{u.get('key')}(仅在键 κ 产生反应的状态写入方向，以 LoRA 应用{size})")
+            continue
         who = {"neuron": f"N{u['neuron']}", "random": f"random{u['seed']}", "head": f"H{u.get('head')}"}.get(
             u["kind"], f"dir:{u.get('direction')}")
         if u.get("mode") == "proj":                          # CHANGE-06
@@ -495,7 +510,11 @@ def stats_act(c: Common, holder: dict, corpus: Optional[Path] = _CORPUS, tokens:
 # --- steer / export / import / bake --------------------------------------------------------------------
 
 _RECIPE = typer.Option(None, "--recipe", help="配方 YAML")
-_UNIT = typer.Option(None, "--unit", help="L:N:dose（例 14:8949:+1.0）、L:random:SEED:dose、gain 为 L:N:x2，方向为 L:dir:NAME:dose，注意力头为 L:Hh:xk（例 21:H7:x0），注意力头方向分量投影为 L:Hh:sS@NAME（例 33:H16:s6@evil）。可重复")
+_UNIT = typer.Option(None, "--unit", help=("L:N:dose（例 14:8949:+1.0）、L:random:SEED:dose、gain 为 L:N:x2，方向为 "
+        "L:dir:NAME:dose，注意力头为 L:Hh:xk（例 21:H7:x0），注意力头方向分量投影为 L:Hh:sS@NAME（例 "
+        "33:H16:s6@evil），带键写入为 L:ffn:keyed:aα@NAME#KEY（例 "
+        "19:ffn:keyed:a1@zundamon_endings#zundamon_endings，attention 为 "
+        "L:attn:keyed:…）。可重复 "))
 _WORKERS = typer.Option(None, "--workers", help="auto，或逗号分隔的名称：分发给 gne worker 并等待完成（CHANGE-03 B）")
 _YES = typer.Option(False, "--yes", help="估算超过 30 分钟时仍继续运行")
 _BUDGET = typer.Option(None, "--budget", help="时间预算（30m、2h、90s）。会缩小候选或窗口以适配预算")
@@ -685,31 +704,71 @@ def gain(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
          out: Optional[Path] = typer.Option(None, "--out", "-o", help="输出（默认 <root>/export/<配方名>.lora.gguf；--bake 时为 -gain.gguf）"),
          bake: bool = typer.Option(False, "--bake", help="不生成 LoRA，而生成改写 W_up 的 GGUF"),
          in_path: Optional[Path] = typer.Option(None, "--in", help="--bake 的原始 GGUF（默认 --model）"),
-         requant: str = typer.Option("auto", "--requant", help="--bake 改写后的 ffn_up / W_O 类型：q8_0 / f16"),
+         requant: str = typer.Option("auto", "--requant", help=("--bake 的写入方式: auto(能写补丁时写缩放补丁，不能写时为 q8_0。包含 keyed 时按张量处理：原本为 Q8_0 的保持 Q8_0，其余为 "
+        "f16。仅对保持 Q8_0 时编辑的 1 成以上会被舍入抹掉的张量用 f16)/ patch / q8_0 / f16 / keep(原为 "
+        "F32、F16、BF16 时保持该类型。专家张量 ffn_down_exps 保持原类型，不编辑的专家保持字节不变。K-quant、IQ 的专家为 q8_0) ")),
+         key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 的 keyed 单元的键(由 gne direction key 创建)"),
+         direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 的 proj、keyed 单元的方向"),
          strip_meta: bool = typer.Option(False, "--strip-meta", help="不保留 gne 记录（gne.* 元数据、配方、名称标记）（供分发的版本）")):
-    """将 gain 单元（如 L:N:x2，把输出放大 k 倍；注意力头为 L:Hh:xk）导出为 LoRA 适配器 GGUF 或改写 GGUF（§6.16）。"""
+    """将 gain 单元（如 L:N:x2，把输出放大 k 倍；注意力头为 L:Hh:xk）导出为 LoRA 适配器 GGUF 或改写 GGUF（§6.16）。
+    ヘッドの方向成分の射影(proj)と鍵つきの書き込み(keyed、CHANGE-07)も同じ LoRA・焼き込みに入る。"""
     if in_path and c.model and in_path.resolve() != c.model.resolve():
         raise GneError("BAD_ARGS", "--in 与 --model 指向不同文件")
     s = holder["session"] = c.session(in_path)
-    r = s.recipe(units=unit, path=recipe, scale=scale)
-    name = r.name or "gain"
-    out = out or s.store.export_dir() / (f"{name}-gain.gguf" if bake else f"{name}.lora.gguf")
+    r = s.recipe(units=unit, path=recipe, scale=scale, default_key=key, default_direction=direction)
+    out = out or s.default_export_path(r, bake=bake, kind="gain")
     d = s.gain(r, out, bake=bake, requant=requant, strip_meta=strip_meta)
     if bake:
-        text = f"{d['path']}（{d['bytes'] / 1e6:.1f} MB）、改写：" + ", ".join(
-            f"{m['tensor']}({m['from']} → {m['to']})" for m in d["modified"])
+        text = f"{d['path']}({d['bytes'] / 1e6:.1f} MB)、改写: " + ", ".join(_mod_text(m) for m in d["modified"])
         if d.get("method") == "patch":
             text += f"\n缩放补丁（{d['patch_bytes'] / 1e3:.1f} KB，量化保持不变）。应用的操作位于 {d['path']}.patch.json"
+        text += "".join("\n" + ln for ln in _keyed_export_lines(d))
     else:
-        text = (f"{d['path']}({d['bytes'] / 1e6:.2f} MB、LoRA)\n"
-                + "\n".join(f"  L{L}: " + ", ".join(f"N{int(n)} ×{k:g}" for n, k in nk) for L, nk in (d.get("layers") or {}).items())
-                + "".join(f"\n  L{L}: " + ", ".join(f"H{int(h)} ×{k:g}" for h, k in hk) for L, hk in (d.get("heads") or {}).items())
-                + "".join(f"\n  L{L}: " + ", ".join(f"H{int(h)} s{sv:g}@{dn}" for h, sv, dn in x["heads"])
-                          + f"（方向分量投影，秩 {x['rank']}{'' if x['folded'] else '，方向混杂，无法折叠为秩 1'}）"
-                          for L, x in (d.get("proj_layers") or {}).items())
-                + "".join(f"\n  query 操作：{p}" for p in (d.get("query_loras") or []))
+        rows = ([f"  L{L}: " + ", ".join(f"N{int(n)} ×{k:g}" for n, k in nk) for L, nk in (d.get("layers") or {}).items()]
+                + [f"  L{L}: " + ", ".join(f"H{int(h)} ×{k:g}" for h, k in hk) for L, hk in (d.get("heads") or {}).items()]
+                + [f"  L{L}: " + ", ".join(f"H{int(h)} s{sv:g}@{dn}" for h, sv, dn in x["heads"])
+                   + f"（方向分量投影，秩 {x['rank']}{'' if x['folded'] else '，方向混杂，无法折叠为秩 1'}）"
+                   for L, x in (d.get("proj_layers") or {}).items()]
+                + _keyed_export_lines(d)
+                + [f"  query 操作：{p}" for p in (d.get("query_loras") or [])])
+        text = (f"{d['path']}({d['bytes'] / 1e6:.2f} MB、LoRA)" + "".join("\n" + r for r in rows)
                 + "\n用法：llama-cli -m <model> --lora " + d["path"])
     return d, text, 0
+
+
+def _mod_text(m) -> str:
+    """焼き込みで書き換えたテンソル 1 つ(分割の焼き込みは名前だけ)。keyed・proj は量子化し直しで失った分も出す。"""
+    if isinstance(m, str):
+        return m
+    s = f"{m['tensor']}({m.get('from', m.get('type', '?'))} → {m.get('to', '?')}"
+    if m.get("experts") is not None:            # 専門家の 3 次元テンソル(keyed の expert:e、CHANGE-07)
+        s += "、专家 " + ",".join(f"E{e}" for e in m["experts"])
+        s += "，其他专家" + ("保持字节不变" if m.get("untouched") == "raw" else f"转换({m.get('untouched')})")
+        if m.get("bytes_to") is not None and int(m["bytes_to"]) != int(m.get("bytes_from", m["bytes_to"])):
+            s += f"、{int(m['bytes_from']) / 1e6:.1f} → {int(m['bytes_to']) / 1e6:.1f} MB"
+    if m.get("requant_error") is not None:
+        s += f"，舍入损失占编辑的 {m['requant_error'] * 100:.1f}%"
+    if m.get("edit_kept") is not None:
+        s += f"，保留的编辑 {m['edit_kept'] * 100:.1f}%"
+    if m.get("fallback"):
+        s += "，Q8_0 下编辑会被淹没，因此用 F16"
+    return s + ")"
+
+
+def _keyed_export_lines(d: dict, *, requant_line: bool = True) -> list[str]:
+    """gain・headproj export の結果の keyed の行(CHANGE-07): 層ごとの書き込み先と階数(= その層の鍵の数)・鍵・方向と、
+    焼き込みなら量子化し直しで失った分の最大(requant_line)。"""
+    lines = []
+    for L, x in (d.get("keyed_layers") or {}).items():
+        tens = ", ".join(f"{n} 阶数 {r}" for n, r in x["tensors"].items())
+        lines.append(f"  L{L}: 带键写入 {tens}(键 {', '.join(x['keys'])}、方向 {', '.join(x['directions'])})")
+    err, kept = d.get("requant_error_max"), d.get("edit_kept_min")
+    if requant_line and d.get("keyed_layers") and err is not None:
+        bad = (kept < 0.9) if kept is not None else err > 0.5     # 残った編集の割合で見る(無ければ丸めのずれ)
+        lines.append(f"  重新量化损失最大为编辑大小的 {err * 100:.1f}%"
+                     + (f"，保留的编辑最小为 {kept * 100:.1f}%" if kept is not None else "")
+                     + ("(编辑被舍入淹没。请使用 --requant f16 或 auto，或用 LoRA 分发)" if bad else ""))
+    return lines
 
 
 def _doses(text: str) -> list[float]:
@@ -736,15 +795,25 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
              random_controls: int = typer.Option(0, "--random-controls", help="在每个倍率下也测量 N 个同等大小的随机对照配方（0 = 无）"),
              reactivity: Optional[Path] = typer.Option(None, "--reactivity", help="同时测量反应性的对照集 YAML（reactivity 对和 validate.match）"),
              head_controls: int = typer.Option(0, "--head-controls", help="--reactivity：将注意力头替换为相同 k 的随机头的对照数量"),
-             control_pool: str = typer.Option("before", "--control-pool", help="proj 的对照注意力头总体：before（指标层之前的全部注意力头）/ same-layers（同一层，严格对照）"),
+             control_pool: str = typer.Option("before", "--control-pool", help="proj 的对照注意力头总体：before（测量投影值的层之前的全部注意力头）/ same-layers（同一层，严格对照）"),
              compare_methods: bool = typer.Option(False, "--compare-methods", help="与 proj 配方使用同一方向，在效果对齐后比较全层投影、注意力头方向分量、注意力头整体倍率和神经元消除（CHANGE-06 F.3）"),
-             match_effect: Optional[float] = typer.Option(None, "--match-effect", help="--compare-methods：对齐用的 A 侧得分（省略则使用此配方的水平）"),
-             score_layer: Optional[int] = typer.Option(None, "--score-layer", help="--compare-methods：指标层"),
+             match_effect: Optional[float] = typer.Option(None, "--match-effect", help="--compare-methods：对齐用的 A 侧投影值（省略则使用此配方的水平）"),
+             score_layer: Optional[int] = typer.Option(None, "--score-layer", help="--compare-methods：测量投影值的层"),
              alloc: Optional[str] = typer.Option(None, "--alloc", help="按注意力头数量评估 gne heads allocate 的结果（名称或路径）中的各组（CHANGE-06 F.4）"),
              n_heads: Optional[str] = typer.Option(None, "--n-heads", help="--alloc：要评估的注意力头数量（例 6,5,4,3）"),
              direction_metrics: bool = typer.Option(True, "--direction-metrics/--no-direction-metrics",
-                                                    help="使用方向的配方还会测量方向指标（得分下降幅度、偏移、判定一致率）"),
+                                                    help="使用方向的配方还会测量方向指标（投影值下降幅度、偏移、判定一致率）"),
              dir_max_examples: int = typer.Option(64, "--dir-max-examples", help="方向指标读取的问题数量（A、B 各自。0 = 全部）"),
+             keyed: bool = typer.Option(True, "--keyed/--no-keyed",
+                                        help="对包含 keyed 单元的配方，还会测量 eval 的选择性(写入位置、不希望写入位置的残差变化)、方式比较、与比较用键(打乱标签后用相同步骤创建的键)的比较"),
+             keyed_contrast: Optional[str] = typer.Option(None, "--keyed-contrast",
+                                                          help="keyed: 创建键所用的对照集(configs/contrast/ 的名称或路径)。省略时，若创建方向所用的对照集与键相同则使用它"),
+             keyed_examples: int = typer.Option(8, "--keyed-examples", help="keyed: 每组对话读取的数量(0 = 全部)"),
+             keyed_pseudo: int = typer.Option(8, "--keyed-pseudo", help="keyed: 用于比较 eval 选择性的比较用键数量(最多为键文件中比较用键的数量)"),
+             keyed_subset: Optional[str] = typer.Option(None, "--keyed-subset",
+                                                        help="keyed: 读取的样本 even / odd / all(默认为键创建时的相反侧)"),
+             keyed_match: bool = typer.Option(True, "--keyed-match/--no-keyed-match",
+                                              help="keyed: 在方式比较中，将 add、gain、proj 的大小在写入位置与 keyed 对齐(省略则更快)"),
              yes: bool = _YES):
     """副作用检查：逐倍率测量能力（exact / format）、ppl、语言混入、人格变化量，并给出可发布的倍率（§6.14）。"""
     s = holder["session"] = c.session()
@@ -780,9 +849,8 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
     if compare_methods:                                  # CHANGE-06 F.3
         d = s.eval_compare_methods(r, match_effect=match_effect, score_layer=score_layer, top_neurons=top_neurons,
                                    suite=suite, when=when, name=name)
-        lines = [f"方式比较 {d['name']}（方向 {d['direction']}、将 L{d['score_layer']} 的 A 侧得分对齐到 {d['target']:.2f}。"
-                 f"无干预 A {d['base_score_a']:.2f} / B {d['base_score_b']:.2f}、{d['seconds']:.0f} 秒）→ {d['path']}",
-                 f"  {'方式':<10} {'α':>6} {'A得分':>7} {'B正交':>7} {'能力下降':>8} {'ppl恶化':>8} {'混入':>6} {'一致率':>6}"]
+        lines = [f"方式比较 {d['name']}（方向 {d['direction']}、将 L{d['score_layer']} 的 A 侧投影值对齐到 {d['target']:.2f}。无干预 A {d['base_score_a']:.2f} / B {d['base_score_b']:.2f}、{d['seconds']:.0f} 秒）→ {d['path']}",
+                 f"  {'方式':<10} {'α':>6} {"A侧投影值":>7} {'B正交':>7} {'能力下降':>8} {'ppl恶化':>8} {'混入':>6} {'一致率':>6}"]
         for r_ in d["rows"]:
             if r_.get("excluded"):
                 lines.append(f"  {r_['method']:<10} 排除：{r_['excluded']}")
@@ -790,12 +858,17 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
             lines.append(f"  {r_['method']:<10} {r_['alpha']:>6.3f} {r_['score_a']:>7.2f} {r_['drift_orth_b']:>7.4f} "
                          f"{r_['capability_drop_pt']:>7.1f}pt {r_['ppl_worse_pct']:>+7.1f}% {r_['mix_increase'] * 100:>+5.2f}% "
                          f"{_f(r_['rate'], '6.2f')}" + ("  可发布" if r_["shippable"] else ""))
-        lines.append("在同一 A 侧得分水平下比较的副作用。报告应主要采用判定一致率（外部可见指标）")
+        lines.append("在同一 A 侧投影值水平下比较的副作用。报告应主要采用判定一致率（外部可见指标）")
         return d, "\n".join(lines), 0
-    _gate(s, "eval", {"doses": _doses(doses), "suite": suite, "when": when, "random_controls": random_controls}, yes, None)
+    _gate(s, "eval", {"doses": _doses(doses), "suite": suite, "when": when, "random_controls": random_controls,
+                      "recipe": r, "keyed_metrics": keyed, "keyed_contrast": keyed_contrast,      # keyed の選択性の分も見積もる
+                      "keyed_examples": keyed_examples or None, "keyed_pseudo": keyed_pseudo, "keyed_match": keyed_match,
+                      "keyed_subset": keyed_subset}, yes, None)
     d = s.eval(r, doses=_doses(doses), suite=suite, when=when, judge_model=judge_model, judge_target=judge_target,
                name=name, random_controls=random_controls, reactivity=reactivity, head_controls=head_controls,
-               control_pool=control_pool, direction_metrics=direction_metrics, dir_max_examples=dir_max_examples or None)
+               control_pool=control_pool, direction_metrics=direction_metrics, dir_max_examples=dir_max_examples or None,
+               keyed_contrast=keyed_contrast, keyed_metrics=keyed, keyed_examples=keyed_examples or None,
+               keyed_match=keyed_match, keyed_pseudo=keyed_pseudo, keyed_subset=keyed_subset)
     th = d["suite"]["thresholds"]
     nc = d.get("random_controls") or 0
     head = f"{'倍率':>5} {'能力':>6} {'下降pt':>6} {'ppl':>8} {'恶化%':>7} {'混入':>6} {'新词':>5} {'d4':>5} {'截断':>4}"
@@ -807,9 +880,14 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
     if rcd:
         head += f" │ {'有':>5} {'无':>5} {'反应性':>6}" + (f" {'对照p95':>7} {'null':>5}" if rcd["head_controls"] else "")
     dmx = d.get("direction_metrics")
-    if dmx:                                              # CHANGE-06 F.1: 方向の点数と直交成分のずれ
+    if dmx:                                              # CHANGE-06 F.1: 方向への射影の値と直交成分のずれ
         head += f" │ {'下降':>7} {'A正交':>7} {'B正交':>7}" + (f" {'一致率':>6}" if dmx.get("behavior") else "") \
             + (f" {'null':>5}" if nc else "")
+    kd = d.get("keyed")                                  # CHANGE-07 E: 結果の keyed(方式の比較・比較用の鍵、または skipped)
+    ksel = any((row.get("keyed") or {}).get("selectivity") is not None for row in d["rows"])
+    knull = ksel and any((row.get("keyed") or {}).get("null_pct") is not None for row in d["rows"])
+    if ksel:                                             # 行の keyed: 目的の層の eval の選択性(比較用の鍵の対照があれば null)
+        head += f" │ {'选择性':>7}" + (f" {'null':>5}" if knull else "")
     lines = [head]
     for row in d["rows"]:
         pm = row["persona"]
@@ -838,6 +916,12 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
             if nc:
                 npct = row.get("rate_null_pct") if row.get("rate_null_pct") is not None else row.get("dir_null_pct")
                 line += f" {_f(None if npct is None else npct * 100, '4.0f')}%"
+        if ksel:
+            kr = row.get("keyed") or {}
+            line += f" │ {_f(kr.get('selectivity'), '+.3g'):>7}"
+            if knull:
+                kn = kr.get("null_pct")
+                line += f" {kn * 100:>4.0f}%" if kn is not None else f" {'—':>5}"
         lines.append(line + ("  可发布" if row["shippable"] else "  " + "、".join(k for k, ok in row["ok"].items() if not ok) + " ×"))
     ok = [r_["dose"] for r_ in d["rows"] if r_["shippable"] and r_["dose"] > 0]
     verdict = (f"可发布的最大倍率：{max(ok):g}" if ok else "没有可发布的倍率（0 除外）")
@@ -854,9 +938,18 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
                  + (f"对照为相同 k 的随机注意力头 {rcd['head_controls']} 个" if rcd["head_controls"] else "")
                  + ("" if rcd["head_controls"] or not head_controls else "配方不含注意力头，因此无法创建注意力头对照"))
     if dmx:
-        text += (f"\n方向 {dmx['direction']}（L{dmx['layers'][-1]}）：下降 = A 侧得分下降幅度，A正交 / B正交 = 残差差的"
-                 "正交分量 ÷ 残差" + ("，一致率 = A 侧判定（validate.match）" if dmx.get("behavior") else ""))
+        text += (f"\n方向 {dmx['direction']}（L{dmx['layers'][-1]}）：下降 = A 侧投影值下降幅度，A正交 / B正交 = 残差差的正交分量 ÷ 残差" + ("，一致率 = A 侧判定（validate.match）" if dmx.get("behavior") else ""))
+    if kd and "skipped" in kd:
+        text += f"\n未测量 keyed 的 eval 选择性: {kd['skipped']}" + (f"\n提示: {kd['hint']}" if kd.get("hint") else "")
+    elif kd:
+        text += "\n" + "\n".join(kd.get("text") or [])
+    if ksel:
+        kL = next(row["keyed"].get("layer") for row in d["rows"] if row.get("keyed"))
+        text += (f"\n行的选择性 = L{kL} 的 eval 选择性(残差在 r̂ 方向上的变化，写入位置 − 不希望写入位置。按写入方向对齐的值，应用整个配方后的结果。与 key-check 的选择性是不同的量)"
+                 + ("。null = 比替换为比较用键的对照中多少比例更大" if knull else ""))
     for n_ in d.get("notes") or []:
+        if kd and n_.startswith("keyed: "):              # keyed の注は上の keyed の表示に入っている
+            continue
         text += f"\n注意: {n_}"
     top = d["rows"][-1]["persona"]["top_words"][:8]
     if top:
@@ -1028,7 +1121,8 @@ def direction(c: Common, holder: dict,
               yes: bool = _YES):
     """从对照集创建并保存全层方向 r_L（mean_A − mean_B），再用 --select auto 选择效果较大的层（§6.17）。
     创建的方向可用 L:dir:NAME:dose 单元加入（gne steer / chat / eval / export-cvec）。
-    gne direction score は、方向の分離度(層ごとの cohen_d)と介入の効き目を生成なしで測る(CHANGE-06 B)。"""
+    gne direction score は、方向の分離度(層ごとの cohen_d)と介入の効き目を生成なしで測る(CHANGE-06 B)。
+    gne direction key / key-check / keys / key-verify / key-experts は鍵つきの書き込み(keyed、CHANGE-07)の鍵を作る・確かめる(key-experts は MoE の expert:e の鍵の専門家を選ぶ材料)。"""
     if contrast is None:
         raise GneError("BAD_ARGS", "--contrast 是必需的", "创建方向：gne direction --contrast <对照集>；"
                                                           "测量：gne direction score --name <方向> --contrast <对照集>")
@@ -1373,13 +1467,13 @@ def heads_contrast(c: Common, holder: dict,
                    contrast: Path = typer.Option(..., "--contrast", help="对照集 YAML（若有 triggers，也测量 trigger_mass）"),
                    name: Optional[str] = typer.Option(None, "--name", help="保存名称（默认使用对照集的 name）"),
                    direction: Optional[str] = typer.Option(None, "--direction", help="用于 dir_cos 的方向（默认为与对照集同名的方向）"),
-                   system_b2: Optional[str] = typer.Option(None, "--system-b2", help="用于噪声下限的另一中立 system（默认为长度相近的中立文本）"),
+                   system_b2: Optional[str] = typer.Option(None, "--system-b2", help="用于噪声基准值的另一中立 system（默认为长度相近的中立文本）"),
                    layers: str = typer.Option("all", "--layers", help="all / 10-16 / 1,5,9-12"),
                    max_tokens: int = typer.Option(48, "--max-tokens", help="比较用回复长度（以 system_a greedy 生成）"),
                    sort: str = typer.Option("z", "--sort", help="表格排序：z / trigger_mass / pattern_shift / out_shift / dir_cos（保存时按 z 排序）"),
                    show: int = typer.Option(20, "--show")):
     """分别用带人格（system_a）和中立（system_b）运行同一会话，逐注意力头测量关注与输出差异并排序。
-    噪声下限取中立之间（system_b 与 system_b2）的差异。"""
+    基準値に取中立之间（system_b 与 system_b2）的差异。"""
     from .heads import METRICS
     if sort not in ("z", *METRICS):
         raise GneError("BAD_ARGS", f"--sort 必须是 z / {' / '.join(METRICS)} 之一")
@@ -1393,7 +1487,7 @@ def heads_contrast(c: Common, holder: dict,
         rows = sorted((x for x in load_candidates(s, d["name"]) if x[sort] is not None), key=lambda x: -x[sort])
     lines = [f"{d['path']}（{d['n_heads']} 个注意力头、{d['n_prompts']} 个提示词（有触发词 {d['n_with_triggers']}）、"
              f"方向 {d['direction'] or '无'}、{d['seconds']:.0f} 秒）",
-             "下限（中立之间的 p95）：" + "、".join(f"{k} {v:.3f}" for k, v in fl.items()),
+             "基准值（中立之间的 p95）：" + "、".join(f"{k} {v:.3f}" for k, v in fl.items()),
              f"  {'序':>3} {'地址':>9} {'类型':>6} {'trigger':>8} {'pattern':>8} {'out':>6} {'dir_cos':>8} {'z':>6} {'null':>5}"]
     for i, x in enumerate(rows[:show], 1):
         lines.append(f"  {i:>3} {('L' + str(x['layer']) + ' H' + str(x['head'])):>9} {x['kind']:>6} "
@@ -1410,13 +1504,13 @@ def experts_contrast(c: Common, holder: dict,
                      contrast: Path = typer.Option(..., "--contrast", help="对照集 YAML"),
                      name: Optional[str] = typer.Option(None, "--name", help="保存名称（默认使用对照集的 name）"),
                      direction: Optional[str] = typer.Option(None, "--direction", help="用于 contrib_cos 的方向（默认为与对照集同名的方向，不存在时使用 l_out 的差）"),
-                     system_b2: Optional[str] = typer.Option(None, "--system-b2", help="用于噪声下限的另一中立 system"),
+                     system_b2: Optional[str] = typer.Option(None, "--system-b2", help="用于噪声基准值的另一中立 system"),
                      layers: str = typer.Option("all", "--layers", help="all / 10-16 / 1,5,9-12（仅测量 MoE 层）"),
                      max_tokens: int = typer.Option(48, "--max-tokens", help="比较用回复长度（以 system_a greedy 生成）"),
                      sort: str = typer.Option("z", "--sort", help="表格排序：z / usage_shift / weight_shift / contrib_cos / contrib_norm"),
                      show: int = typer.Option(20, "--show")):
     """分别用带人格（system_a）和中立（system_b）运行同一回复，逐 MoE 层专家测量选择方式与贡献差异并排序。
-    噪声下限取中立之间（system_b 与 system_b2）的差异。"""
+    基準値に取中立之间（system_b 与 system_b2）的差异。"""
     from .experts import METRICS, load_expert_candidates
     if sort not in ("z", *METRICS):
         raise GneError("BAD_ARGS", f"--sort 必须为 z / {' / '.join(METRICS)} 之一")
@@ -1426,7 +1520,7 @@ def experts_contrast(c: Common, holder: dict,
     rows = d["top"] if sort == "z" else sorted(load_expert_candidates(s, d["name"]),
                                                key=lambda x: -(abs(x[sort]) if sort != "contrib_norm" else x[sort]))
     lines = [f"{d['path']}（{d['n_experts']} 个专家、{d['n_prompts']} 个提示词、方向 {d['direction'] or 'l_out 的差'}、{d['seconds']:.0f} 秒）",
-             "下限（中立之间的 p95）：" + "、".join(f"{k} {v:.3f}" for k, v in d["floors"].items()),
+             "基准值（中立之间的 p95）：" + "、".join(f"{k} {v:.3f}" for k, v in d["floors"].items()),
              f"  {'序':>3} {'地址':>8} {'选择率 A→B':>12} {'usage':>7} {'weight':>7} {'cos':>6} {'norm':>6} {'z':>5} {'null':>5}"]
     for i, x in enumerate(rows[:show], 1):
         lines.append(f"  {i:>3} {('L' + str(x['layer']) + ' E' + str(x['expert'])):>8} {x['rate_a']:5.2f}→{x['rate_b']:<5.2f} "
@@ -1692,11 +1786,11 @@ def direction_score(c: Common, holder: dict,
                     positions: str = typer.Option("last", "--positions", help="测量位置：last / last:K（最后 K 个 token）/ assistant（生成提示词的 token）"),
                     recipe: Optional[Path] = _RECIPE, unit: Optional[list[str]] = _UNIT,
                     side: str = typer.Option("both", "--side", help="both / A / B"),
-                    subset: str = typer.Option("all", "--subset", help="all / even(測定用)/ odd(確認用)"),
+                    subset: str = typer.Option("all", "--subset", help="all / even(测量用)/ odd(确认用)"),
                     set_base: Optional[int] = typer.Option(None, "--set-base", help="手动指定并记录基准层"),
                     record: Optional[bool] = typer.Option(None, "--record/--no-record", help="将 cohen_d 最大的层记录为基准层（默认只在尚无记录时）")):
-    """速い物差し(CHANGE-06 B): 生成せず、対照集合の A 側・B 側をプロンプトの最後まで読ませて、層ごとに 残差 · r̂_L を測る。
-    --unit / --recipe を渡すと、その介入での点数の変化と、残差の差の方向成分・直交成分(drift_par / drift_orth)も出す。"""
+    """速い指標(CHANGE-06 B): 生成せず、対照集合の A 側・B 側をプロンプトの最後まで読ませて、層ごとに方向への射影の値
+    (残差 · r̂_L)を測る。--unit / --recipe を渡すと、その介入での射影の値の変化と、残差の差の方向成分・直交成分(drift_par / drift_orth)も出す。"""
     s = holder["session"] = c.session()
     d = s.direction_score(name, contrast=contrast, layers=_ints(layers), positions=positions, units=unit,
                           recipe=recipe, side=side, subset=subset, set_base=set_base, record_base=record)
@@ -1720,6 +1814,289 @@ def direction_score(c: Common, holder: dict,
     return d, "\n".join(lines), 0
 
 
+# --- CHANGE-07: 鍵つきの書き込み(keyed write)--------------------------------------------------------------
+
+_KEY_POS = (("写入位置: response / assistant / last / last:K / "
+        "before:<正则表达式>(在与推理时相同上下文的回复中，匹配字符的紧前方。写入位置的取法 (b))。默认为对照集的 positions，没有则为 "
+        "response "))
+_KEY_POS_B = "不希望写入的位置(默认: before:<re> 时为 not-before:<re>，否则与写入位置相同的指定)"
+_KEY_REPLIES_A = ("供读取写入侧回复的文件(YAML / JSON，与问题等长的列表或 {问题: 回复})。before:<re> 时写入位置与不希望写入位置在同一回复中，因此只传入一个")
+_KEY_REPLIES_B = "供读取不希望写入侧回复的文件"
+_KEY_IV = "在应用此干预的状态下捕获(配方 YAML、已保存配方的名称，或单元的写法。可多个)"
+_REPLY_KIND = {"given": "给定", "generated": "生成"}
+
+
+def _iv_arg(iv: Optional[list[str]]):
+    """--iv → keyed_build.intervention に渡す形: レシピのパスか保存したレシピの名前 1 つ、またはユニットの書き方のリスト。"""
+    if not iv:
+        return None
+    if len(iv) == 1 and (Path(iv[0]).exists() or ":" not in iv[0]):
+        return iv[0]
+    return list(iv)
+
+
+def _floats(text: str, opt: str) -> list[float]:
+    try:
+        return [float(x) for x in text.split(",") if x.strip()]
+    except ValueError as e:
+        raise GneError("BAD_ARGS", f"{opt} {text!r} 应为逗号分隔的数字(例 1,2)") from e
+
+
+def _fc(x, spec: str) -> str:
+    """表の列: 数を spec(例 '>8.3f')で書き、None は同じ幅の —。"""
+    return format("—", spec.split(".")[0]) if x is None else format(x, spec)
+
+
+def _target_who(target: str) -> str:
+    """鍵の書き込み先(ffn / attn / shared / expert:e)→ ユニットの記法の書き方(ffn / attn / S / Ee)。"""
+    if target.startswith("expert:"):
+        return f"E{target.split(':', 1)[1]}"
+    return _keyed_who(target)
+
+
+def _replies_text(replies: dict | None) -> str:
+    if not replies:
+        return ""
+    return "、回复 " + "、".join(f"{g} {_REPLY_KIND.get(v, "无")}" for g, v in replies.items())
+
+
+@gne_command(direction_app, "key", "direction key")
+def direction_key(c: Common, holder: dict,
+                  contrast: Path = typer.Option(..., "--contrast", help="对照集 YAML(system_a、system_b 与问题，可选 dont_touch、positions、replies。例 configs/contrast/zundamon_endings.yaml)"),
+                  layers: str = typer.Option(..., "--layers", help="创建键的层(必需。例 8,14,20 / 10-16。Q 的基底按层创建，因此不默认全层。最终层与 MTP 层不可用)"),
+                  name: Optional[str] = typer.Option(None, "--name", help="键的名称(默认为对照集的 name)。保存到 <root>/keys/<model_id>/<名称>.npz"),
+                  positions: Optional[str] = typer.Option(None, "--positions", help=_KEY_POS),
+                  positions_b: Optional[str] = typer.Option(None, "--positions-b", help=_KEY_POS_B),
+                  skip: Optional[int] = typer.Option(None, "--skip", help="从回复开头丢弃的 token 数(默认为对照集的 skip，没有则为 0)"),
+                  max_tokens: int = typer.Option(96, "--max-tokens", help="生成回复时的长度"),
+                  q_mode: str = typer.Option("examples", "--q-mode", help=("构成 Q(不希望写入位置与 dont_touch 的激活所张成子空间的基底)的行: examples(每个样本的平均，默认)/ "
+        "means(每组的平均。效果好但选择性粗)/ samples(token 的激活。选择性高但较重) ")),
+                  q_energy: float = typer.Option(0.99, "--q-energy", help="Q 的截断(奇异值平方的累计比例)"),
+                  q_max_rank: Optional[int] = typer.Option(None, "--q-max-rank", help="Q 的秩上限"),
+                  q_max_samples: int = typer.Option(4096, "--q-max-samples", help="--q-mode samples 使用的 token 上限(超过则抽样)"),
+                  subset: str = typer.Option("even", "--subset", help="使用的问题: even(默认。key-check 用 odd 确认)/ odd / all"),
+                  pseudo: int = typer.Option(16, "--pseudo", help="比较用键(将写入侧、不希望写入侧的标签按样本打乱，用相同步骤创建的键)的数量。打乱由 --seed 决定"),
+                  replies_a: Optional[Path] = typer.Option(None, "--replies-a", help=_KEY_REPLIES_A),
+                  replies_b: Optional[Path] = typer.Option(None, "--replies-b", help=_KEY_REPLIES_B),
+                  iv: Optional[list[str]] = typer.Option(None, "--iv", help=_KEY_IV),
+                  target: str = typer.Option("ffn", "--target", help=("写入目标: ffn(dense 的 ffn_down 输入)/ attn(attn_output、ssm_out 的输入 = 注意力头输出的拼接)/ "
+        "shared(MoE 层的 shared expert 的 ffn_down_shexp 输入)/ expert:e(ffn_down_exps 中专家 e "
+        "的输入。仅在专家 e 被选中的位置创建) ")),
+                  dont_touch_start: Optional[bool] = typer.Option(None, "--dont-touch-start/--no-dont-touch-start", help="dont_touch 各群问题的、开始写回复紧前方的位置也加入 Q(默认为对照集的 dont_touch_start，没有则加入)。不希望写入侧问题的此位置不加入")):
+    """keyed write の鍵 κ_L を作る(CHANGE-07)。書き込みたい位置の活性の平均 μ_L を、書き込みたくない位置と dont_touch の
+    活性が張る空間 Q_L に直交させ、κ_Lᵀμ_L = 1 に正規化して保存する(方向とは別のファイル)。鍵は無介入で作る(--iv は重ねるときだけ)。
+    作ったら gne direction key-check で、作成に使っていない例(既定 subset odd)で分離を確かめる。"""
+    Ls = parse_layers(layers)
+    if not Ls:
+        raise GneError("BAD_ARGS", "请在 --layers 中指定层(不能使用 all)", "例 --layers 8,14,20")
+    s = holder["session"] = c.session()
+    d = s.direction_key(contrast, name=name, layers=Ls, positions=positions, positions_b=positions_b, skip=skip,
+                        max_tokens=max_tokens, q_mode=q_mode, q_energy=q_energy, q_max_rank=q_max_rank,
+                        q_max_samples=q_max_samples, subset=subset, pseudo=pseudo, replies_a=replies_a,
+                        replies_b=replies_b, iv=_iv_arg(iv), target=target, seed=c.seed, dont_touch_start=dont_touch_start,
+                        progress=s.progress)
+    d.pop("warnings", None)                        # 警告はエンベロープの warnings に入っている
+    n = d["counts"]
+    moe = any("rows_a" in r for r in d["layers"])            # 書き込み先 shared・expert:e の鍵(層ごとの行の数を出す)
+    how = "与推理时相同上下文的回复" if d["mode"] == "same" else "system、recipe 的上下文"
+    lines = [f"{d['path']}(键 {d['name']}、写入目标 {d['target']}、写入位置为{how}(mode {d['mode']})、{d['seconds']:.1f} 秒)",
+             f"  位置: 写入位置 {d['positions']}、不希望写入位置 {d['positions_b']}、skip {d['skip']}、subset {d['subset']}、q_mode {d['q_mode']}、比较用键 {d['n_pseudo']} 个",
+             f"  示例: 写入侧 {n['a']} 个({n['rows_a']} 位置，包含写入位置的样本 {d['matched']['A']}/{d['matched']['of']})、不希望写入侧 {n['b']} 个({n['rows_b']} 位置)" + (f"、dont_touch {n['dt']} 个({n['rows_dt']} 位置)" if n.get("dt") else "")
+             + _replies_text(d.get("replies"))]
+    ds_ = d.get("dont_touch_start")
+    if ds_ and ds_.get("on") and ds_.get("groups"):          # dont_touch の質問の、返事を書き始める直前の位置を Q に入れた行
+        lines.append(f"  dont_touch 问题的、开始写回复紧前方的位置: 已将 {ds_['rows']} 行加入 Q("
+                     + "、".join(f"{g} {r}" for g, r in ds_["groups"].items()) + ")")
+    elif ds_ and not ds_.get("on") and d.get("dont_touch"):
+        lines.append("  dont_touch 问题的、开始写回复紧前方的位置: 未加入 Q(--no-dont-touch-start 或对照集的 dont_touch_start: false)")
+    rs = d.get("reply_start")
+    if rs:                                                   # mode same: 書き込みたい位置のうち返事の冒頭にあるもの
+        lines.append(f"  回复开头: 写入位置中的 {rs['rows']} / {rs['rows_a']} 是决定回复最初 {rs['k']} 个 token 的位置"
+                     + (f"(L{rs['layer']})" if rs.get("layer") is not None else "")
+                     + f"、占 μ 的权重 {rs['share'] * 100:.0f}%"
+                     + (f"(将开始写回复紧前方的位置加入 Q 的 dont_touch: {', '.join(rs['dont_touch_starts'])})" if rs["dont_touch_starts"] else ""))
+    lines += [f"  {'层':>4} {'kn':>6} {'放大率':>7} {'q_rank':>6} {'创建时AUC':>9}"
+             + (f" {'rows_a':>6} {'rows_b':>6} {'gate_a':>7}" if moe else "")]
+    for r in d["layers"]:
+        lines.append(f"  {r['layer']:>4} {r['kn']:>6.3f} {r['gain']:>7.2f} {r['q_rank']:>6} {_fc(r['build_auc'], '>9.3f')}"
+                     + (f" {r['rows_a']:>6} {r['rows_b']:>6} {_fc(r.get('gate_a'), '>7.3f')}" if moe else "")
+                     + ("  ← 弱(kn < 0.05，容易泄漏到不希望写入的位置)" if r["weak"] else ""))
+    lines.append("  kn = ‖k‖/‖μ‖(越接近 1，写入位置的平均越位于不希望写入位置子空间之外)、放大率 = 1/kn"
+                 + ("。rows_a、rows_b = 该层中存在写入目标行的写入位置、不希望写入位置的数量(专家仅为被选中的位置)，gate_a = 写入位置处 gate、router 权重的平均(LoRA 的 B 除以此值)" if moe else ""))
+    for x in d["dropped"]:
+        lines.append(f"  L{x['layer']}: 已排除({x['error']})")
+    lines += [f"注: {t}" for t in d["notes"]]
+    if d.get("samples"):
+        lines.append(f"回复示例: {d['samples'][0][:120]!r}")
+    lines.append(f"下一步: gne direction key-check --key {d['name']} --contrast {contrast}(默认 subset odd = 创建时未使用的样本)")
+    return d, "\n".join(lines), 0
+
+
+def _start_rho_text(sr: dict | None) -> str:
+    """key-check の層の start_rho を 1 行に: 群ごとの、返事の冒頭の位置 0(返事を書き始める直前の位置)での ρ の中央値。"""
+    if not sr:
+        return ""
+    items = ([("不希望写入侧", sr["B"])] if sr.get("B") else []) + list((sr.get("dont_touch") or {}).items())
+    out = [f"{g} {_f(v['median'][0], '+.2f')}" for g, v in items if v.get("median") and v["median"][0] is not None]
+    return "、".join(out)
+
+
+@gne_command(direction_app, "key-check", "direction key-check")
+def direction_key_check(c: Common, holder: dict,
+                        key: str = typer.Option(..., "--key", help="键的名称(NAME~j 表示比较用键 j)"),
+                        contrast: Optional[Path] = typer.Option(None, "--contrast", help="要确认的对照集(与创建相同则 --subset odd 为保留集)。省略时用键中保存的创建时样本测量(偏乐观的值)"),
+                        subset: str = typer.Option("odd", "--subset", help="使用的问题: odd(默认)/ even / all。与创建重叠时 held_out: false"),
+                        layers: Optional[str] = typer.Option(None, "--layers", help="测量层(默认为键的全部层)"),
+                        positions: Optional[str] = typer.Option(None, "--positions", help="写入位置(默认为创建键时的值)"),
+                        positions_b: Optional[str] = typer.Option(None, "--positions-b", help="不希望写入的位置(默认为创建键时的值)"),
+                        skip: Optional[int] = typer.Option(None, "--skip", help="从回复开头丢弃的 token 数(默认为创建键时的值)"),
+                        max_tokens: Optional[int] = typer.Option(None, "--max-tokens", help="生成回复时的长度(默认为创建键时的值)"),
+                        replies_a: Optional[Path] = typer.Option(None, "--replies-a", help=_KEY_REPLIES_A),
+                        replies_b: Optional[Path] = typer.Option(None, "--replies-b", help=_KEY_REPLIES_B),
+                        iv: Optional[list[str]] = typer.Option(None, "--iv", help=_KEY_IV),
+                        strict: bool = typer.Option(False, "--strict", help="若与创建时使用的样本重叠，则不测量并报错(BAD_ARGS)")):
+    """鍵の分離の確認(CHANGE-07 C、生成なしで済む位置なら生成なし)。各位置で鍵の反応の強さ ρ = κᵀx を測り、層ごとに
+    書き込みたい位置 対 書き込みたくない位置の AUC(例単位とトークン単位)、key-check の選択性(例ごとの ρ の平均の、
+    書き込みたい位置 − 書き込みたくない位置)と比較用の鍵(ラベルをシャッフルして同じ手順で作った鍵)の p95、
+    dont_touch の ρ の中央値を出す。作成に使った例と重なると held_out: false(甘い値)。判定の目安: 保留集合で選択性が
+    比較用の鍵の p95 を超えること。"""
+    s = holder["session"] = c.session()
+    d = s.direction_key_check(key, contrast=contrast, subset=subset, layers=parse_layers(layers) if layers else None,
+                              positions=positions, positions_b=positions_b, skip=skip, max_tokens=max_tokens,
+                              replies_a=replies_a, replies_b=replies_b, iv=_iv_arg(iv), strict=strict,
+                              progress=s.progress)
+    d.pop("warnings", None)
+    src = f"对照集 {d['contrast']}、subset {d['subset']}" if d["contrast"] else "键中保存的创建时样本"
+    lines = [f"键 {d['key']}(写入目标 {d['target']}、{src}、mode {d['mode']}、写入位置 {d['positions']}、不希望写入位置 {d['positions_b']}、{d['seconds']:.1f} 秒)"]
+    ov = d["overlap"]
+    if d["held_out"]:
+        lines.append(f"保留集: 是(创建时未使用的样本 {ov['n_checked']} 个)")
+    else:
+        why = ([f"同一对照集中 subset 重叠(创建 {ov.get('built_subset')}、确认 {ov.get('subset')})"] if ov.get("subset_overlap") else []) \
+            + ([f"与创建相同的 (system, 问题) 有 {ov['hash_overlap']} 个"] if ov.get("hash_overlap") else [])
+        lines.append("保留集: 否(" + "、".join(why or ["创建时使用的样本"]) + ")。AUC、选择性为偏乐观的值")
+    lines.append(f"  {'层':>4} {'AUC':>6} {'AUC(tok)':>8} {'选择性':>7} {'比较用p95':>7} {'比较用AUCp95':>10} {'二分AUC':>7}  判定")
+    for r in d["layers"]:
+        pa = (r["pseudo_auc_token"] if r["auc_token"] is not None else r["pseudo_auc"])["p95"]
+        mark = {True: "○", False: "×"}.get(r["beats_pseudo"], "—")
+        line = (f"  {r['layer']:>4} {_fc(r['auc'], '>6.3f')} {_fc(r['auc_token'], '>8.3f')} {_fc(r['selectivity'], '>7.3f')} "
+                f"{_fc(r['pseudo_selectivity']['p95'], '>7.3f')} {_fc(pa, '>10.3f')} {_fc(r['b_split_auc'], '>7.3f')}  {mark}")
+        dt = "、".join(f"{g} {_f(v, '+.3f')}" for g, v in (r.get("dont_touch_median") or {}).items())
+        if dt:
+            line += f"  dont_touch 的 ρ 中位数 {dt}"
+        st = _start_rho_text(r.get("start_rho"))
+        if st:
+            line += f"  回复开头的 ρ {st}"
+        if r["layer"] == d["best_layer"]:
+            line += "  ← 最佳"
+        lines.append(line)
+    lines.append(("  选择性 = key-check 的选择性(每个样本键反应强度 ρ 的平均，写入位置 − 不希望写入位置)。比较用p95、比较用AUCp95 = "
+        "比较用键的选择性、AUC 的 p95(AUC 若存在 token 级 AUC 则为 token 级)。判定 ○ = 选择性超过比较用键的 p95，且 AUC "
+        "> 0.5。二分AUC = 将不希望写入位置分成两组创建的键的 AUC(参考值)。回复开头的 ρ = 不希望写入侧、dont_touch "
+        "在开始写回复紧前方位置的 ρ 中位数(0.4 以上警告) "))
+    ab = d["all_beat_pseudo"]
+    lines.append("在全部层超过比较用键: " + {True: "是", False: "否"}.get(ab, "无判定(没有比较用键或不希望写入位置)"))
+    lines += [f"注: {t}" for t in d["notes"]]
+    if not d["held_out"]:
+        lines.append("下一步: 请用创建时未使用的样本(--subset odd 或另一对照集)重新测量")
+    elif d["best_layer"] is not None and ab is not False:
+        lines.append(f"下一步: gne steer --unit {d['best_layer']}:{_target_who(d['target'])}:keyed:a1@<方向>#{d['key']} -p \"…\" --compare 确认生成(α 为 raw，1 表示直接写入观测到的 A − B 差)")
+    return d, "\n".join(lines), 0
+
+
+@gne_command(direction_app, "keys", "direction keys")
+def direction_keys(c: Common, holder: dict):
+    """保存した鍵の一覧(<root>/keys/<model_id>/、CHANGE-07)。層・書き込み先・kn・作成の条件。"""
+    s = holder["session"] = c.session()
+    ks = s.keys()
+    lines = [f"键 {len(ks)} 个" + ("" if ks else "(用 gne direction key --contrast <对照集> --layers <层> 创建)")]
+    for k in ks:
+        if "error" in k:
+            lines.append(f"  {k['name']}: 无法读取({k['error']})")
+            continue
+        kn = " ".join(f"L{L}:{v:.2f}" for L, v in k["kn"].items())
+        lines.append(f"  {k['name']}  {k['target']}  q_mode {k['q_mode']}  位置 {k['positions']}  subset {k['subset']}  比较用键 {k['n_pseudo']}  kn {kn}")
+    return {"keys": ks}, "\n".join(lines), 0
+
+
+@gne_command(direction_app, "key-experts", "direction key-experts")
+def direction_key_experts(c: Common, holder: dict,
+                          contrast: Path = typer.Option(..., "--contrast", help="对照集 YAML(与创建键时相同。例 configs/contrast/zundamon_endings.yaml)"),
+                          layers: str = typer.Option(..., "--layers", help="要调查的 MoE 层(必需。例 6,12,18 / 10-16)"),
+                          positions: Optional[str] = typer.Option(None, "--positions", help=_KEY_POS),
+                          positions_b: Optional[str] = typer.Option(None, "--positions-b", help=_KEY_POS_B),
+                          skip: Optional[int] = typer.Option(None, "--skip", help="从回复开头丢弃的 token 数(默认为对照集的 skip，没有则为 0)"),
+                          max_tokens: int = typer.Option(96, "--max-tokens", help="生成回复时的长度"),
+                          subset: str = typer.Option("even", "--subset", help="使用的问题: even(默认。与键创建相同)/ odd / all"),
+                          replies_a: Optional[Path] = typer.Option(None, "--replies-a", help=_KEY_REPLIES_A),
+                          replies_b: Optional[Path] = typer.Option(None, "--replies-b", help=_KEY_REPLIES_B),
+                          iv: Optional[list[str]] = typer.Option(None, "--iv", help=_KEY_IV),
+                          top: int = typer.Option(8, "--top", help="每层显示的专家数(按写入位置被选中的比例从大到小)")):
+    """expert:e の鍵(gne direction key --target expert:e)の専門家を選ぶ材料(CHANGE-07 MoE)。鍵と同じ対照集合・位置・返事で、
+    書き込みたい位置・書き込みたくない位置で各専門家が選ばれた割合(rate_a・rate_b、例ごとの割合の平均)と、選ばれたときの
+    ルーターの重みの平均(weight_a、鍵の gate_a の見込み)を層ごとに出す。専門家の鍵は書き込みたい位置で専門家 e が選ばれた
+    行だけでできるので、rate_a の
+    大きい専門家ほど行が多く(rows_a)、鍵が例の本文を拾いにくい。MoE でない層は BAD_RECIPE。"""
+    Ls = parse_layers(layers)
+    if not Ls:
+        raise GneError("BAD_ARGS", "请在 --layers 中指定层(不能使用 all)", "例 --layers 6,12,18")
+    s = holder["session"] = c.session()
+    d = s.direction_key_experts(contrast, layers=Ls, positions=positions, positions_b=positions_b, skip=skip,
+                                max_tokens=max_tokens, subset=subset, replies_a=replies_a, replies_b=replies_b,
+                                iv=_iv_arg(iv), top=top, progress=s.progress)
+    lines = [f"专家被选中的方式(对照集 {d['contrast']}、mode {d['mode']}、写入位置 {d['positions']}、不希望写入位置 {d['positions_b']}、subset {d['subset']}{_replies_text(d.get('replies'))}、{d['seconds']:.1f} 秒)"]
+    for lay in d["layers"]:
+        lines.append(f"  L{lay['layer']}({lay['n_expert']} 个专家中 {lay['n_used']}、写入位置 {lay['positions_a']} 个、不希望写入位置 {lay['positions_b']} 个，若每个被等概率选中则为 {lay['base_rate']:.2f})")
+        lines.append(f"    {'专家':>6} {'rate_a':>6} {'rate_b':>6} {'差':>6} {'lift':>6} {"权重":>6} {"rows_a预期":>9}")
+        for r in lay["top"]:
+            dt = "、".join(f"{g} {v:.2f}" for g, v in (r.get("rate_dt") or {}).items())
+            lines.append(f"    {'E' + str(r['expert']):>6} {r['rate_a']:>6.2f} {r['rate_b']:>6.2f} {r['diff']:>+6.2f} "
+                         f"{_fc(r['lift'], '>6.2f')} {_fc(r['weight_a'], '>6.3f')} {r['rows_a']:>9.1f}"
+                         + (f"  dont_touch {dt}" if dt else ""))
+    lines += [f"注: {t}" for t in d["notes"]]
+    best = [(lay["layer"], lay["top"][0]["expert"]) for lay in d["layers"] if lay["top"]]
+    if best:
+        L, e = best[0]
+        lines.append(f"下一步: gne direction key --contrast {contrast} --layers {L} --target expert:{e}(rate_a 越大且 rate_b 越小的专家，写入位置的行越多，键越容易捕捉状态)")
+    return d, "\n".join(lines), 0
+
+
+@gne_command(direction_app, "key-verify", "direction key-verify")
+def direction_key_verify(c: Common, holder: dict,
+                         layer: int = typer.Option(..., "--layer", help="层 L"),
+                         key: str = typer.Option(..., "--key", help="键的名称"),
+                         direction: str = typer.Option(..., "--direction", help="写入方向的方向名称(开头的 - 折叠为 α 的符号)"),
+                         alphas: str = typer.Option("1,2", "--alphas", help="要确认的 α(逗号分隔)"),
+                         target: str = typer.Option("ffn", "--target", help=("写入目标(与键的写入目标相同): ffn / attn / shared(MoE 层的 shared expert 的 ffn_down_shexp)/ "
+        "expert:e(ffn_down_exps 中的专家 e。例 expert:31) ")),
+                         direction_layer: str = typer.Option("own", "--direction-layer", help="own(该层方向)/ base(基准层方向)"),
+                         text: Optional[list[str]] = typer.Option(None, "--text", help="传入的句子(默认为语尾不同的日语和英语 2 句)。可多个。expert:e 时传入专家 e 会被选中的句子(如包含键写入位置的句子)")):
+    """V30(CHANGE-07): keyed の LoRA が式どおり ΔW x = α (κᵀx) d を書くか。無介入で重み行列の入力 x と出力を捕捉し、
+    LoRA を当てた出力の差と比べる(|κᵀx| の大きいトークンで相対誤差の中央値 < 3%、鍵の作成に使った書き込みたくない側の例で
+    漏れ < 0.1)。
+    shared はゲートを掛ける前の ffn_shexp、expert:e はルーターの重みを掛ける前の ffn_moe_down の、専門家 e が選ばれた枠で測り、
+    ほかの専門家の枠の差(0 のはず)と、LoRA で選ばれる専門家が変わったトークンの数(0 のはず)も確かめる。"""
+    from .keyed import parse_target
+    kind, expert = parse_target(target)
+    s = holder["session"] = c.session()
+    d = s.check_keyed(layer, key=key, direction=direction, alphas=_floats(alphas, "--alphas"), kind=kind, expert=expert,
+                      direction_layer=direction_layer, texts=text or None)
+    lines = [f"L{layer} {d['tensor']}(键 {d['key']}、方向 {d['direction']}、‖d‖={d['d_norm']:.3g}、kn {d['kn']:.3f}"
+             + ("、有 post-norm 校正(一阶近似)" if d.get("post_norm") else "")
+             + (f"、用 gate_a {d['gate']:.3g} 除了 B" if d.get("gate") is not None else "")
+             + (f"、用 residual_scale {d['res_scale']:g} 除了 B" if d.get("res_scale") is not None else "") + ")"]
+    for r in d["rows"]:
+        lines.append(f"  α {r['alpha']:+g}: 相对误差中位数 {_f(r['rel_err_median'], '.2e')}(|κᵀx| 的前 {r['n_big']}/{r['n_tokens']} {'槽位' if kind == 'expert' else 'token'})、cos {_f(r['cos_median'], '.4f')}、对不希望写入侧的泄漏 {_f(r['leak_b'], '.3g')}"
+                     + (f"、其他专家的槽位差 {r['other_max']:.2g}、选择方式变化 {r['selection_changed']} 个 token"
+                        if "other_max" in r else "") + f"  {'○' if r['ok'] else '×'}")
+    if d.get("note"):
+        lines.append(f"注: {d['note']}")
+    lines.append(f"V30 {'合格' if d['v30'] else '不合格'}(相对误差 < 3%"
+                 + ("、对不希望写入侧的泄漏 < 0.1" if d["judged_leak"] else "、对不希望写入侧的泄漏无判定")
+                 + ("、其他专家的槽位差 < 1e-3、选择方式变化 0" if kind == "expert" else "") + ")")
+    return d, "\n".join(lines), 0 if d["v30"] else 1
+
+
 @gne_command(heads_app, "causal", "heads causal")
 def heads_causal(c: Common, holder: dict,
                  name: str = typer.Option(..., "--name", help="方向名称"),
@@ -1727,35 +2104,36 @@ def heads_causal(c: Common, holder: dict,
                  mode: str = typer.Option("ablate", "--mode", help="ablate（将输出置 0 并测量下降幅度，用于初次筛选）/ marginal（从当前组提高 s 时的效率 η，用于重新分配）。两者排名不一致"),
                  layers: str = typer.Option("auto", "--layers", help="auto（按层停止，并对下降最大的 --top-layers 个层）/ all / 10-16 / 1,5,9-12"),
                  candidates: Optional[str] = typer.Option(None, "--candidates", help="all / contrib:N（直接贡献前 N）/ L:Hh,…（显式指定）"),
-                 score_layers: Optional[str] = typer.Option(None, "--score-layers", help="指标层（默认基准层及其后 2 层）"),
+                 score_layers: Optional[str] = typer.Option(None, "--score-layers", help="测量投影值的层（默认基准层及其后 2 层）"),
                  primary: Optional[int] = typer.Option(None, "--primary", help="输出 causal / contrib / ratio 的层（默认基准层）"),
                  base_recipe: Optional[Path] = typer.Option(None, "--base-recipe", help="marginal：当前组的配方"),
                  base_unit: Optional[list[str]] = typer.Option(None, "--base-unit", help="marginal：当前组（L:Hh:sS@NAME，可多个）"),
                  delta_s: float = typer.Option(3.0, "--delta-s", help="marginal：提高 s 的量"),
                  hard: int = typer.Option(16, "--hard", help="marginal：难生效示例的数量"),
                  hard_subset: Optional[str] = typer.Option(None, "--hard-subset", help="marginal：已保存的难生效示例（名称或路径）"),
-                 b_side_max: Optional[float] = typer.Option(None, "--b-side-max", help="B 侧得分变化绝对值超过该值的注意力头会标记为排除"),
+                 b_side_max: Optional[float] = typer.Option(None, "--b-side-max", help="B 侧投影值变化绝对值超过该值的注意力头会标记为排除"),
                  top_layers: int = typer.Option(4, "--top-layers", help="--layers auto 时逐层测量的层数"),
                  positions: str = typer.Option("last", "--positions"), subset: str = typer.Option("all", "--subset"),
                  b_examples: int = typer.Option(16, "--b-examples", help="测量对 B 侧影响所用示例数（0 为全部）"),
                  out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认使用方向名称）"),
                  direction_layer: str = typer.Option("own", "--direction-layer", help="marginal 投影方向：own（注意力头所在层）/ base（基准层）"),
                  sort: str = typer.Option("auto", "--sort", help="表格排序：auto（ablate 用 causal_max，marginal 用 eta）/ causal / contrib / ratio / eta"),
-                 show: int = typer.Option(30, "--show")):
-    """因果スクリーニング(CHANGE-06 C): ヘッドを止めた(ablate)/ 強めた(marginal)ときの、生成なしの点数の下がり方。
+                 show: int = typer.Option(30, "--show"),
+                 max_examples: Optional[int] = typer.Option(None, "--max-examples", help="停止并测量的间题数(等间隔抽样。默认全部)"),
+                 include_score_layers: bool = typer.Option(False, "--include-score-layers", help="将测量投影值的层及其之后的注意力头也作为候选(默认排除。只是直接改变测量量，行为不易变化)")):
+    """因果スクリーニング(CHANGE-06 C): ヘッドを止めた(ablate)/ 強めた(marginal)ときの、生成なしの射影の値の下がり方。
     各行に直接の寄与 contrib(r̂ᵀW[:, blk]·x の平均)と causal / contrib の比を並べる(1 より大きければ間接の経路、
-    小さければ補い合い。物差しの層より後ろのヘッドは contrib が 0 なので causal_max で見る)。
+    小さければ補い合い。射影の値を測る層より後ろのヘッドは contrib が 0 なので causal_max で見る)。
     ablate と marginal は順位が入れ替わる: 最初の候補出しは ablate、配り直しは marginal。"""
     s = holder["session"] = c.session()
     d = s.heads_causal(name, contrast=contrast, mode=mode, layers=layers, candidates=candidates,
                        score_layers=_ints(score_layers), primary=primary, base_recipe=base_recipe, base_units=base_unit,
                        delta_s=delta_s, hard=hard, hard_subset=hard_subset, b_side_max=b_side_max, top_layers=top_layers,
                        positions=positions, subset=subset, b_examples=b_examples, name=out_name,
-                       direction_layer=direction_layer)
+                       direction_layer=direction_layer, max_examples=max_examples, include_score_layers=include_score_layers)
     P = d["primary"]
-    lines = [f"{d['path']}（{d['n_rows']} 个注意力头，mode={mode}，指标 L{','.join(map(str, d['score_layers']))}（主 L{P}），"
-             f"{d['seconds']:.0f} 秒）",
-             "无干预得分：" + "、".join(f"L{L} A {x['A']:.2f} / B {x['B']:.2f}" for L, x in d["base_scores"].items())]
+    lines = [f"{d['path']}（{d['n_rows']} 个注意力头，mode={mode}，测量层 L{','.join(map(str, d['score_layers']))}（主 L{P}），{d['seconds']:.0f} 秒）",
+             "无干预投影值：" + "、".join(f"L{L} A {x['A']:.2f} / B {x['B']:.2f}" for L, x in d["base_scores"].items())]
     if d.get("layers"):
         lines.append("按层（停止全部注意力头时的下降幅度）：" + " ".join(
             f"L{r['layer']}:{r['causal_max']:+.2f}" for r in sorted(d["layers"], key=lambda r: -r["causal_max"])[:12]))
@@ -1773,7 +2151,7 @@ def heads_causal(c: Common, holder: dict,
                      + ("  排除" if r.get("excluded") else "") + ("  （组内）" if r.get("in_base") else ""))
     if mode == "marginal" and d.get("spearman_ablate_marginal") is not None:
         lines.append(f"ablate 与 marginal 的排名相关性（Spearman，{d['n_compared']} 个注意力头）：{d['spearman_ablate_marginal']:+.2f}")
-    lines.append("下一步：gne heads allocate --name " + d["direction"] + " --target <A 侧得分目标>")
+    lines.append("下一步：gne heads allocate --name " + d["direction"] + " --target <A 侧投影值目标>")
     return d, "\n".join(lines), 0
 
 
@@ -1786,9 +2164,35 @@ def _allocate_note(r: dict, d: dict) -> list[str]:
         return [f"      L{c['layer']} H{c['head']} 达到上限 s={c['s']:g}。由于按比例分配，其他注意力头也一起停止。"
                 "可尝试 --method greedy 或 --s-max（仅提高上限时，目标较远时强度可能升到会破坏模型的程度）"]
     why = {"drift": f"B 侧正交分量的偏移超过 {d.get('drift_max')}，因此在超过前停止",
-           "no_gain": "提高任何注意力头得分都不会下降，因此停止", "s_max": "所有注意力头都达到了 s 的上限",
+           "no_gain": "提高任何注意力头的投影值都不会下降，因此停止", "s_max": "所有注意力头都达到了 s 的上限",
            "steps": "达到提升次数上限"}
     return [f"      {why[stop]}"] if stop in why else []
+
+
+@gne_command(heads_app, "writers", "heads writers")
+def heads_writers(c: Common, holder: dict,
+                  name: str = typer.Option(..., "--name", help="方向名称"),
+                  contrast: Optional[Path] = typer.Option(None, "--contrast", help="对照集(默认为创建方向时的对照集)"),
+                  ref_layer: Optional[int] = typer.Option(None, "--ref-layer", help="测量贡献的方向层(默认为基准层)"),
+                  expert_layers: Optional[str] = typer.Option(None, "--expert-layers", help="还按专家细分的层(例 36,42-46)"),
+                  max_examples: int = typer.Option(64, "--max-examples", help="使用的问题数(等间隔抽样)"),
+                  top: int = typer.Option(12, "--top", help="每层显示的专家数"),
+                  out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称(默认为方向名称)")):
+    """方向の差を、層ごとに attention・専門家・共有の専門家の書き込みに分ける。どこを探すかを決めるために使う。"""
+    s = holder["session"] = c.session()
+    d = s.heads_writers(name, contrast=contrast, ref_layer=ref_layer, expert_layers=parse_layers(expert_layers) if expert_layers else None,
+                        max_examples=max_examples, name=out_name, top=top)
+    gap = d["gap"] or 1.0
+    t = d["totals"]
+    lines = [f"{d['path']}(L{d['ref_layer']} 的方向，A {d['n']['A']} 问、B {d['n']['B']} 问、{d['positions']}、A−B 的差 {d['gap']:.2f}、求和误差 {d['sum_error'] * 100:.1f}%)",
+             f"合计: attention {t['attention'] / gap:+.0%}、专家 {t['moe'] / gap:+.0%}、共享 {t['shared'] / gap:+.0%}",
+             f"{'层':>4} {'种类':<8} {'attention':>10} {'专家':>8} {'共有':>8}"]
+    for r in d["rows"]:
+        if max(abs(r["attention"]), abs(r["moe"]), abs(r["shared"])) >= 0.02 * abs(gap):
+            lines.append(f"{r['layer']:>4} {r['kind']:<8} {r['attention']:>+10.2f} {r['moe']:>+8.2f} {r['shared']:>+8.2f}")
+    for L, rows in d["experts"].items():
+        lines.append(f"L{L} 的专家(按差值从大到小): " + " ".join(f"E{x['expert']}({x['diff']:+.2f}、A {x['rate_a']:.0%}/B {x['rate_b']:.0%})" for x in rows))
+    return d, "\n".join(lines), 0
 
 
 @gne_command(heads_app, "allocate", "heads allocate")
@@ -1796,21 +2200,23 @@ def heads_allocate(c: Common, holder: dict,
                    name: str = typer.Option(..., "--name", help="方向名称"),
                    contrast: Optional[Path] = typer.Option(None, "--contrast", help="对照集（默认使用创建方向时的对照集）"),
                    candidates: Optional[str] = typer.Option(None, "--candidates", help="heads causal 的结果（名称或 .causal.jsonl。默认使用方向名称）"),
-                   target: float = typer.Option(..., "--target", help="难生效示例平均得分目标（例 −3。B 侧平均值附近是起点）"),
-                   score_layer: Optional[int] = typer.Option(None, "--score-layer", help="指标层（默认使用 heads causal 的最后一层）"),
+                   target: float = typer.Option(..., "--target", help="难生效示例平均投影值目标（例 −3。B 侧平均值附近是起点）"),
+                   score_layer: Optional[int] = typer.Option(None, "--score-layer", help="测量投影值的层（默认使用 heads causal 的最后一层）"),
                    n_heads: str = typer.Option("6,5,4", "--n-heads", help="要创建的组内注意力头数量"),
                    hard: int = typer.Option(16, "--hard", help="难生效示例数量"),
                    hard_subset: Optional[str] = typer.Option(None, "--hard-subset", help="已保存的难生效示例（名称或路径）"),
                    proportional_to: str = typer.Option("eta", "--proportional-to", help="eta（效率）/ causal（停止时的效果）"),
                    from_zero: bool = typer.Option(True, "--from-zero/--add", help="从 0 重新分配 / 加到当前 s"),
-                   b_side_max: Optional[float] = typer.Option(None, "--b-side-max", help="移除会改变 B 侧得分的注意力头的阈值"),
+                   b_side_max: Optional[float] = typer.Option(None, "--b-side-max", help="移除会改变 B 侧投影值的注意力头的阈值"),
                    base_recipe: Optional[Path] = typer.Option(None, "--base-recipe", help="当前组（若无则从 ablate 的前列创建）"),
                    delta_s: float = typer.Option(3.0, "--delta-s"), pool: int = typer.Option(30, "--pool", help="用于测量效率的候选（当前组 + 效果前 N）"),
                    s_max: Optional[float] = typer.Option(None, "--s-max", help="s 的上限（默认 proportional 为 30，greedy 无上限）"),
                    method: str = typer.Option("proportional", "--method", help="proportional（按 s ∝ η 整体提高）/ greedy（每次提高最有效的单个注意力头）"),
-                   remain_threshold: float = typer.Option(0.0, "--remain-threshold", help="视为“剩余”的得分"),
+                   remain_threshold: float = typer.Option(0.0, "--remain-threshold", help="视为“剩余”的投影值"),
                    direction_layer: str = typer.Option("own", "--direction-layer"),
-                   out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认使用方向名称）")):
+                   out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认使用方向名称）"),
+                   candidate_layers: Optional[str] = typer.Option(None, "--candidate-layers", help="将候选注意力头限制到这些层(例 3-44)"),
+                   include_score_layers: bool = typer.Option(False, "--include-score-layers", help="将测量投影值的层及其之后的注意力头也作为候选(默认排除。只是直接改变测量量，行为不易变化)")):
     """効率ベースの強さ配分(CHANGE-06 D): 効きにくい例を選び、効率 η を測って s ∝ η で配り、全体の大きさを二分探索して、
     ヘッド数を変えた組の比較表を出す。残る件数と B 側のずれが同程度なら、ヘッド数が最小の組を推す。"""
     s = holder["session"] = c.session()
@@ -1818,7 +2224,8 @@ def heads_allocate(c: Common, holder: dict,
                          n_heads=_ints(n_heads) or [6, 5, 4], hard=hard, hard_subset=hard_subset,
                          proportional_to=proportional_to, from_zero=from_zero, b_side_max=b_side_max,
                          base_recipe=base_recipe, delta_s=delta_s, pool=pool, s_max=s_max, method=method,
-                         remain_threshold=remain_threshold, direction_layer=direction_layer, name=out_name)
+                         remain_threshold=remain_threshold, direction_layer=direction_layer, name=out_name,
+                         include_score_layers=include_score_layers, candidate_layers=parse_layers(candidate_layers))
     lines = [f"{d['path']}（L{d['score_layer']}、目标 {d['target']:g}、A {d['n_a']} 例、难生效示例 {d['hard']['n']}、"
              f"无干预 A {d['base_a_mean']:.2f} / B {d['base_b_mean']:.2f}、{d['seconds']:.0f} 秒）",
              f"  {'数量':>3} {'最大s':>6} {'剩余':>5} {'A最大':>7} {'B正交':>7} {'B变化':>7} {'秒':>5}  组"]
@@ -1836,31 +2243,109 @@ def heads_allocate(c: Common, holder: dict,
     return d, "\n".join(lines), 0
 
 
+@gne_command(app, "behave")
+def behave_cmd(c: Common, holder: dict,
+               prompts: Path = typer.Option(..., "--prompts", exists=True, help="问题集(JSON / YAML 的字符串或对话历史列表)"),
+               recipe: Optional[list[Path]] = typer.Option(None, "--recipe", help="应用的配方(多个则叠加)"),
+               match: Optional[str] = typer.Option(None, "--match", help="统计回复中匹配的正则表达式"),
+               judge: Optional[Path] = typer.Option(None, "--judge", exists=True, help="给读取方的提示词文件({q} 为问题，{a} 为回复)"),
+               labels: str = typer.Option("R,P,C", "--labels", help="读取方的判定字符(取回复中最后出现的)"),
+               max_tokens: int = typer.Option(400, "--max-tokens"),
+               thinking: bool = typer.Option(False, "--thinking", help="让模型带思考回答，只统计 </think> 之后"),
+               temperature: float = typer.Option(0.0, "--temperature", help="0 则为 greedy"),
+               seeds: Optional[str] = typer.Option(None, "--seeds", help="有温度时，每个种子各 1 次(1,2,3)"),
+               name: str = typer.Option("behave", "--name", help="保存名")):
+    """振る舞いを数える: レシピを当てて質問集に答えさせ、正規表現の一致・読み手の判定・空・繰り返し・長さの上限で切れた数を出す。
+    返事は <root>/behave/<model_id>/<名前>.json に残し、画面には数だけを出す。長さで結果が変わることがあるので、--max-tokens は十分に取る。"""
+    s = holder["session"] = c.session()
+    d = s.behave(prompts, recipes=list(recipe or []), match=match, judge=judge.read_text(encoding="utf-8") if judge else None,
+                 labels=labels, max_tokens=max_tokens, thinking=thinking, temperature=temperature, seeds=_ints(seeds), name=name)
+    lines = [f"{d['path']}({d['n_prompts']} 问、{d['max_tokens']} token" + ("、带思考" if thinking else "")
+             + (f"、温度 {temperature:g}" if temperature > 0 else "、greedy") + ")"]
+    for r in d["runs"]:
+        c_ = r["counts"]
+        lines.append(f"  种子 {r['seed']}: " + (f"一致 {c_['match']}、" if "match" in c_ else "")
+                     + (" ".join(f"{k} {v}" for k, v in c_["labels"].items()) + "、" if "labels" in c_ else "")
+                     + f"空 {c_['empty']}、重复 {c_['loop']}、截断 {c_['at_limit']}、平均 {c_['tokens']:g} 个 token")
+    return d, "\n".join(lines), 0
+
+
+@app.command("recipe-combine")
+def recipe_combine(recipes: list[Path] = typer.Argument(..., exists=True, help="叠加的配方(2 个以上)"),
+                   out: Path = typer.Option(..., "--out", "-o", help="导出的配方"),
+                   name: Optional[str] = typer.Option(None, "--name", help="配方名称(默认为输出文件名)")):
+    """複数のレシピを 1 つにまとめる。方向の違う CHiPS の組を重ねるときなどに使う(各ユニットは自分の方向を持つ)。"""
+    from .steer import Recipe, combine_recipes
+    r = combine_recipes([Recipe.load(p) for p in recipes], name=name or out.stem)
+    r.save(out)
+    dirs = sorted({u.direction for u in r.units if u.mode in ("proj", "keyed") and u.direction})
+    keys = sorted({u.key for u in r.units if u.mode == "keyed" and u.key})      # CHANGE-07
+    print(f"{out}({len(r.units)} 个单元" + (f"、方向 {', '.join(dirs)}" if dirs else "")
+          + (f"、键 {', '.join(keys)}" if keys else "") + ")")
+
+
+@gne_command(headproj_app, "ablate", "headproj export")
+def headproj_ablate(c: Common, holder: dict,
+                    direction: str = typer.Option(..., "--direction", help="由 gne direction 创建的方向名称"),
+                    layers: str = typer.Option("all", "--layers", help="消除层: all / 1-47 / 1,5,9-12"),
+                    per_layer: bool = typer.Option(False, "--per-layer", help="按层消除该层测得的 r_L(默认为基准层的 r)"),
+                    scale: float = typer.Option(1.0, "--scale", help="消除比例(1 为全部)"),
+                    out: Optional[Path] = typer.Option(None, "--out", "-o", help="输出（默认 <root>/export/<方向>-heads-ablate.lora.gguf）"),
+                    bake: bool = typer.Option(False, "--bake", help="不生成 LoRA，而生成改写写入残差的权重矩阵的 GGUF(可保持分割)")):
+    """attention の書き込みだけから方向を消す(abliteration の attention 部分)。指定した層の全ヘッドに proj(s=--scale)を当てる
+    レシピと同じで、LoRA は層ごとに 1 本。MLP が MoE で gne ablate の LoRA が使えないモデルでも使える。"""
+    from .steer import Recipe, Unit
+    s = holder["session"] = c.session()
+    arch = s.weights.arch
+    Ls = parse_layers(layers) or list(range(s.meta.n_layer))
+    units = [Unit(L, None, 0.0, "head", mode="proj", k=float(scale), head=h, direction=direction)
+             for L in Ls if arch.layers[L].head_dim and arch.layers[L].head_writer for h in range(arch.layers[L].n_head)]
+    if not units:
+        raise GneError("BAD_ARGS", "指定的层没有注意力头")
+    rec = Recipe(units, s.meta.model_id, name=f"{direction}-heads-ablate", default_direction=direction,
+                 direction_layer="own" if per_layer else "base")
+    out = out or s.store.export_dir() / (f"{direction}-heads-ablate.gguf" if bake else f"{direction}-heads-ablate.lora.gguf")
+    d = s.headproj_export(rec, out, bake=bake, requant="keep" if bake else "q8_0")
+    lines = [f"{d['path']}({d['bytes'] / 1e6:.2f} MB、{'烧录' if bake else 'LoRA'}、{len(units)} 个注意力头、{len({u.layer for u in units})} 层、{'按层的 r_L' if per_layer else '基准层的 r'}、比例 {scale:g})"]
+    if not bake:
+        lines.append("用法: llama-cli -m <model> --lora " + d["path"])
+    return d, "\n".join(lines), 0
+
+
 @gne_command(headproj_app, "export", "headproj export")
 def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optional[list[str]] = _UNIT,
-                    out: Optional[Path] = typer.Option(None, "--out", "-o", help="输出（默认 <root>/export/<配方名>.lora.gguf；--bake 时为 -headproj.gguf）"),
-                    bake: bool = typer.Option(False, "--bake", help="不生成 LoRA，而生成仅重新量化写入矩阵的 GGUF"),
+                    out: Optional[Path] = typer.Option(None, "--out", "-o", help=("输出（默认 <root>/export/<配方名>.lora.gguf；--bake 时为 -headproj.gguf。仅 keyed 的配方为 "
+        "<配方名>-keyed.lora.gguf / -keyed.gguf） ")),
+                    bake: bool = typer.Option(False, "--bake", help="不生成 LoRA，只生成重新量化改写后权重矩阵(写入残差的部分)的 GGUF"),
                     in_path: Optional[Path] = typer.Option(None, "--in", help="--bake 的原始 GGUF（默认 --model）"),
-                    requant: str = typer.Option("q8_0", "--requant", help="--bake 中改写张量的类型：q8_0 / f16 / keep（原类型为 F32、F16、BF16 时保持该类型）"),
+                    requant: Optional[str] = typer.Option(None, "--requant", help=("--bake 改写张量的类型: auto / q8_0 / f16 / keep(原为 F32、F16、BF16 时保持该类型。专家张量 "
+        "ffn_down_exps(keyed 的 expert:e)保持原类型，不编辑的专家保持字节不变。K-quant、IQ 的专家为 q8_0，分割 GGUF "
+        "则保持原类型)。默认为 q8_0，包含 keyed 时为 auto: 按张量处理，原为 Q8_0 的保持 Q8_0(改为 F16 会改变计算方法，反而与 "
+        "LoRA 版产生偏差)，其余(K-quant、IQ、F16 等)为 f16。仅对保持 Q8_0 时 rank 1 的小编辑有 1 成以上被舍入抹掉的张量(结果 "
+        "edit_kept < 0.9)用 f16。专家张量也遵循相同规则(改为 f16 会使整体变为 F16 而变大) ")),
+                    key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 的 keyed 单元的键(由 gne direction key 创建)"),
                     into: Optional[Path] = typer.Option(None, "--into", help="--bake：烧录到另一个 GGUF（同一结构、未量化的 F16 / BF16 等）。方向使用此模型（--model）的。不使用 GPU"),
                     via_f16: bool = typer.Option(False, "--via-f16", help="--bake：以 F16 写入，再用 llama-quantize 恢复到原类型"),
                     imatrix: Optional[Path] = typer.Option(None, "--imatrix"), llama_quantize: Optional[str] = typer.Option(None, "--llama-quantize"),
-                    verify: bool = typer.Option(False, "--verify", help="--bake：比较烧录版与 LoRA 版（V26：得分、KL、最大概率 token、ppl）"),
-                    contrast: Optional[Path] = typer.Option(None, "--contrast", help="--verify 评分使用的对照集（默认使用创建方向时的对照集）"),
-                    direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 的 proj 单元的方向"),
+                    verify: bool = typer.Option(False, "--verify", help=("--bake: 比较烧录版与 LoRA 版(V26、V33: 方向上的投影值、KL、最可能 token、ppl。最后一层投影值的合格线为，加上写入几乎为 0 "
+        "的 LoRA 与无 LoRA 的差 = 仅由计算方法不同产生的误差) ")),
+                    contrast: Optional[Path] = typer.Option(None, "--contrast", help="--verify 评估投影值使用的对照集（默认使用创建方向时的对照集）"),
+                    direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 的 proj / keyed 单元的方向"),
                     direction_layer: Optional[str] = typer.Option(None, "--direction-layer", help="own（注意力头所在层方向）/ base（基准层方向）"),
+                    lora_f16: bool = typer.Option(False, "--lora-f16", help="以 F16 写入 LoRA(大小减半。精度足够)"),
                     strip_meta: bool = typer.Option(False, "--strip-meta", help="不保留 gne 记录（gne.* 元数据、配方、名称标记、旁边的 .headproj.json）（供分发的版本）")):
     """proj のユニット(L:Hh:sS@NAME、レシピの mode: proj)を LoRA アダプタ GGUF か焼き込み GGUF に書き出す(CHANGE-06 E、gne gain の別名)。
     同じ層・同じ方向のヘッドは階数 1 の LoRA に畳む。スケールパッチ(CHANGE-05 D)では表せないので、焼き込みは書き換える
-    テンソルだけ量子化し直す。"""
+    テンソルだけ量子化し直す。鍵つきの書き込み(keyed、L:ffn:keyed:aα@NAME#KEY、CHANGE-07)も受ける(層・鍵ごとに階数 1。
+    配るなら LoRA が第一候補。焼き込みの既定は auto: 元が Q8_0 のテンソルは Q8_0 のまま、それ以外は f16)。"""
     if in_path and c.model and in_path.resolve() != c.model.resolve():
         raise GneError("BAD_ARGS", "--in 与 --model 指向不同文件")
     s = holder["session"] = c.session(in_path)
-    r = s.recipe(units=unit, path=recipe, default_direction=direction, direction_layer=direction_layer)
-    nm = r.name or "headproj"
-    out = out or s.store.export_dir() / (f"{nm}-headproj.gguf" if bake else f"{nm}.lora.gguf")
+    r = s.recipe(units=unit, path=recipe, default_direction=direction, direction_layer=direction_layer, default_key=key)
+    out = out or s.default_export_path(r, bake=bake, kind="headproj")
     d = s.headproj_export(r, out, bake=bake, requant=requant, via_f16=via_f16, imatrix=str(imatrix) if imatrix else None,
-                          llama_quantize=llama_quantize, verify=verify, contrast=contrast, strip_meta=strip_meta, into=into)
+                          llama_quantize=llama_quantize, verify=verify, contrast=contrast, strip_meta=strip_meta, into=into,
+                          lora_f16=lora_f16)
     lines = [f"{d['path']}（{d['bytes'] / 1e6:.2f} MB，{'烧录' if bake else 'LoRA'}"
              + ("，无 gne 记录" if d.get("strip_meta") else "") + "）"]
     if d.get("local_path_keys"):
@@ -1868,17 +2353,29 @@ def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, u
     for L, x in (d.get("proj_layers") or {}).items():
         lines.append(f"  L{L}: " + ", ".join(f"H{int(h)} s{sv:g}@{dn}" for h, sv, dn in x["heads"])
                      + f"（秩 {x['rank']}" + ("" if x["folded"] else "，方向混杂，无法折叠为秩 1") + "）")
-    if bake:
-        lines.append("改写：" + ", ".join(f"{m['tensor']}({m['from']} → {m['to']})" for m in d["modified"]))
+    lines += _keyed_export_lines(d, requant_line=not (bake and d.get("parts")))
+    if bake and d.get("parts"):                 # 分割 GGUF: 同じ型で書き戻した
+        how = {"keep": "以原类型写回", "auto": "以 auto 写回(Q8_0 保持原类型，其余为 F16"
+               + (f"。{len(d['fallback'])} 个张量因编辑会被淹没而用 F16" if d.get("fallback") else "") + ")"}
+        lines.append(f"改写: {len(d['modified'])} 个张量以" + how.get(d["requant"], f"{d['requant']} 重新写入")
+                     + f"(重新量化损失最大为编辑大小的 {d['requant_error_max'] * 100:.1f}%)、分割 {len(d['parts'])} 个文件。记录 {d['sidecar']}")
+        if d.get("expert_bytes_added"):
+            lines.append(f"  专家张量增大了 {d['expert_bytes_added'] / 1e6:.1f} MB(不编辑的专家也会转换。--requant keep 则保持原类型)")
+    elif bake:
+        lines.append("改写: " + ", ".join(_mod_text(m) for m in d["modified"]))
     else:
         lines.append("用法：llama-cli -m <model> --lora " + d["path"])
     ok = True
     v = d.get("verify")
     if v:
-        lines.append(f"V26：得分{'一致' if all(x['ok'] for x in v['scores'].values()) else '不一致'}、"
-                     f"首个 token 的 KL {v['kl_first_token']:.2e}、最大概率 token 的一致率 {v['top1_match'] * 100:.0f}%、"
-                     f"ppl 差异 {_f(v['ppl_diff_pct'], '+.3f')}%（{'通过' if v['pass'] else '未通过'}）"
+        lines.append(f"{'V33' if r.keyed_units and not r.proj_units else 'V26'}: 投影值 {'一致' if all(x['ok'] for x in v['scores'].values()) else '不一致'}、首个 token 的 KL {v['kl_first_token']:.2e}、最大概率 token 的一致率 {v['top1_match'] * 100:.0f}%、ppl 差异 {_f(v['ppl_diff_pct'], '+.3f')}%（{'通过' if v['pass'] else '未通过'}）"
                      + (f"。分歧示例的差距 {', '.join(f'{g:.3f}' for g in v['top1_mismatch_gaps'])} nats" if v["top1_mismatch_gaps"] else ""))
+        lines.append("  投影值差的最大 / 合格线: " + "、".join(
+            f"L{k[:-1]} {k[-1]} {x['max_abs_diff']:.3g} / {x.get('threshold', x['resolution']):.3g}{'' if x['ok'] else ' ×'}"
+            for k, x in v["scores"].items()))
+        nz = v.get("noise")
+        if nz:
+            lines.append(f"  最后一层 L{nz['layer']} 的合格线 = 容许误差(投影值标准差的 1 成)+ 仅由计算方法不同产生的误差 {nz['max_abs_diff']:.3g}(写入几乎为 0 的 LoRA(倍率 {nz['lora_scale']:g})与无 LoRA 的投影值差的最大、{nz['seconds']:.1f} 秒)")
         ok = v["pass"]
     return d, "\n".join(lines), 0 if ok else 1
 
@@ -1887,7 +2384,7 @@ def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, u
 def headproj_check(c: Common, holder: dict, layer: int = typer.Option(..., "--layer"), head: int = typer.Option(..., "--head"),
                    direction: str = typer.Option(..., "--direction", help="方向名称"),
                    ss: str = typer.Option("1,2,6", "--s", help="要确认的 s")):
-    """V24・V25: proj の LoRA で、書き込み行列の出力の差が numpy の計算(方向成分を s 倍ぶん引く)と合い、直交成分が変わらないか。"""
+    """V24・V25: proj の LoRA で、ヘッドが残差に書き込む重み行列の出力の差が numpy の計算(方向成分を s 倍ぶん引く)と合い、直交成分が変わらないか。"""
     s = holder["session"] = c.session()
     d = s.check_head_proj(layer, head, direction, ss=[float(x) for x in ss.split(",")])
     lines = [f"L{layer} H{head}（{d['out_tensor']}，方向 {direction} 的 L{d['direction_from']}，注意力头写入与方向的 |cos| 中位数 "
@@ -1896,25 +2393,27 @@ def headproj_check(c: Common, holder: dict, layer: int = typer.Option(..., "--la
         lines.append(f"  s {r['s']:g}：相对误差中位数 {r['rel_err_median']:.2e}，方向分量 {r['par_after_over_before']:+.3f} 倍"
                      f"（期望 {1 - r['s']:+g}）、正交分量变化 {r['orth_change_rel_median']:.2e}  {'○' if r['ok'] else '×'}")
     lines.append(f"  对比 gain ×{d['gain']['k']:g}：正交分量变化 {_f(d['gain']['orth_change_rel_median'], '.3f')}")
-    lines.append(f"V24 {'通过' if d['v24'] else '未通过'}・V25 {'通过' if d['v25'] else '未通过'}")
+    lines.append(f"V24 {'通过' if d['v24'] else '未通过'}、V25 {'通过' if d['v25'] else '未通过'}")
     return d, "\n".join(lines), 0 if d["ok"] else 1
 
 
 @gne_command(heads_app, "pipeline", "heads pipeline")
 def heads_pipeline(c: Common, holder: dict,
                    spec: Path = typer.Option(..., "--spec", help="对照集 JSON 或 YAML（name、user_prompts 或按侧 prompts_a / prompts_b、system_a / system_b 或 recipe_a / recipe_b，可选 pipeline 设置）"),
-                   target: Optional[str] = typer.Option(None, "--target", help="难生效示例得分目标：数值、B（消到 B 侧平均值）、mid（默认，A 与 B 中点）"),
+                   target: Optional[str] = typer.Option(None, "--target", help="难生效示例投影值目标：数值、B（消到 B 侧平均值）、mid（默认，A 与 B 中点）"),
                    n_heads: Optional[str] = typer.Option(None, "--n-heads", help="要比较的组的注意力头数量（默认 6,5,4）"),
                    max_examples: Optional[int] = typer.Option(None, "--max-examples", help="停止测量阶段使用的问题数量（默认 64，等间距抽稀）"),
                    positions: Optional[str] = typer.Option(None, "--positions", help="创建方向的位置：last（默认）/ response 等"),
                    top_layers: Optional[int] = typer.Option(None, "--top-layers"), hard: Optional[int] = typer.Option(None, "--hard"),
+                   include_score_layers: bool = typer.Option(False, "--include-score-layers", help="将测量投影值的层及其之后的注意力头也作为候选(默认排除。只是直接改变测量量，行为不易变化)"),
                    fresh: bool = typer.Option(False, "--fresh", help="不复用已创建的方向和因果结果，从头重新创建"),
                    yes: bool = _YES):
     """対照集合から、方向づくり → 基準層 → 因果スクリーニング(層ごと → ヘッド 1 個ずつ止める)→ 強さの配分(効き目に比例した
-    最初の組を二分探索 → 点数が残りやすい質問で効率を測って 0 から配り直す → ヘッド数を変えた組の比較)を 1 回で回す。"""
+    最初の組を二分探索 → 射影の値が残りやすい質問で効率を測って 0 から配り直す → ヘッド数を変えた組の比較)を 1 回で回す。"""
     s = holder["session"] = c.session()
     over = {"target": target, "n_heads": _ints(n_heads), "max_examples": max_examples, "positions": positions,
-            "top_layers": top_layers, "hard": hard, "resume": False if fresh else None}
+            "top_layers": top_layers, "hard": hard, "resume": False if fresh else None,
+            "include_score_layers": True if include_score_layers else None}
     _gate(s, "head_pipeline", {"spec": str(spec), **{k: v for k, v in over.items() if v is not None}}, yes, None)
     d = s.heads_pipeline(spec, **over)
     sc, ca, al = d["score"], d["causal"], d["allocate"]
@@ -1923,7 +2422,7 @@ def heads_pipeline(c: Common, holder: dict,
              + "）",
              f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒）",
              f"2. 基准层 L{sc['base_layer']}（cohen_d 最大，停止测量阶段使用 {sc['n'].get('A')} 个问题）",
-             f"3. 因果：指标 L{','.join(map(str, ca['score_layers']))}、{ca['n_rows']} 个注意力头、前列 " +
+             f"3. 因果：测量层 L{','.join(map(str, ca['score_layers']))}、{ca['n_rows']} 个注意力头、前列 " +
              " ".join(f"L{r['layer']}H{r['head']}({r['causal_max']:+.2f}{'，仅破坏所以排除' if r.get('excluded') else ''})" for r in ca["top"][:6])
              + f"（{ca['seconds']:.0f} 秒）"
              + "".join(f"\n   层 L{r['layer']} 停止后连中立输入也会大幅崩坏（偏移 {r['drift_orth_b']:.2f}），因此未选择"
@@ -2042,8 +2541,7 @@ def heads_refine(c: Common, holder: dict,
     d = s.heads_refine(name, n_heads=n_heads, new_heads=nh, out_name=out_name, resume=not fresh)
     rm, cb, pp = d["remaining"], d["combined"], d["pipeline"]
     lines = [f"{d['path']}（{d['seconds']:.0f} 秒）",
-             f"1. 使用 {d['n_heads']} 个注意力头的组 " + " ".join(d["base_units"]) + f"，L{d['score_layer']} 得分超过 {d['threshold']:.2f}"
-             f" 的 A 侧问题：{rm['n']}/{rm['n_a']} 个" + (f"（较少，因此按得分从高到低用 {rm['used']} 个问题创建方向）" if rm["padded"] else ""),
+             f"1. 使用 {d['n_heads']} 个注意力头的组 " + " ".join(d["base_units"]) + f"，L{d['score_layer']} 投影值超过 {d['threshold']:.2f} 的 A 侧问题：{rm['n']}/{rm['n_a']} 个" + (f"（较少，因此按投影值从高到低用 {rm['used']} 个问题创建方向）" if rm["padded"] else ""),
              f"2. 用剩余问题运行流水线 → 方向 {pp['direction']}" + (f"（复用已生成的{'、'.join({'direction': '方向', 'causal': '因果'}[x] for x in pp['reused'])}）" if pp["reused"] else "")]
     for r in pp["table"]:
         if r.get("skipped"):
@@ -2058,8 +2556,8 @@ def heads_refine(c: Common, holder: dict,
         for c in rows:
             lines.append(f"   + {c['n_new']} 个（共 {c['n_heads']} 个注意力头）：剩余 {c['remain_after']} 个问题，A 平均值 {c['a_mean_before']:.2f} → "
                          f"{c['a_mean_after']:.2f}，B 偏移 {c['b_drift_orth']:.4f}  {c['recipe']}"
-                         + ("  ← 代表" if cb and c["recipe"] == cb["recipe"] else ""))
-        lines.append(f"代表也放在 {Path(cb['recipe']).with_name(d['name'] + '.combined.yaml')}"
+                         + ("  ← 代表性" if cb and c["recipe"] == cb["recipe"] else ""))
+        lines.append(f"代表性方案也保存到 {Path(cb['recipe']).with_name(d['name'] + '.combined.yaml')}"
                      + ("（推荐组）" if cb["chosen_by"] == "recommended" else "（没有达到目标的组，因此选择合并后剩余最少的一组）"))
         lines.append(f"确认：gne eval --recipe {cb['recipe']} --random-controls 16")
     else:

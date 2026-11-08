@@ -6,9 +6,12 @@ U2: 3 列チャット(SSE)、fires、reads you、レシピ、cvec の書き出�
 U5: エージェント連携。MCP の ui_* が POST /api/ui/{highlight,note,open,clear} を叩き、ブラウザへ SSE(/api/ui/events)。
 CHANGE-04 G: ヘッドの調書(/api/head)・名前、保存済みのヘッドの対照分析(/api/heads)、注目のパターン(/api/attention)、
 fires の文章でのヘッドの注目(/api/fires/{id}/heads)。GPU を使うものは live.Live の調停を通す。
-CHANGE-06 G: 因果スクリーニングと強さの配分(/api/causal)、方向セットと速い物差し(/api/directions、.../score は GPU)、
+CHANGE-06 G: 因果スクリーニングと強さの配分(/api/causal)、方向セットと速い指標(/api/directions、.../score は GPU)、
 方向とヘッドの一括の結果(/api/pipelines。実行は head_pipeline のジョブ)、強さの候補と名前を伏せた採点(/api/candidates。
 生成は heads_candidates のジョブ)。
+CHANGE-07 G: 鍵つきの書き込み(keyed)の鍵の一覧(/api/keys)、対照集合の候補(/api/contrasts)とひな形(/api/keyed-templates)。
+鍵の作成・確認・専門家の選ばれ方・LoRA の確かめ・方向から key-check までの一括は direction_key・direction_key_check・
+direction_key_experts・direction_key_verify・direction_key_pipeline のジョブ、keyed のレシピの書き出しは headproj_export のジョブ。
 ローカル専用なので、Host が 127.0.0.1 / localhost 以外の要求(DNS rebinding)と、別のオリジンからの書き込み(POST / DELETE)は断る。
 大きい配列は JSON にせず octet-stream で返し、形は X-Shape、付帯情報は X-Meta(JSON)に入れる(§8.2)。
 """
@@ -73,13 +76,13 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
     async def local_only(request, call_next):
         host = (request.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
         if host not in ("127.0.0.1", "localhost", "::1", "testserver"):
-            return JSONResponse({"error": {"code": "FORBIDDEN", "message": f"Host {host!r} は受け付けません(ローカル専用)"}},
+            return JSONResponse({"error": {"code": "FORBIDDEN", "message": f"不接受 Host {host!r}（仅限本地）"}},
                                 status_code=403)
         origin = request.headers.get("origin")
         if request.method not in ("GET", "HEAD", "OPTIONS") and origin:
             o = origin.split("//", 1)[-1].split("/", 1)[0].rsplit(":", 1)[0].strip("[]")
             if o not in ("127.0.0.1", "localhost", "::1"):
-                return JSONResponse({"error": {"code": "FORBIDDEN", "message": "別のオリジンからの書き込みは受け付けません"}},
+                return JSONResponse({"error": {"code": "FORBIDDEN", "message": "不接受来自其他来源的写入"}},
                                     status_code=403)
         return await call_next(request)
     if warm:
@@ -103,7 +106,8 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
                 "directions": ov["directions"], "names": data.names(), "layouts": data.layouts(), "runs": data.run_list(),
                 "connections": data.connections().meta if data.connections() is not None else None,
                 "heads": data.heads_list(), "writers": data.writers_list(),
-                "causal": data.causal_list(), "direction_sets": data.directions_list()}       # CHANGE-06 G
+                "causal": data.causal_list(), "direction_sets": data.directions_list(),       # CHANGE-06 G
+                "keys": data.keys_list()}                                                     # CHANGE-07 G: 鍵つきの書き込みの鍵
 
     @app.get("/api/vocab")
     def vocab():
@@ -125,16 +129,16 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
         data._check(L)
         cell = data.layout(L, kind)
         if cell is None:
-            return JSONResponse({"error": {"code": "NOT_FOUND", "message": f"L{L} の配置 {kind} はまだありません",
-                                           "hint": "層の右クリックの「配置」で作れます"}}, status_code=404)
+            return JSONResponse({"error": {"code": "NOT_FOUND", "message": f"L{L} 的布局 {kind} 尚不存在",
+                                           "hint": "可通过图层右键菜单的“布局”创建"}}, status_code=404)
         return _binary(cell.tobytes(), str(cell.size), {"layer": L, "kind": kind})
 
     @app.get("/api/embeddings")
     def embeddings(run: str):
         e = data.embeddings(run)
         if e is None:
-            return JSONResponse({"error": {"code": "NOT_FOUND", "message": f"run {run} の埋め込みはまだありません",
-                                           "hint": "embed ビューの「埋め込みを計算」で作れます(GGUF の埋め込みモデルが要ります)"}},
+            return JSONResponse({"error": {"code": "NOT_FOUND", "message": f"run {run} 的嵌入尚不存在",
+                                           "hint": "可通过 embed 视图的“计算嵌入”创建（需要 GGUF 嵌入模型）"}},
                                 status_code=404)
         return e
 
@@ -146,7 +150,7 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
     def web(layer: int, n: int, hops: int = 2, first: int = 8, k: int = 4, zmin: float = 2.0, cap: int = 20000):
         c = data.connections()
         if c is None:
-            raise GneError("NOT_FOUND", "connections がありません", "層の右クリックの「connections」で作れます")
+            raise GneError("NOT_FOUND", "缺少 connections", "可通过图层右键菜单的“connections”创建")
         e = c.web(layer, n, hops=max(1, min(hops, 5)), first=first, k=k, zmin=zmin, cap=cap)
         return _binary(e.tobytes(), f"{e.shape[0]},7", {"n_edges": int(e.shape[0])})
 
@@ -155,7 +159,7 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
         from ..connections import web_summary as summarize
         c = data.connections()
         if c is None:
-            raise GneError("NOT_FOUND", "connections がありません", "層の右クリックの「connections」で作れます")
+            raise GneError("NOT_FOUND", "缺少 connections", "可通过图层右键菜单的“connections”创建")
         e = c.web(layer, n, hops=max(1, min(hops, 5)), first=first, k=k, zmin=zmin, cap=cap)
         return {"n_edges": int(e.shape[0]), **summarize(data, c, layer, n, e)}
 
@@ -193,7 +197,7 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
         return data.heads_one(name)
 
     # --- CHANGE-06 G: 因果スクリーニング・強さの配分(HEAD パネルの Causal、地図の causal:<name>・eta:<name>)、
-    # 方向の速い物差し(direction ビュー) --------------------------------------------------------------------------
+    # 方向の速い指標(direction ビュー) --------------------------------------------------------------------------
     @app.get("/api/causal")
     def causal_list():
         return data.causal_list()
@@ -210,6 +214,21 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
     def direction_one(name: str):
         return data.direction_one(name)
 
+    # --- CHANGE-07 G: 鍵つきの書き込み(direction ビューの「鍵」)。作成と確認はジョブ(direction_key・direction_key_check) -----
+    @app.get("/api/keys")
+    def keys():
+        """保存した鍵の一覧(<root>/keys/<model_id>/、パスなし)。"""
+        return data.keys_list()
+
+    @app.get("/api/keys/{name}")
+    def key_one(name: str):
+        return data.key_one(name)
+
+    @app.get("/api/contrasts")
+    def contrasts():
+        """鍵を作る対照集合の候補(configs/contrast/ と <root>/contrasts/ の YAML の要約)。"""
+        return data.contrasts_list()
+
     @app.get("/api/fieldtests")
     def fieldtests():
         """実地テスト(fieldtest のジョブ)の保存済みの結果。生成した文章は返さない。"""
@@ -223,6 +242,11 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
     def pipeline_templates():
         """用途別の質問集のテンプレート(configs/pipeline/、「ひな形」で選ぶ)。"""
         return data.pipeline_templates()
+
+    @app.get("/api/keyed-templates")
+    def keyed_templates():
+        """鍵つきの書き込みの対照集合のひな形(configs/keyed/、鍵のタブの「ひな形」で選ぶ)。"""
+        return data.keyed_templates()
 
     @app.get("/api/pipelines")
     def pipelines():
@@ -336,16 +360,23 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
             for u in x["units"]:
                 if u.get("mode") == "proj" and not u.get("direction"):
                     u["direction"] = ex["default_direction"]
+                if u.get("mode") == "keyed":         # CHANGE-07: 省いた方向・鍵はレシピの既定で埋める(埋めたことは *_default で)
+                    if not u.get("direction") and ex["default_direction"]:
+                        u["direction"], u["direction_default"] = ex["default_direction"], True
+                    if not u.get("key") and ex["default_key"]:
+                        u["key"], u["key_default"] = ex["default_key"], True
             out.append({**x, **ex})
         return out
 
     @app.post("/api/recipes/{name}")
     def recipe_save(name: str, units: list[str] = Body(...), ablate: dict | None = Body(None),
-                    sampling: dict | None = Body(None), direction_layer: str | None = Body(None)):
-        if direction_layer and direction_layer != "own":                     # CHANGE-06: proj に基準層の方向を当てるレシピ
-            r = session.recipe(units=list(units) or None, dose_unit="rel", name=name, ablate=ablate, direction_layer=direction_layer)
-            return session.recipe_save(name, r, sampling=sampling)
-        return session.recipe_save(name, units, ablate=ablate, sampling=sampling)
+                    sampling: dict | None = Body(None), direction_layer: str | None = Body(None),
+                    default_direction: str | None = Body(None), default_key: str | None = Body(None)):
+        """direction_layer は proj・keyed に当てる方向の層(CHANGE-06・07、own なら書かない)。default_direction・default_key は
+        @方向・#鍵を省いた proj・keyed のユニットの既定(CHANGE-07)。"""
+        return session.recipe_save(name, units, ablate=ablate, sampling=sampling, default_direction=default_direction or None,
+                                   direction_layer=direction_layer if direction_layer and direction_layer != "own" else None,
+                                   default_key=default_key or None)
 
     @app.get("/api/evals")
     def evals():
@@ -356,8 +387,9 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
         return session.eval_load(name)
 
     @app.post("/api/export")
-    def export(units: list[str] = Body(...), name: str = Body(...), verify: bool = Body(False)):
-        return live.export(units, name, verify=verify)
+    def export(units: list[str] = Body(...), name: str = Body(...), verify: bool = Body(False), keyed: int = Body(0)):
+        """control vector の書き出し。keyed はレシピから外した鍵つきの書き込みの数(CHANGE-07、cvec に入らないので警告に出す)。"""
+        return live.export(units, name, verify=verify, keyed=keyed)
 
     @app.get("/api/export/file/{file}")
     def export_file(file: str):
@@ -435,7 +467,7 @@ def serve(model: str | Path, *, host: str = "127.0.0.1", port: int = 8791, root:
 
     from ..api import Session
     if host not in ("127.0.0.1", "localhost", "::1"):
-        raise GneError("BAD_ARGS", "UI はローカル専用です(--host は 127.0.0.1)", "別冊 UI 設計 §1 の非ゴール: マルチユーザー・認証")
+        raise GneError("BAD_ARGS", "UI 仅限本地（--host 为 127.0.0.1）", "另册 UI 设计 §1 的非目标：多用户、认证")
     session = Session(model, root=root, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, seed=seed, mmproj=mmproj)
     app = create_app(session, openai=openai)
     server = _Server(uvicorn.Config(app, host=host, port=port, log_level="warning"), app.state.closing)
@@ -444,7 +476,7 @@ def serve(model: str | Path, *, host: str = "127.0.0.1", port: int = 8791, root:
     except KeyboardInterrupt:                      # uvicorn.run と同じく、止めた後に送り直される Ctrl+C は黙って終わる
         pass
     if server.started:
-        sys.stderr.write("gne serve: 止めました\n")
+        sys.stderr.write("gne serve：已停止\n")
 
 
 def _server_class():
@@ -472,11 +504,11 @@ def _server_class():
             self.n_signals += 1
             self.closing.set()
             if self.n_signals == 1:
-                sys.stderr.write("gne serve: 止めています(開いている配信を閉じています。もう一度 Ctrl+C で接続を切ります)\n")
+                sys.stderr.write("gne serve：正在停止（关闭已打开的推送。再按一次 Ctrl+C 断开连接）\n")
                 if self.loop is not None:
                     self.loop.call_soon_threadsafe(self.loop.call_later, 5.0, self.drop_connections)
             elif self.n_signals == 2:
-                sys.stderr.write("gne serve: 残った接続を切って止めます\n")
+                sys.stderr.write("gne serve：断开剩余连接并停止\n")
                 if self.loop is not None:
                     self.loop.call_soon_threadsafe(self.drop_connections)
             else:

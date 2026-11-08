@@ -118,7 +118,8 @@ def _eval(s, recipe: str | None = None, units: list[str] | None = None, dose_uni
           compare_methods: bool = False, match_effect: float | None = None, score_layer: int | None = None,
           alloc: str | None = None, n_heads: list[int] | None = None, **p) -> dict:
     """eval(§6.14)。recipe は保存したレシピの名前、units は単発指定(どちらか)。compare_methods は方式の比較(CHANGE-06 F.3)、
-    alloc は heads allocate の組のヘッド数ごとの評価(F.4、recipe も units も要らない)。"""
+    alloc は heads allocate の組のヘッド数ごとの評価(F.4、recipe も units も要らない)。ほかの引数は Session.eval と同じ
+    (keyed のレシピの keyed_contrast・keyed_metrics・keyed_examples・keyed_match・keyed_pseudo・keyed_subset も、CHANGE-07 E)。"""
     if alloc:
         return s.eval_alloc_curve(alloc, n_heads=n_heads, suite=p.get("suite"), when=p.get("when"),
                                   random_controls=int(p.get("random_controls") or 0))
@@ -134,19 +135,21 @@ def _eval(s, recipe: str | None = None, units: list[str] | None = None, dose_uni
 
 def _headproj_export(s, recipe: str | None = None, out: str | None = None, *, units: list[str] | None = None,
                      name: str | None = None, direction_layer: str | None = None, file_stem: str | None = None,
-                     overwrite: bool = True, **p) -> dict:
-    """ヘッドの proj と gain(LoRA に入るユニット)を LoRA アダプタか焼き込み GGUF に書き出す。recipe(保存したレシピの名前か
-    パス)か units(UI のレシピのユニットの書き方)。out を省くと <root>/export/<名前>.lora.gguf(焼き込みは <名前>-headproj.gguf)。
-    file_stem を渡すとファイル名はそれ(LoRA は <file_stem>.lora.gguf、焼き込みは <file_stem>.gguf)。overwrite=False なら、
-    同じ名前のファイルがあれば書かずに FILE_EXISTS を返す(UI は確かめてから上書きする)。LoRA は小さいので、UI から落とせる
-    URL も返す。"""
+                     overwrite: bool = True, key: str | None = None, direction: str | None = None, **p) -> dict:
+    """ヘッドの proj・鍵つきの書き込み(keyed、CHANGE-07)と gain(LoRA に入るユニット)を LoRA アダプタか焼き込み GGUF に
+    書き出す。recipe(保存したレシピの名前かパス)か units(UI のレシピのユニットの書き方)。key・direction は #KEY・@NAME を
+    省いたユニットの鍵と方向。out を省くと Session.default_export_path(<root>/export/<名前>.lora.gguf、焼き込みは
+    <名前>-headproj.gguf、keyed だけなら <名前>-keyed.lora.gguf / -keyed.gguf)。file_stem を渡すとファイル名はそれ(LoRA は
+    <file_stem>.lora.gguf、焼き込みは <file_stem>.gguf)。overwrite=False なら、同じ名前のファイルがあれば書かずに
+    FILE_EXISTS を返す(UI は確かめてから上書きする)。LoRA は小さいので、UI から落とせる URL も返す。"""
     import re
     from pathlib import Path
     from .steer import GneError
     if units:
-        r = s.recipe(units=list(units), name=name or None, direction_layer=direction_layer)
+        r = s.recipe(units=list(units), name=name or None, direction_layer=direction_layer, default_key=key,
+                     default_direction=direction)
     elif recipe:
-        r = s.recipe(path=s.recipe_path(recipe), direction_layer=direction_layer)
+        r = s.recipe(path=s.recipe_path(recipe), direction_layer=direction_layer, default_key=key, default_direction=direction)
     else:
         raise GneError("BAD_ARGS", "需要 recipe 或 units")
     nm = name or r.name or "headproj"
@@ -157,8 +160,12 @@ def _headproj_export(s, recipe: str | None = None, out: str | None = None, *, un
         file_stem = file_stem.strip().removesuffix(".gguf").removesuffix(".lora")
         if not re.fullmatch(r"[\w.\-]+", file_stem):
             raise GneError("BAD_ARGS", f"文件名 {file_stem!r} 只能包含字母、数字、_、-、.")
-    stem = file_stem or (f"{nm}-headproj" if bake else nm)
-    path = Path(out) if out else s.store.export_dir() / (f"{stem}.gguf" if bake else f"{stem}.lora.gguf")
+    if out:
+        path = Path(out)
+    elif file_stem:
+        path = s.store.export_dir() / (f"{file_stem}.gguf" if bake else f"{file_stem}.lora.gguf")
+    else:
+        path = s.default_export_path(r, bake=bake, kind="headproj", name=nm)
     if not overwrite and path.exists():
         raise GneError("FILE_EXISTS", f"{path.name} 已存在", "请覆盖或使用其他名称")
     d = s.headproj_export(r, path, **p)
@@ -167,6 +174,86 @@ def _headproj_export(s, recipe: str | None = None, out: str | None = None, *, un
         d["url"] = f"/api/export/file/{d['file']}"
     d["name"] = nm
     return d
+
+
+def _layers(x) -> list[int] | None:
+    """層の指定(リスト・"8,14,20"・"10-16")→ 層のリスト。"""
+    if x is None or isinstance(x, (list, tuple)):
+        return None if x is None else [int(L) for L in x]
+    if isinstance(x, int):
+        return [x]
+    from .cli import parse_layers
+    return parse_layers(str(x))
+
+
+def _key_contrast(s, contrast, spec, params: dict, keys) -> tuple:
+    """鍵のジョブの対照集合: contrast(パス)か spec(UI の入力欄の表。heads_pipeline と同じく <root>/contrasts/<name>.yaml に
+    書いてから使う)。spec の keyed の設定(keys のもの)を、渡していない引数の既定にする。戻り値 (パス, 引数)。"""
+    if (contrast is None) == (spec is None):
+        raise GneError("BAD_ARGS", "请通过 contrast（路径）或 spec（映射表）之一传入对照集")
+    if spec is None:
+        return contrast, params
+    from .keyed_pipeline import apply_settings, save_spec
+    path, settings = save_spec(s, spec)
+    return str(path), apply_settings(settings, params, keys)
+
+
+def _direction_key(s, contrast=None, layers=None, spec: dict | None = None, **p) -> dict:
+    """鍵つきの書き込みの鍵を作る(CHANGE-07、gne direction key)。contrast は対照集合のパスか、spec に対照集合の表(UI の入力欄)。
+    layers は必須(リストか "8,14,20"。spec の keyed.layers でも可)。ほかの引数は Session.direction_key(keyed_build.build_keys)と同じ。"""
+    contrast, p = _key_contrast(s, contrast, spec, {"layers": layers, **p},
+                                ("layers", "target", "q_mode", "subset", "pseudo", "max_tokens"))
+    Ls = _layers(p.pop("layers", None))
+    if not Ls:
+        raise GneError("BAD_ARGS", "请指定键的层（layers）（例如 [8, 14, 20] 或 \"8,14,20\"）")
+    return s.direction_key(contrast, layers=Ls, progress=s.progress, **p)
+
+
+def _direction_key_check(s, key: str, layers=None, compact: bool = False, **p) -> dict:
+    """鍵の分離の確認(CHANGE-07、gne direction key-check)。compact なら例ごとの ρ(values)・ヒストグラム(hist)・
+    比較用の鍵ごとの値を落とす(MCP 向け。UI はヒストグラムに使うので落とさない)。"""
+    d = s.direction_key_check(key, layers=_layers(layers), progress=s.progress, **p)
+    if compact:
+        for r in d["layers"]:
+            r.pop("values", None)
+            r.pop("hist", None)
+            for k in ("pseudo_auc", "pseudo_selectivity"):
+                r[k].pop("values", None)
+    return d
+
+
+def _direction_key_experts(s, contrast=None, layers=None, spec: dict | None = None, **p) -> dict:
+    """expert:e の鍵の専門家を選ぶ材料(CHANGE-07 MoE、gne direction key-experts): 書き込みたい位置・書き込みたくない位置で各専門家が
+    選ばれた割合と重み。contrast は対照集合のパスか、spec に対照集合の表(UI の入力欄)。layers は必須(リストか "6,12,18")。
+    ほかの引数は keyed_build.expert_usage と同じ。"""
+    contrast, p = _key_contrast(s, contrast, spec, {"layers": layers, **p}, ("layers", "subset", "max_tokens"))
+    Ls = _layers(p.pop("layers", None))
+    if not Ls:
+        raise GneError("BAD_ARGS", "请指定要调查的 MoE 层（layers）（例如 [6, 12, 18] 或 \"6,12,18\"）")
+    return s.direction_key_experts(contrast, layers=Ls, progress=s.progress, **p)
+
+
+def _direction_key_pipeline(s, contrast=None, spec: dict | None = None, **p) -> dict:
+    """方向(gne direction --positions response と同じ)→ 鍵 → 作成と反対側の subset での key-check を 1 回で(CHANGE-07、
+    keyed_pipeline.run)。contrast は対照集合のパスか、spec に対照集合の表(UI の入力欄。<root>/contrasts/<name>.yaml に書く)。
+    同じ名前の方向があれば使い回し、rebuild_direction=True で作り直す。"""
+    if (contrast is None) == (spec is None):
+        raise GneError("BAD_ARGS", "请通过 contrast（路径）或 spec（映射表）之一传入对照集")
+    from .keyed_pipeline import run
+    return run(s, spec if spec is not None else contrast, progress=s.progress, **p)
+
+
+def _direction_key_verify(s, layer, key: str, direction: str, alphas=None, target: str | None = None,
+                          direction_layer: str = "own", texts=None) -> dict:
+    """V30(CHANGE-07、gne direction key-verify): keyed の LoRA が式どおり ΔW x = α (κᵀx) d を書くか(数秒)。target を省くと
+    鍵の書き込み先。texts は流す文か会話のリスト、または 1 行に 1 文の文字列(省くと語尾の違う日本語と英語の 2 文。
+    専門家の鍵はその専門家が選ばれる文を)。"""
+    from .keyed import load_key, parse_target
+    kind, expert = parse_target(target or load_key(s, str(key)).target)
+    if isinstance(texts, str):
+        texts = [x for x in texts.splitlines() if x.strip()]
+    return s.check_keyed(int(layer), key=str(key), direction=str(direction), alphas=tuple(float(a) for a in (alphas or (1.0, 2.0))),
+                         kind=kind, expert=expert, direction_layer=direction_layer, texts=list(texts) if texts else None)
 
 
 def standard_kinds() -> dict[str, Callable[..., dict]]:
@@ -197,6 +284,11 @@ def standard_kinds() -> dict[str, Callable[..., dict]]:
         "heads_refine": lambda s, name, **p: s.heads_refine(name, **p),                 # 残りの質問で追加のヘッドを探す
         "fieldtest": lambda s, **p: s.fieldtest(**p),                                   # 本番と同じ動かし方で、ファイルどうしを比べる
         "headproj_export": _headproj_export,
+        "direction_key": _direction_key,                                                # CHANGE-07: 鍵の作成
+        "direction_key_check": _direction_key_check,                                    # CHANGE-07: 鍵の分離の確認
+        "direction_key_experts": _direction_key_experts,                                # CHANGE-07 MoE: 専門家の選ばれ方
+        "direction_key_pipeline": _direction_key_pipeline,                              # CHANGE-07: 方向 → 鍵 → key-check
+        "direction_key_verify": _direction_key_verify,                                  # CHANGE-07 V30: LoRA が式どおりか
     }
 
 

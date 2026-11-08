@@ -6,7 +6,7 @@
 // CHANGE-05 G: MoE の専門家(EXPERT パネル、jump の L12 E37)、overlay expert_usage・experts:<name>、fires で選ばれた専門家のタイルの枠、
 // MoE のニューロン(通し番号 = 専門家 × 幅 + n)を NEURON パネルで開き、レシピに L:Ee:Nn で足す。
 // CHANGE-06 G: overlay causal:<name>・eta:<name>(因果スクリーニング)、HEAD パネルの Causal、レシピのヘッドの射影(L:Hh:sS@NAME)、
-// direction ビュー(方向の速い物差し: 層ごとの cohen_d・基準層・A/B の点数の分布)。
+// direction ビュー(方向の速い指標: 層ごとの cohen_d・基準層・A/B の射影の値の分布)。
 import { LayerCache, getBin, getJSON, loadVocab } from "./api.js";
 import { AgentLink } from "./agent.js";
 import { LANG, setLang, t, translateDOM } from "./i18n.js";
@@ -312,6 +312,7 @@ async function refreshModel() {
   state.model.writers = m.writers;
   state.model.causal = m.causal;
   state.model.direction_sets = m.direction_sets;
+  state.model.keys = m.keys;                                             // CHANGE-07: 鍵つきの書き込みの鍵
   await refreshExperts();
 }
 
@@ -789,6 +790,7 @@ async function onJobFinished(j) {
   updateStatus();
   if (j.kind === "fieldtest" && evalView) evalView.ft.jobEnded(j);        // 実地テスト: eval ビューに結果を出す
   if (j.kind === "headproj_export" && recipePanel) recipePanel.lxDone(j);   // レシピのタブの LoRA・焼き込み
+  if (String(j.kind).startsWith("direction_key") && directionView) directionView.jobEnded(j);   // CHANGE-07: 鍵の作成・確認・専門家・key-verify・一括
   if (j.kind === "head_pipeline" || j.kind === "heads_candidates" || j.kind === "heads_refine") {    // 一括・強さの候補・残りから追加: direction ビューに結果を出す
     if (j.status === "done") {
       if (j.kind !== "heads_candidates") causalCache.clear();
@@ -816,7 +818,8 @@ async function onJobFinished(j) {
     causalCache.clear();
     if (headPanel && state.headFocus) { headPanel.causalSums.clear(); headPanel.open(state.headFocus); }
   }
-  if (j.kind === "direction" && directionView) directionView.refresh();
+  if ((j.kind === "direction" || j.kind === "direction_key_pipeline") && directionView) directionView.refresh();   // 一括も方向を作る
+  if ((j.kind === "direction_key" || j.kind === "direction_key_pipeline") && recipePanel && !$("#recipe-list").classList.contains("hidden")) recipePanel.render();   // 鍵・方向の選択肢
   if ((j.kind === "experts_contrast" || j.kind === "experts_sweep" || j.kind === "stats_act") && expertPanel && state.expertFocus) {
     expertPanel.open(state.expertFocus);                                 // 専門家の対照分析・使用統計(CHANGE-05 G): 開いている専門家を取り直す
   }
@@ -867,7 +870,7 @@ async function setView(v) {
   xv.classList.toggle("hidden", v !== "eval");
   wv.classList.toggle("hidden", v !== "writers");
   dv.classList.toggle("hidden", v !== "direction");
-  if (v === "direction") {                                                 // 方向の速い物差し(CHANGE-06 G)
+  if (v === "direction") {                                                 // 方向の速い指標(CHANGE-06 G)
     if (!state.model) { dv.innerHTML = `<p class="muted" style="padding:16px">${t("合成の構造には direction ビューのデータがありません")}</p>`; return; }
     if (!directionView) {
       directionView = new DirectionView(dv, {
@@ -882,6 +885,13 @@ async function setView(v) {
         candidates: {                                                     // 強さの候補(heads_candidates)の候補を使う
           onLoadCandidate: (c) => loadCandidate(c),
           onChatCandidate: async (c) => { const note = await loadCandidate(c); chat.setSingle(true); startRecipeChat(); return note; },
+        },
+        keyed: {                                                          // 鍵つきの書き込みの鍵(CHANGE-07): 作成と key-check のジョブ
+          onRun: (kind, params) => jobsBar.start(kind, params),
+          onAddKeyed: (u) => { state.recipe.addKeyed(u); expand("list"); listTab("recipe"); },
+          directions: () => (state.model ? (state.model.direction_sets || []).map((x) => x.name) : []),
+          nLayer: state.arch.n_layer,
+          moeLayers: state.arch.layers.map((li, L) => (String(li.ffn || "").startsWith("moe") ? L : null)).filter((L) => L !== null),   // 専門家を選ぶ材料
         },
       });
       state.directionView = directionView;                               // 自動テスト用
@@ -914,7 +924,8 @@ async function setView(v) {
                                     onLoadProj: (name, specs) => { state.recipe.loadProj(name, specs); expand("list"); listTab("recipe"); },
                                     onLoadRecipe: (rd) => {
                                       const us = (rd.units || []).map((u) => (u.mode === "proj" && !u.direction ? { ...u, direction: rd.default_direction } : u));
-                                      state.recipe.load(rd.name || "", us, rd.ablate, rd.sampling, rd.direction_layer);
+                                      state.recipe.load(rd.name || "", us, rd.ablate, rd.sampling, rd.direction_layer,
+                                                        { default_direction: rd.default_direction, default_key: rd.default_key });   // keyed の既定(CHANGE-07)
                                       expand("list"); listTab("recipe");
                                     } });
       state.evalView = evalView;                                         // 自動テスト用
@@ -1114,6 +1125,8 @@ async function main() {
       onOpenHead: (u) => openHead(u),
       headKind: (L) => mixerLabel(state.arch.layers[L]),
       onRunJob: (kind, params) => jobsBar.start(kind, params),          // LoRA・焼き込み(headproj_export)
+      keys: () => (state.model ? state.model.keys || [] : []),           // 鍵つきの書き込みの鍵(CHANGE-07)
+      nLayer: state.arch.n_layer,
     });
     headPanel = new HeadPanel($("#head-body"), {
       onRecipe: (L, h, k) => {

@@ -38,9 +38,9 @@ class AgentBus:
         try:
             L, n = int(L), int(n)
         except (TypeError, ValueError) as e:
-            raise GneError("BAD_ARGS", "layer と neuron が要ります") from e
+            raise GneError("BAD_ARGS", "需要 layer 和 neuron") from e
         if not 0 <= L < self.n_layer or not 0 <= n < self.n_ff_at(L):
-            raise GneError("BAD_ARGS", f"L{L} N{n} は範囲外です")
+            raise GneError("BAD_ARGS", f"L{L} N{n} 超出范围")
         return L, n
 
     def snapshot(self) -> dict:
@@ -53,11 +53,11 @@ class AgentBus:
         for u in units or []:
             m = _UNIT.match(str(u))
             if not m:
-                raise GneError("BAD_ARGS", f"ユニット {u!r} が読めません", '"22:2742" や "14:8949:+1" の形で渡してください')
+                raise GneError("BAD_ARGS", f"无法读取单元 {u!r}", "\"22:2742\" 或 \"14:8949:+1\" 形式传入")
             L, n = self._check(m.group(1), m.group(2))
             out.append({"layer": L, "neuron": n, "dose": float(m.group(3)) if m.group(3) else None})
         if len(out) > MAX_HIGHLIGHT:
-            raise GneError("BAD_ARGS", f"強調は {MAX_HIGHLIGHT} 個までです")
+            raise GneError("BAD_ARGS", f"高亮最多 {MAX_HIGHLIGHT} 个")
         self.highlights, self.label = out, (label or None) and str(label)[:80]
         self.last = {"action": "highlight", "n": len(out), "label": self.label, "t": time.time()}
         ev = {"type": "highlight", "highlights": out, "label": self.label, "last": self.last}
@@ -71,7 +71,7 @@ class AgentBus:
         text = (text or "").strip()[:MAX_TEXT]
         if text:
             if key not in self.notes and len(self.notes) >= MAX_NOTES:
-                raise GneError("BAD_ARGS", f"注釈は {MAX_NOTES} 個までです(空の text で消せます)")
+                raise GneError("BAD_ARGS", f"注释最多 {MAX_NOTES} 个（可用空 text 删除）")
             self.notes[key] = {"layer": L, "neuron": n, "text": text, "t": time.time()}
         else:
             self.notes.pop(key, None)
@@ -82,7 +82,7 @@ class AgentBus:
     def open(self, layer, neuron, tab: str | None = None) -> dict:
         L, n = self._check(layer, neuron)
         if tab not in (None, "examples", "chat", "details", "web"):
-            raise GneError("BAD_ARGS", "tab は examples / chat / details / web です")
+            raise GneError("BAD_ARGS", "tab 必须是 examples / chat / details / web")
         self.last = {"action": "open", "layer": L, "neuron": n, "t": time.time()}
         self._publish({"type": "open", "layer": L, "neuron": n, "tab": tab, "last": self.last})
         return {"ok": True, "browsers": len(self._subs)}

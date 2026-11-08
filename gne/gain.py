@@ -89,7 +89,7 @@ def head_gain_by_layer(units: list[Unit]) -> dict[int, list[tuple[int, float]]]:
 
 
 def head_lora_tensors(weights, by_layer: dict[int, list[tuple[int, float]]]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """書き込み行列の名前 → (A, B)。A は (r, n_in)、B は (n_embd, r)、r = ヘッド数 × head_dim。"""
+    """残差に書き込む重み行列の名前 → (A, B)。A は (r, n_in)、B は (n_embd, r)、r = ヘッド数 × head_dim。"""
     out = {}
     for L, hk in by_layer.items():
         name, _, _ = weights.head_block(L, hk[0][0])
@@ -135,9 +135,13 @@ def lora_tensors(weights, by_layer: dict[int, list[tuple[int, float]]]) -> dict[
 
 def export_gain_lora(weights, recipe: Recipe, path: str | Path, *,
                      extra: dict[str, tuple[np.ndarray, np.ndarray]] | None = None, extra_meta: dict | None = None,
-                     strip_meta: bool = False) -> dict:
+                     extra_kv: dict[str, str] | None = None, strip_meta: bool = False, f16: bool = False) -> dict:
     """gain ユニット(ニューロンの ffn_up とヘッドの W_O)を LoRA アダプタ GGUF に書く。extra は同じファイルに入れる
-    書き込み行列の LoRA(ヘッドの方向成分の射影 CHANGE-06。同じテンソルのヘッドの gain とは A・B を連結して 1 つにする)。"""
+    残差に書き込む重み行列の LoRA(ヘッドの方向成分の射影 CHANGE-06、鍵つきの書き込み CHANGE-07 の ffn_down・attn_output・
+    ffn_down_shexp・ffn_down_exps。同じテンソルのヘッドの gain とは A・B を連結して 1 つにする)。
+    extra_meta は gne.headproj の記録(従来どおり)、extra_kv はそのほかの gne.* の記録(名前 → JSON の文字列、例 gne.keyed)。
+    proj_rank は extra_meta(proj)を渡したときだけ extra から数える(proj と keyed を混ぜたときは呼ぶ側が数える)。"""
+    cast = (lambda x: np.asarray(x, dtype=np.float16)) if f16 else (lambda x: x)   # LoRA を F16 で書く(大きさが半分)
     from .headproj import merge_tensors
     by_layer = gain_by_layer(recipe.units)
     heads = head_gain_by_layer(recipe.units)
@@ -169,18 +173,20 @@ def export_gain_lora(weights, recipe: Recipe, path: str | Path, *,
         w.add_key_value("gne.source_model_id", m.model_id, GGUFValueType.STRING)
         if extra_meta is not None:
             w.add_key_value("gne.headproj", json.dumps(extra_meta, ensure_ascii=False), GGUFValueType.STRING)
+        for k, v in (extra_kv or {}).items():
+            w.add_key_value(k, v, GGUFValueType.STRING)
     for L, (A, B) in tens.items():
-        w.add_tensor(f"blk.{L}.ffn_up.weight.lora_a", A)
-        w.add_tensor(f"blk.{L}.ffn_up.weight.lora_b", B)
+        w.add_tensor(f"blk.{L}.ffn_up.weight.lora_a", cast(A))
+        w.add_tensor(f"blk.{L}.ffn_up.weight.lora_b", cast(B))
     for name, (A, B) in sorted(htens.items(), key=lambda x: int(x[0].split(".")[1])):
-        w.add_tensor(f"{name}.lora_a", A)
-        w.add_tensor(f"{name}.lora_b", B)
+        w.add_tensor(f"{name}.lora_a", cast(A))
+        w.add_tensor(f"{name}.lora_b", cast(B))
     for L, (A, B) in etens.items():                              # numpy (E, r, n_embd) → ne [n_embd, r, E]
-        w.add_tensor(f"blk.{L}.ffn_up_exps.weight.lora_a", A)
-        w.add_tensor(f"blk.{L}.ffn_up_exps.weight.lora_b", B)
+        w.add_tensor(f"blk.{L}.ffn_up_exps.weight.lora_a", cast(A))
+        w.add_tensor(f"blk.{L}.ffn_up_exps.weight.lora_b", cast(B))
     for L, (A, B) in stens.items():
-        w.add_tensor(f"blk.{L}.ffn_up_shexp.weight.lora_a", A)
-        w.add_tensor(f"blk.{L}.ffn_up_shexp.weight.lora_b", B)
+        w.add_tensor(f"blk.{L}.ffn_up_shexp.weight.lora_a", cast(A))
+        w.add_tensor(f"blk.{L}.ffn_up_shexp.weight.lora_b", cast(B))
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -190,8 +196,8 @@ def export_gain_lora(weights, recipe: Recipe, path: str | Path, *,
     if heads:
         out["heads"] = {str(L): [[h, k] for h, k in hk] for L, hk in heads.items()}
         out["head_rank"] = {str(L): int(htens[weights.head_block(L, hk[0][0])[0]][0].shape[0]) for L, hk in heads.items()}
-    if extra:
-        out["proj_rank"] = {name.split(".")[1]: int(B.shape[1]) for name, (_, B) in extra.items()}
+    if extra and extra_meta is not None:
+        out["proj_rank"] = {name.split(".")[1]: int(B.shape[-1]) for name, (_, B) in extra.items()}
     if experts:
         out["experts"] = {str(L): [[e, n, k] for e, n, k in enk] for L, enk in experts.items()}
     if shared:
@@ -203,7 +209,8 @@ def _patch_targets(weights, recipe: Recipe) -> list[tuple[str, object, float, st
     """スケールパッチで書ける操作の一覧 [(テンソル, 行 / 専門家, k か delta, 種類)]。ヘッドの gain(W_O の列)のように
     列方向の操作があるか、テンソルの型がパッチに対応していなければ None。"""
     from .patch import supported
-    if head_gain_by_layer(recipe.units) or recipe.proj_units:    # 列方向(ヘッドの gain・方向成分の射影)はパッチで書けない
+    # 列方向(ヘッドの gain・方向成分の射影)と鍵つきの書き込み(rank 1 の足し算、CHANGE-07)はパッチで書けない
+    if head_gain_by_layer(recipe.units) or recipe.proj_units or recipe.keyed_units:
         return None
     out = []
     for L, nk in gain_by_layer(recipe.units).items():
@@ -261,20 +268,230 @@ def bake_gain_patch(weights, recipe: Recipe, dst: str | Path) -> dict:
             "bytes": Path(dst).stat().st_size, "method": "patch", "patch_bytes": ps.n_bytes, "ops": ps.ops}
 
 
+def _writer_base(weights, name: str) -> np.ndarray:
+    """焼き込みで変化量を足す重み行列の元の値(float32、numpy の形 (out, in)、専門家は (n_expert, out, in))。
+    ヘッドが残差に書き込む重み行列(attn_output / ssm_out)は head_writer_matrix(形を確かめる)、それ以外(ffn_down・ffn_down_shexp・
+    ffn_down_exps など、CHANGE-07 の keyed)はテンソルをそのまま float32 にする(レビュー P12)。"""
+    from .weights import tensor_to_f32
+    parts = name.split(".")
+    if parts[0] == "blk" and len(parts) > 2 and parts[1].isdigit():
+        L = int(parts[1])
+        try:
+            li = weights.arch.layers[L]
+        except (IndexError, KeyError, AttributeError):
+            li = None
+        if li is not None and li.head_writer and li.head_dim and name == f"blk.{L}.{li.head_writer}.weight":
+            return weights.head_writer_matrix(L)
+    return tensor_to_f32(weights.tensor(name))
+
+
+# --- keyed を含む焼き込みの既定の型(requant="auto"、CHANGE-07)--------------------------------------------------------
+# 元が Q8_0 のテンソルは Q8_0 のまま(keep と同じ)書く。F16 にすると編集の丸めは小さいが、書き換えたテンソルの掛け算が
+# Q8_0 の経路(活性も 8 ビットにする)から F16 の経路に変わり、LoRA 版との差が keep より大きくなった(verification.md F132)。
+# ただし編集が Q8_0 の刻みに比べて小さく、量子化し直すと編集の 1 割以上が消える(edit_kept < KEYED_KEEP_MIN)テンソルだけ F16 に
+# する(Qwen3-0.6B の L14 で、edit_kept は α = 1 で 0.99、0.25 で 0.93、0.1 で 0.84、0.05 で 0.75)。α ではなく edit_kept で
+# 分けるのは、残り方が編集の要素と刻みの比(α‖r_L‖‖κ_L‖ と重みの大きさ)で決まり、α だけでは決まらないため。
+# 元が Q8_0 でない型(K-quant・IQ・F16・BF16・F32)は今までどおり F16。専門家の 3 次元テンソル(ffn_down_exps)も同じ規則。
+KEYED_KEEP_MIN = 0.9
+
+
+def auto_qtype(src):
+    """requant="auto"(keyed を含む焼き込みの既定)で書き出す型の第一候補: 元が Q8_0 なら Q8_0、それ以外は F16。"""
+    return GGMLQuantizationType.Q8_0 if src == GGMLQuantizationType.Q8_0 else GGMLQuantizationType.F16
+
+
+def edit_kept(back: np.ndarray, want: np.ndarray, dW: np.ndarray) -> float:
+    """量子化し直しても残った編集の割合: 1 + ⟨戻した値 − 書きたい値, ΔW⟩ / ‖ΔW‖²(= ⟨実際に足された分, ΔW⟩ / ‖ΔW‖²)。
+    1 なら編集がそのまま残り、0 なら丸めで消えた。requant_error(‖戻した値 − 書きたい値‖ / ‖ΔW‖)は編集と無関係な丸めの
+    ゆらぎも数えるので、刻みより小さい編集では大きく出るが、編集の向きの成分はこちらで見る。"""
+    d = np.asarray(dW, dtype=np.float64)
+    den = float(np.sum(d * d))
+    if den <= 0:
+        return 1.0
+    return 1.0 + float(np.sum((np.asarray(back, dtype=np.float64) - np.asarray(want, dtype=np.float64)) * d)) / den
+
+
+def _decode_back(data: np.ndarray, qt, shape: tuple[int, ...]) -> np.ndarray:
+    """_encode した値を float32 に戻す(量子化し直しで失った分を測る用)。"""
+    if qt == GGMLQuantizationType.F32:
+        return np.asarray(data, dtype=np.float32).reshape(shape)
+    if qt == GGMLQuantizationType.F16:
+        return np.asarray(data).astype(np.float32).reshape(shape)
+    return np.asarray(gquants.dequantize(data, qt), dtype=np.float32).reshape(shape)
+
+# --- 専門家の 3 次元テンソルの焼き込み(CHANGE-07 の keyed expert:e)-------------------------------------------------
+# ffn_down_exps は (n_expert, out, in) で、大きなモデルでは 1 層で数億要素ある。テンソル全体を float32 にせず、
+# 専門家(スラブ)ごとに読んで書く。編集するのは LoRA の A・B が 0 でない専門家のスラブだけで、ほかのスラブは
+# 書き出す型が元と同じならバイトのまま写し、違えば 1 枚ずつ変換する。1 つのテンソルの型は 1 つなので、書き出す型を
+# 元と違う型(F16 など)にすると編集しないスラブも含めてテンソル全体の大きさが変わる(modified の bytes_from・bytes_to)。
+
+_ENCODABLE: dict = {}
+
+
+def _can_encode(qt) -> bool:
+    """gguf-py で量子化できる型か(F32・F16・BF16・Q4_0・Q4_1・Q5_0・Q5_1・Q8_0・MXFP4 など。K-quant・IQ は不可)。"""
+    if qt not in _ENCODABLE:
+        from gguf.constants import GGML_QUANT_SIZES
+        try:
+            bs = int(GGML_QUANT_SIZES[qt][0])
+            gquants.quantize(np.zeros((1, 256 * max(bs, 1)), np.float32), qt)
+            _ENCODABLE[qt] = True
+        except Exception:                                    # NotImplementedError・KeyError など
+            _ENCODABLE[qt] = False
+    return _ENCODABLE[qt]
+
+
+def _encode(W: np.ndarray, qt) -> np.ndarray:
+    if qt == GGMLQuantizationType.F32:
+        return np.asarray(W, dtype=np.float32)
+    if qt == GGMLQuantizationType.F16:
+        return np.asarray(W).astype(np.float16)
+    return gquants.quantize(np.asarray(W, dtype=np.float32), qt)
+
+
+def _expert_qtype(src, requant: str):
+    """専門家の 3 次元テンソルを書き出す型。f16 / q8_0 はその型。keep は元の型で書けるなら元の型(編集しない専門家の
+    スラブはバイトのまま)、書けない型(K-quant・IQ など)は 2 次元の keep と同じく Q8_0。auto(keyed を含む焼き込みの既定)は
+    元が Q8_0 なら Q8_0、それ以外は F16(auto_qtype。Q8_0 で編集が埋もれるときの F16 への切り替えは _expert_bake)。"""
+    if requant == "f16":
+        return GGMLQuantizationType.F16
+    if requant == "q8_0":
+        return GGMLQuantizationType.Q8_0
+    if requant == "auto":
+        return auto_qtype(src)
+    return src if _can_encode(src) else GGMLQuantizationType.Q8_0
+
+
+class _SlabStream:
+    """専門家の 3 次元テンソルを、書くときにスラブ(専門家)ごとに作るもの(GGUFWriter.write_tensor_data に配列の代わりに
+    渡す: shape・dtype・nbytes・tofile)。編集したスラブは前もって作ったもの、ほかは元のバイトか 1 枚ずつ変換したもの。"""
+
+    def __init__(self, t, qt, edited: dict[int, np.ndarray], slab_shape: tuple[int, ...], dtype):
+        self.t, self.qt, self.edited = t, qt, edited
+        self.n = int(t.data.shape[0])
+        self.shape = (self.n, *slab_shape)
+        self.dtype = np.dtype(dtype)
+        self.nbytes = int(self.n * int(np.prod(slab_shape)) * self.dtype.itemsize)
+
+    def byteswap(self, inplace: bool = False):
+        raise GneError("INTERNAL", "专家的张量烧录不支持字节序交换")
+
+    def tofile(self, fout) -> None:
+        from .weights import _slab_to_f32
+        same = self.qt == self.t.tensor_type
+        for e in range(self.n):
+            if e in self.edited:
+                data = self.edited[e]
+            elif same:
+                data = np.ascontiguousarray(self.t.data[e])
+            else:
+                data = _encode(_slab_to_f32(self.t, e), self.qt)
+            if data.nbytes * self.n != self.nbytes:
+                raise GneError("INTERNAL", f"{self.t.name}：专家 {e} 的 slab 大小 {data.nbytes} 不一致")
+            data.tofile(fout)
+
+
+def expert_slab_edits(t, A: np.ndarray, B: np.ndarray, qt, *, encode=None, decode=None,
+                      measure: bool = True, stats: dict | None = None) -> tuple[dict[int, np.ndarray], float | None]:
+    """専門家の 3 次元テンソル t(numpy (n_expert, out, in))の、A (n_expert, r, in)・B (n_expert, out, r) が 0 でない専門家の
+    スラブだけを float32 にして W_e + B_e A_e を作り、型 qt にしたもの {専門家: 書き出すスラブ}(1 枚ずつ。テンソル全体は
+    float32 にしない)。通常の焼き込み(_expert_bake)と分割 GGUF への焼き込み(headproj.bake_proj_split)で共用する。
+    encode(W, qt) / decode(data, qt, shape) を省くと gguf-py(_encode・_decode_back)。measure なら量子化し直しで失った分
+    ‖戻した値 − 書きたい値‖ / ‖B_e A_e‖(編集したスラブの和)も返す(編集が無ければ None)。stats(dict)を渡すと、measure の
+    とき stats["kept"] に編集の残り方(edit_kept、編集したスラブの和)を入れる。"""
+    from .weights import _slab_to_f32
+    encode = encode or _encode
+    decode = decode or _decode_back
+    n_exp = int(t.data.shape[0])
+    if A.ndim != 3 or B.ndim != 3 or A.shape[0] != n_exp or B.shape[0] != n_exp:
+        raise GneError("INTERNAL", f"{t.name}: 专家 LoRA 形状 {A.shape} / {B.shape} 与专家数量 {n_exp} 不一致")
+    edited: dict[int, np.ndarray] = {}
+    err2 = d2 = dot = 0.0
+    for e in range(n_exp):
+        if not (np.any(A[e]) and np.any(B[e])):
+            continue
+        W = _slab_to_f32(t, e)
+        dW = B[e].astype(np.float64) @ A[e].astype(np.float64)
+        if dW.shape != W.shape:
+            raise GneError("INTERNAL", f"{t.name}: 专家 {e} 的变化量形状 {dW.shape} 与原矩阵 {W.shape} 不一致")
+        want = (W.astype(np.float64) + dW).astype(np.float32)
+        edited[e] = encode(want, qt)
+        if measure:
+            back = decode(edited[e], qt, W.shape)
+            diff = back.astype(np.float64) - want
+            err2 += float(np.sum(np.square(diff)))
+            d2 += float(np.sum(np.square(dW)))
+            dot += float(np.sum(diff * dW))
+    if stats is not None and measure and d2 > 0:
+        stats["kept"] = 1.0 + dot / d2
+    return edited, (float(np.sqrt(err2) / np.sqrt(d2)) if measure and d2 > 0 else None)
+
+
+def expert_record(t, qt, edited, bytes_to: int) -> dict:
+    """専門家の 3 次元テンソルの書き換えの記録(modified の 1 つ): 編集した専門家、編集しないスラブの扱い(raw = バイトの
+    まま、"Q8_0->F16" = 1 枚ずつ変換)、元と後の大きさ。"""
+    return {"tensor": t.name, "from": t.tensor_type.name, "to": qt.name, "experts": sorted(edited),
+            "untouched": "raw" if qt == t.tensor_type else f"{t.tensor_type.name}->{qt.name}",
+            "bytes_from": int(t.n_bytes), "bytes_to": int(bytes_to)}
+
+
+def expert_bytes_added(records) -> int | None:
+    """modified の記録のうち専門家の 3 次元テンソルの大きさの増分の和(専門家のテンソルが無ければ None)。"""
+    recs = [m for m in records or [] if isinstance(m, dict) and "experts" in m and "bytes_to" in m and "bytes_from" in m]
+    return sum(int(m["bytes_to"]) - int(m["bytes_from"]) for m in recs) if recs else None
+
+
+def _expert_bake(t, A: np.ndarray, B: np.ndarray, requant: str, via_f16: bool) -> tuple[_SlabStream, object, dict]:
+    """専門家の 3 次元テンソル t(numpy (n_expert, out, in))に W_e += B_e A_e を焼き込む書き出しの準備。A (n_expert, r, in)・
+    B (n_expert, out, r) が 0 でない専門家のスラブだけ float32 にして足し、書き出す型にしておく(1 枚ずつ、テンソル全体は
+    float32 にしない、expert_slab_edits)。戻り値 (ストリーム, 書き出す型, modified の記録)。記録の requant_error は編集した
+    スラブでの ‖戻した値 − 書きたい値‖ / ‖B_e A_e‖(全専門家の和)、untouched は編集しないスラブの扱い(raw = バイトのまま)。"""
+    from .weights import _slab_to_f32
+    qt = _expert_qtype(t.tensor_type, requant)
+    stats: dict = {}
+    edited, err = expert_slab_edits(t, A, B, qt, measure=not via_f16 or requant == "auto", stats=stats)
+    fallback = None
+    if requant == "auto" and qt == GGMLQuantizationType.Q8_0 and stats.get("kept", 1.0) < KEYED_KEEP_MIN:
+        fallback = {"from": "Q8_0", "edit_kept": stats["kept"]}            # Q8_0 では編集が埋もれる: F16 で書き直す
+        qt, stats = GGMLQuantizationType.F16, {}
+        edited, err = expert_slab_edits(t, A, B, qt, measure=not via_f16, stats=stats)
+    probe = next(iter(edited.values())) if edited else _encode(_slab_to_f32(t, 0), qt)
+    st = _SlabStream(t, qt, edited, probe.shape, probe.dtype)
+    rec = expert_record(t, qt, edited, st.nbytes)
+    if err is not None and not via_f16:
+        rec["requant_error"] = err
+    if "kept" in stats and not via_f16:
+        rec["edit_kept"] = stats["kept"]
+    if fallback is not None:
+        rec["fallback"] = fallback
+    return st, qt, rec
+
+
 def bake_gain_gguf(weights, recipe: Recipe, dst: str | Path, *, requant: str = "q8_0",
                    extra: dict[str, tuple[np.ndarray, np.ndarray]] | None = None, extra_meta: dict | None = None,
-                   via_f16: bool = False, strip_meta: bool = False) -> dict:
+                   extra_kv: dict[str, str] | None = None, via_f16: bool = False, strip_meta: bool = False,
+                   keyed: bool = False) -> dict:
     """W_up[L] の行(ニューロン)と W_O の列ブロック(ヘッド)を k 倍した GGUF を作る。書き換えたテンソルだけ
     Q8_0(requant="q8_0")か F16 にし、他は生バイトのまま写す。requant="patch" はスケールパッチ(量子化を保ったまま
     ちょうど k 倍、bake_gain_patch)、"auto" はパッチで書ければパッチ、書けなければ Q8_0。専門家全体の gain と route は
-    パッチだけ。extra は書き込み行列に足す LoRA の変化量 B @ A(ヘッドの方向成分の射影、CHANGE-06)。gain と同じテンソルなら、
-    どちらも元の重みから計算した変化量を足す(LoRA を並べて当てたのと同じ)。"""
+    パッチだけ。extra は残差に書き込む重み行列に足す LoRA の変化量 B @ A(ヘッドの方向成分の射影 CHANGE-06、鍵つきの書き込み CHANGE-07)。
+    元の行列は _writer_base で引く(ヘッドの行列に限らない)。専門家の 3 次元 (E, out, in) は専門家ごとに W_e += B_e A_e を
+    スラブごとに書く(_expert_bake。テンソル全体を float32 にしない。requant="keep" なら元の型で書ける型のとき元の型にして、
+    編集しない専門家のスラブはバイトのまま)。modified には書き換えたテンソルの元と後の大きさ(bytes_from・bytes_to)も入れ、
+    専門家のテンソルがあれば大きさの増分の和を expert_bytes_added に返す。
+    gain と同じテンソルなら、どちらも元の重みから計算した変化量を足す(LoRA を並べて当てたのと同じ)。
+    extra のテンソルは量子化し直しで失った分 ‖戻した値 − 書きたい値‖ / ‖B @ A‖ を modified の requant_error と
+    requant_error_max に返す(小さな rank 1 の編集が量子化の刻みに埋もれていないかの目安)。
+    extra_meta は gne.headproj、extra_kv はそのほかの gne.* の記録(例 gne.keyed)。
+    keyed(鍵つきの書き込みを含む)で requant="auto" なら、テンソルごとに型を決める(auto_qtype: 元が Q8_0 なら Q8_0 のまま、
+    それ以外は F16。Q8_0 のままでは編集の 1 割以上が丸めに消える(edit_kept < KEYED_KEEP_MIN)テンソルだけ F16、記録の
+    fallback)。変化量を足したテンソルの記録には、量子化し直しても残った編集の割合 edit_kept も入れる(edit_kept_min)。"""
     if requant in ("patch", "auto"):
         if requant == "patch" or (_patch_targets(weights, recipe) is not None and not extra):
             return bake_gain_patch(weights, recipe, dst)
-        requant = "q8_0"
+        requant = "auto" if (requant == "auto" and keyed) else "q8_0"
     extra = extra or {}
-    if any(u.kind == "expert" for u in recipe.units):
+    if any(u.kind == "expert" and u.mode in ("gain", "route") for u in recipe.units):
         raise GneError("BAD_RECIPE", "专家整体的 gain 与 route 只能通过缩放补丁写入", "--requant patch（或 auto）")
     by_layer = gain_by_layer(recipe.units)
     heads = head_gain_by_layer(recipe.units)
@@ -283,48 +500,75 @@ def bake_gain_gguf(weights, recipe: Recipe, dst: str | Path, *, requant: str = "
     if by_layer:
         _check(weights, by_layer)
     head_tensors = {weights.head_block(L, hk[0][0])[0]: L for L, hk in heads.items()}
-    head_tensors.update({name: int(name.split(".")[1]) for name in extra})
-    if requant not in ("q8_0", "f16", "keep"):
-        raise GneError("BAD_ARGS", "--requant 只能为 q8_0、f16 或 keep（原类型为 F32 / F16 / BF16 时保持该类型；量化类型则保持 Q8_0）")
+    missing = [n for n in extra if not weights.has_tensor(n)]
+    if missing:
+        raise GneError("BAD_ARGS", f"烧录目标中不存在 {missing[0]}（结构不同的模型）")
+    targets = set(head_tensors) | set(extra)
+    if requant not in ("q8_0", "f16", "keep", "auto"):
+        raise GneError("BAD_ARGS", "--requant 只能为 q8_0、f16、keep（原类型为 F32 / F16 / BF16 时保持该类型；量化类型则保持 Q8_0）或 auto（包含 keyed 时的默认值）")
     if Path(weights.path).resolve() == Path(dst).resolve():
         raise GneError("BAD_ARGS", "--in 与 --out 指向同一文件")
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     tag = f" +gain:{recipe.name}" if recipe.name else " +gain"
     w = copy_gguf_header(weights, dst, tag=tag, recipe=recipe, strip=strip_meta)
-    if extra_meta is not None and not strip_meta:
-        w.add_key_value("gne.headproj", json.dumps(extra_meta, ensure_ascii=False), GGUFValueType.STRING)
+    if not strip_meta:
+        if extra_meta is not None:
+            w.add_key_value("gne.headproj", json.dumps(extra_meta, ensure_ascii=False), GGUFValueType.STRING)
+        for k, v in (extra_kv or {}).items():
+            w.add_key_value(k, v, GGUFValueType.STRING)
     plan, modified = [], []
     for t in weights.reader.tensors:
         hit = t.name.startswith("blk.") and t.name.endswith(".ffn_up.weight")
         L = int(t.name.split(".")[1]) if hit else None
-        W = None
+        W, dW = None, None
         if L in by_layer:
             W = np.array(weights.up_matrix(L), dtype=np.float32, copy=True)   # F32 のテンソルは読み取り専用の memmap
             for n, k in by_layer[L]:
                 W[n] *= k
-        elif t.name in head_tensors:
-            L = head_tensors[t.name]
-            W0 = weights.head_writer_matrix(L)
-            W = np.array(W0, dtype=np.float32, copy=True)
-            for h, k in heads.get(L, []):
-                _, lo, hi = weights.head_block(L, h)
+        elif t.name in extra and np.ndim(extra[t.name][0]) == 3 and t.name not in head_tensors:
+            st, qt, rec = _expert_bake(t, *extra[t.name], requant, via_f16)    # 専門家の 3 次元: スラブごと
+            plan.append((t.name, st, qt))
+            modified.append(rec)
+            continue
+        elif t.name in targets:
+            W = np.array(_writer_base(weights, t.name), dtype=np.float32, copy=True)
+            hl = head_tensors.get(t.name)
+            for h, k in (heads.get(hl, []) if hl is not None else []):
+                _, lo, hi = weights.head_block(hl, h)
                 W[:, lo:hi] *= k
-            if t.name in extra:                                   # 方向成分の射影: W + B @ A(A は元の W から作った r̂ᵀW)
+            if t.name in extra:                                   # W + B @ A(proj は元の W から作った r̂ᵀW、keyed は α d κᵀ)
                 A, B = extra[t.name]
-                W += (B.astype(np.float64) @ A.astype(np.float64)).astype(np.float32)
+                dW = np.matmul(B.astype(np.float64), A.astype(np.float64))          # 専門家の 3 次元は専門家ごとの積
+                if dW.shape != W.shape:
+                    raise GneError("INTERNAL", f"{t.name}: 变化量形状 {dW.shape} 与原矩阵 {W.shape} 不一致")
+                W += dW.astype(np.float32)
         if W is not None:
+            fallback = None
             if requant == "keep" and t.tensor_type == GGMLQuantizationType.F32:      # 量子化していないモデル: 元の型のまま
                 data, qt = W.astype(np.float32), GGMLQuantizationType.F32
             elif requant == "keep" and t.tensor_type == GGMLQuantizationType.F16:
                 data, qt = W.astype(np.float16), GGMLQuantizationType.F16
             elif requant == "keep" and t.tensor_type == GGMLQuantizationType.BF16:
                 data, qt = gquants.quantize(W, GGMLQuantizationType.BF16), GGMLQuantizationType.BF16
-            elif requant == "f16":
+            elif requant == "f16" or (requant == "auto" and auto_qtype(t.tensor_type) == GGMLQuantizationType.F16):
                 data, qt = W.astype(np.float16), GGMLQuantizationType.F16
             else:
                 data, qt = gquants.quantize(W, GGMLQuantizationType.Q8_0), GGMLQuantizationType.Q8_0
+                if requant == "auto" and dW is not None:            # Q8_0 のままで編集が埋もれるなら F16(KEYED_KEEP_MIN)
+                    kept = edit_kept(_decode_back(data, qt, W.shape), W, dW)
+                    if kept < KEYED_KEEP_MIN:
+                        fallback = {"from": "Q8_0", "edit_kept": kept}
+                        data, qt = W.astype(np.float16), GGMLQuantizationType.F16
             plan.append((t.name, data, qt))
-            modified.append({"tensor": t.name, "from": t.tensor_type.name, "to": qt.name})
+            rec = {"tensor": t.name, "from": t.tensor_type.name, "to": qt.name, "bytes_from": int(t.n_bytes),
+                   "bytes_to": int(data.nbytes)}
+            if dW is not None and not via_f16:                     # 量子化し直しで失った分 ÷ 編集の大きさ、残った編集の割合
+                back = _decode_back(data, qt, W.shape)
+                rec["requant_error"] = float(np.linalg.norm(back - W) / max(float(np.linalg.norm(dW)), 1e-12))
+                rec["edit_kept"] = edit_kept(back, W, dW)
+            if fallback is not None:
+                rec["fallback"] = fallback
+            modified.append(rec)
         else:
             plan.append((t.name, t.data, t.tensor_type))
     if extra and not strip_meta:                                  # CHANGE-06 E.2: 書き換えたテンソルと元の型
@@ -339,7 +583,17 @@ def bake_gain_gguf(weights, recipe: Recipe, dst: str | Path, *, requant: str = "
     for _, data, _ in plan:
         w.write_tensor_data(data, tensor_endianess=weights.reader.endianess)
     w.close()
-    return {"path": str(dst), "modified": modified, "n_tensors": len(plan), "bytes": Path(dst).stat().st_size}
+    out = {"path": str(dst), "modified": modified, "n_tensors": len(plan), "bytes": Path(dst).stat().st_size}
+    errs = [m["requant_error"] for m in modified if "requant_error" in m]
+    if errs:
+        out["requant_error_max"] = max(errs)
+    kept = [m["edit_kept"] for m in modified if "edit_kept" in m]
+    if kept:
+        out["edit_kept_min"] = min(kept)
+    grow = expert_bytes_added(modified)                       # 専門家の 3 次元テンソルを書き換えたときだけ
+    if grow is not None:
+        out["expert_bytes_added"] = grow
+    return out
 
 
 def lora_cache_path(gain_dir: Path, recipe: Recipe) -> Path:

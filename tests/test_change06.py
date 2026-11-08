@@ -126,7 +126,7 @@ def test_unit_matrices_rank_and_math(tmp_path):
     # 方向が混ざると階数 2 と警告
     m2 = unit_matrices(w, dsets, [ProjHead(1, 0, 1.0, "d1"), ProjHead(1, 1, 1.0, "d2"), ProjHead(1, 2, 1.0, "d2")],
                        warn=warn.append)
-    assert m2[1][0].shape == (2, 12) and m2[1][1].shape == (16, 2) and warn and "階数が 2" in warn[0]
+    assert m2[1][0].shape == (2, 12) and m2[1][1].shape == (16, 2) and warn and "秩将为 2" in warn[0]
     # base: 方向セットの基準層の方向を全ヘッドに
     _dirs(tmp_path / "d3.npz", seed=2, base_layer=0)
     d3 = DirectionSet.load(tmp_path / "d3.npz")
@@ -360,6 +360,16 @@ def test_v26_bake_matches_lora(session, tmp_path):
     v = d["verify"]
     assert v["pass"] and v["top1_match"] >= 0.9 and all(g < 0.5 for g in v["top1_mismatch_gaps"]), v
     assert all(x["ok"] for x in v["scores"].values()) and abs(v["ppl_diff_pct"]) < 0.5
+    # 最後の層だけ、合格の線 = 許容誤差 + 書き込みがほぼ 0 の LoRA と LoRA なしの点数の差(計算方法の違いだけで出る誤差)
+    from gne.schemas import BakeVerify
+    BakeVerify.model_validate(v)
+    last, nz = v["last_layer"], v["noise"]
+    if last is not None:
+        assert nz["layer"] == last and nz["lora_scale"] == 1e-6 and nz["max_abs_diff"] >= 0
+        assert v["scores"][f"{last}A"]["threshold"] == pytest.approx(v["scores"][f"{last}A"]["resolution"] + nz["max_abs_diff"])
+    for k, x in v["scores"].items():
+        if int(k[:-1]) != last:
+            assert x["threshold"] == x["resolution"] and "noise" not in x
     f = session.headproj_export(r, tmp_path / "v26f.gguf", bake=True, requant="f16", verify=True)["verify"]
     assert f["pass"] and f["kl_first_token"] <= v["kl_first_token"] + 1e-6, f      # F16 なら Q8_0 より近い
 
@@ -931,8 +941,8 @@ def test_pipeline_target_keywords():
     """目標は数、B(B 側の平均)、mid か省略(A と B の真ん中)。ほかは流す前に断る。"""
     from gne.api import Session
     bs = {"A": 10.0, "B": -6.0}
-    assert Session._pipeline_target(None, bs) == (2.0, "A と B の平均の真ん中")
-    assert Session._pipeline_target("mid", bs)[0] == 2.0 and Session._pipeline_target("b", bs) == (-6.0, "B 側の平均")
+    assert Session._pipeline_target(None, bs) == (2.0, "A 与 B 平均值的中点")
+    assert Session._pipeline_target("mid", bs)[0] == 2.0 and Session._pipeline_target("b", bs) == (-6.0, "B 侧平均值")
     assert Session._pipeline_target("3.5", bs) == (3.5, "settings") and Session._pipeline_target(-1, bs) == (-1.0, "settings")
     with pytest.raises(GneError):
         Session._pipeline_target("half", bs)
@@ -947,7 +957,7 @@ def test_pipeline_target_b_uses_b_mean(session):
     mid = session.heads_pipeline(dict(spec))
     out = session.heads_pipeline(dict(spec), target="B")
     S = str(out["causal"]["score_layers"][-1])
-    assert out["target"] == pytest.approx(out["causal"]["base_scores"][S]["B"]) and out["target_from"] == "B 側の平均"
+    assert out["target"] == pytest.approx(out["causal"]["base_scores"][S]["B"]) and out["target_from"] == "B 侧平均值"
     assert out["allocate"]["remain_threshold"] == pytest.approx(out["target"]) and out["reused"] == ["direction", "causal"]
     assert out["target"] < mid["target"]
     with pytest.raises(GneError):
@@ -985,7 +995,7 @@ def test_eval_direction_metrics_thinned_counted_and_optional(session):
     dm = d["direction_metrics"]
     assert dm["n_a"] == 4 and dm["n_b"] == 4 and 0 < dm["n_behavior"] <= 4 and dm["max_examples"] == 4
     assert d["rows"][1].get("dir_drop_a") is not None and d["rows"][1].get("rate") is not None
-    assert seen and seen[-1][0] == seen[-1][1] and any("方向の指標" in s for _, _, s in seen)
+    assert seen and seen[-1][0] == seen[-1][1] and any("方向指标" in s for _, _, s in seen)
     assert all(x[0] <= x[1] for x in seen)
     e = session.eval(r, doses=(0, 1), direction_metrics=False, name="dm_f")
     assert "direction_metrics" not in e and e["rows"][1].get("dir_drop_a") is None

@@ -143,7 +143,8 @@ def projection_rows(weights, R: np.ndarray, *, layers: list[int] | None = None,
     (ライターを 1 つずつ dequantize するので、層選びで候補が多くても重みを読むのは 1 回)。"""
     m = weights.meta
     if m.n_expert:
-        raise GneError("ARCH_UNSUPPORTED", "MoE 的投影消除不支持 LoRA（请使用 gne ablate --bake）")
+        raise GneError("ARCH_UNSUPPORTED", "MoE 的投影消除不支持 LoRA（请使用 gne ablate --bake）",
+                       "如果只想处理 attention 写入，可用 gne headproj ablate --direction <方向> 生成 LoRA")
     R = np.atleast_2d(np.asarray(R, dtype=np.float32))
     if R.shape[1] != m.n_embd:
         raise GneError("BAD_DIRECTION", f"方向长度 {R.shape[1]} 与 n_embd={m.n_embd} 不同")
@@ -201,7 +202,7 @@ def write_lora_tensors(weights, tensors: dict[str, tuple[np.ndarray, np.ndarray]
     w.write_tensors_to_file()
     w.close()
     return {"path": str(path), "n_tensors": len(tensors), "bytes": Path(path).stat().st_size,
-            "rank": {n: int(np.asarray(B).shape[1]) for n, (_, B) in tensors.items()}}
+            "rank": {n: int(np.asarray(B).shape[-1]) for n, (_, B) in tensors.items()}}   # 専門家の 3 次元 (E, out, r) も最後の軸
 
 
 def write_ablation_lora(weights, rs: dict[str, np.ndarray], rows: dict[str, np.ndarray], path: str | Path, *,

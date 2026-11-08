@@ -49,14 +49,14 @@ def _text(content) -> str:
 def _messages(body: dict) -> list[dict]:
     msgs = body.get("messages")
     if not isinstance(msgs, list) or not msgs:
-        raise GneError("BAD_ARGS", "messages がありません")
+        raise GneError("BAD_ARGS", "缺少 messages")
     out = []
     for m in msgs:
         role = m.get("role")
         if role == "developer":
             role = "system"
         if role not in ("system", "user", "assistant"):
-            raise GneError("BAD_ARGS", f"role={role!r} は扱えません(system / user / assistant)")
+            raise GneError("BAD_ARGS", f"role={role!r} 不受支持（system / user / assistant）")
         out.append({"role": role, "content": _content(m.get("content")) if role == "user" else _text(m.get("content"))})
     return out
 
@@ -75,7 +75,7 @@ def sampling_from(body: dict, recipe: Recipe | None = None):
         if set(given) == {"temperature"} and float(given["temperature"]) <= 0:
             return None
     except (TypeError, ValueError) as e:
-        raise GneError("BAD_ARGS", f"サンプリングの値が読めません: {e}") from e
+        raise GneError("BAD_ARGS", f"无法读取采样参数：{e}") from e
     vals = sampling_values(given, base=base)
     seed = vals.pop("seed", None)
     return Sampling(**vals, seed=seed if seed is not None else int.from_bytes(uuid.uuid4().bytes[:4], "little"))
@@ -95,7 +95,7 @@ def resolve_recipe(session, g: dict) -> tuple[Recipe | None, str]:
     elif units or ablate:
         r = session.recipe(units=list(units) if units else None, ablate=ablate)
     elif rec is not None:
-        raise GneError("BAD_ARGS", "gne.recipe はレシピ名か {units: [...]} です")
+        raise GneError("BAD_ARGS", "gne.recipe 必须是配方名或 {units: [...]}")
     if r is not None and g.get("scale") not in (None, 1, 1.0):
         r = r.scaled(float(g["scale"]))
     when = g.get("when") or (r.when if r is not None else "all")
@@ -123,7 +123,7 @@ def register(app: FastAPI, session, live) -> None:
             w = parse_when(when)
             max_tokens = int(body.get("max_completion_tokens") or body.get("max_tokens") or MAX_TOKENS_DEFAULT)
             if not 1 <= max_tokens <= 4096:
-                raise GneError("BAD_ARGS", "max_tokens は 1〜4096 です")
+                raise GneError("BAD_ARGS", "max_tokens 必须在 1～4096 之间")
             sampling = sampling_from(body, recipe)
         except GneError as e:
             return _err(e)

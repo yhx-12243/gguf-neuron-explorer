@@ -79,7 +79,7 @@ class UIData:
 
     def _check(self, L: int) -> int:
         if not 0 <= L < self.s.meta.n_layer:
-            raise GneError("BAD_ARGS", f"層 {L} は範囲外です")
+            raise GneError("BAD_ARGS", f"层 {L} 超出范围")
         return self.s.weights.n_units(L)             # MoE の層は全専門家の通し番号(CHANGE-05)
 
     def names(self) -> dict[str, str]:
@@ -105,7 +105,7 @@ class UIData:
         from ..dossier import _cos_for_layer
         path = dict(_directions(self.s)).get(name)
         if path is None:
-            raise GneError("NOT_FOUND", f"逆引きの方向 {name!r} がありません", "gne reverse --contrast で作る")
+            raise GneError("NOT_FOUND", f"反向查找方向 {name!r} 不存在", "用 gne reverse --contrast 创建")
         return self._get(("cos", name, L), [path], lambda: _cos_for_layer(self.s, np.load(path), L))
 
     def connections(self):
@@ -145,7 +145,7 @@ class UIData:
         from ..connections import lens_tokens
         c = self.connections()
         if c is None:
-            raise GneError("NOT_FOUND", "connections がありません", "層の右クリックの「connections」(全層ペア、CPU)で作れます")
+            raise GneError("NOT_FOUND", "缺少 connections", "可通过图层右键菜单的“connections”（全层配对，CPU）创建")
         self._check(L)
         out = {}
         for way in ("down", "up"):
@@ -181,7 +181,7 @@ class UIData:
             return rs[0] if rs else None
         hit = next((r for r in rs if r["run"] == run), None)
         if hit is None:
-            raise GneError("NOT_FOUND", f"層 {L} に run {run!r} がありません")
+            raise GneError("NOT_FOUND", f"层 {L} 中没有 run {run!r} ")
         return hit
 
     def records(self, run: str) -> tuple[list[dict], dict]:
@@ -281,7 +281,7 @@ class UIData:
                 v[:] = c["contrib"][:n_ff]
                 meta.update(has=True)
         else:
-            raise GneError("BAD_ARGS", f"overlay {name!r} はありません", f"{', '.join(FIELDS)}, cos:<方向>, writers:<名前>, experts:<名前>")
+            raise GneError("BAD_ARGS", f"overlay {name!r} 不存在", f"{', '.join(FIELDS)}, cos:<方向>, writers:<名前>, experts:<名前>")
         return v, meta
 
     # --- hover(§4.6): steer ±6・logit ±6 の語番号と KL± ------------------------------------------------------
@@ -328,9 +328,9 @@ class UIData:
     def unit(self, L: int, n: int, *, kind: str = "neuron", run: str | None = None) -> dict:
         n_ff = self._check(L)
         if kind not in ("neuron", "random"):
-            raise GneError("BAD_ARGS", "kind は neuron / random です")
+            raise GneError("BAD_ARGS", "kind 必须是 neuron / random")
         if kind == "neuron" and not 0 <= n < n_ff:
-            raise GneError("BAD_ARGS", f"L{L} N{n} は範囲外です")
+            raise GneError("BAD_ARGS", f"L{L} N{n} 超出范围")
         tok = self.tok
         out: dict = {"layer": L, "neuron": n, "kind": kind, "name": None, "down_norm": None, "sweep": None,
                      "steer_lens": None, "logit_lens": None, "directions": {}, "activation": None}
@@ -370,7 +370,7 @@ class UIData:
             break
 
         if out.pop("note_run", None) and out["sweep"] is not None:
-            out["note"] = f"run {run} には順位表が無いので、この層のほかの run({out['sweep']['run']})の結果を出しています"
+            out["note"] = f"run {run} 没有排名表，因此显示该层其他 run（{out['sweep']['run']}）的结果"
             out["note_args"] = {"run": run, "other": out["sweep"]["run"]}                # UI が自分の言語で組み立てる
         if kind == "neuron":
             sl = self.steer_lens(L)
@@ -409,7 +409,7 @@ class UIData:
     def _heads_paths(self, name: str) -> tuple[Path, Path]:
         import re
         if not re.fullmatch(r"[\w.\-]+", name or ""):
-            raise GneError("BAD_ARGS", f"対照分析の名前 {name!r} が不正です")
+            raise GneError("BAD_ARGS", f"对照分析名称 {name!r} 无效")
         d = self.s.store.heads_dir(self.s.meta.model_id)
         return d / f"{name}.json", d / f"{name}.candidates.jsonl"
 
@@ -434,7 +434,7 @@ class UIData:
     def writers_summary(self, name: str) -> dict:
         p = self.s.store.root / "writers" / self.s.meta.model_id / f"{name}.json"
         if not re.fullmatch(r"[\w.\-]+", name) or not p.exists():
-            raise GneError("FILE_NOT_FOUND", f"書き手の分析 {name} がありません")
+            raise GneError("FILE_NOT_FOUND", f"写入者分析 {name} 不存在")
         return json.loads(p.read_text())
 
     def heads_list(self) -> list[dict]:
@@ -462,7 +462,7 @@ class UIData:
         p, cp = self._heads_paths(name)
         s = self.heads_summary(name)
         if s is None or not cp.exists():
-            raise GneError("NOT_FOUND", f"ヘッドの対照分析 {name} がありません", "gne heads contrast で作れます")
+            raise GneError("NOT_FOUND", f"注意力头对照分析 {name} 不存在", "可用 gne heads contrast 创建")
 
         def build():
             out = {k: v for k, v in s.items() if k != "top"}
@@ -483,7 +483,7 @@ class UIData:
     def head(self, L: int, h: int, *, lens: bool = True) -> dict:
         """ヘッドの調書(gne.heads.head_dossier)。W_O ブロックの logit lens は重みだけで決まるので 1 回だけ計算して覚える
         (語彙全体との内積なので大きいモデルでは数秒。lens=False なら覚えていればそれ、無ければ None で先に返す)。
-        保存済みの対照分析ごとに、その床(対照の p95)も添える。"""
+        保存済みの対照分析ごとに、その基準値(中立どうしの差の p95)も添える。"""
         self._check(L)
         d = self.s.head(L, h, lens=False)
         key = ("head_lens", L, h)
@@ -509,7 +509,7 @@ class UIData:
     def _causal_paths(self, name: str) -> tuple[Path, Path, Path]:
         from ..causal import causal_paths
         if not re.fullmatch(r"[\w.\-]+", name or ""):
-            raise GneError("BAD_ARGS", f"因果スクリーニングの名前 {name!r} が不正です")
+            raise GneError("BAD_ARGS", f"因果筛选名称 {name!r} 无效")
         pj, ps = causal_paths(self.s, name)
         return pj, ps, pj.with_name(f"{name}.alloc.json")
 
@@ -560,7 +560,7 @@ class UIData:
         s = self.causal_summary(name)
         rows = self.causal_rows(name)
         if s is None and not rows:
-            raise GneError("NOT_FOUND", f"因果スクリーニング {name} がありません", "gne heads causal で作れます")
+            raise GneError("NOT_FOUND", f"因果筛选 {name} 不存在", "可用 gne heads causal 创建")
         s = s or {}
         return {"name": name, "direction": s.get("direction"), "score_layers": s.get("score_layers"), "primary": s.get("primary"),
                 "base_scores": s.get("base_scores"), "layer_rows": s.get("layer_rows") or [],
@@ -587,7 +587,7 @@ class UIData:
                         "score_layers": x.get("score_layers"), "base_scores": s.get("base_scores"), "rows": mine, "rank": rank})
         return out
 
-    # --- CHANGE-06 G: 方向(gne direction)の速い物差し。direction ビュー・recipe タブの proj の方向 ------------------
+    # --- CHANGE-06 G: 方向(gne direction)の速い指標。direction ビュー・recipe タブの proj の方向 ------------------
     def directions_list(self) -> list[dict]:
         """gne direction で作った方向セット(逆引きの方向は入れない)。基準層(gne direction score で記録したもの)など。"""
         from ..direction import base_layer_of
@@ -613,10 +613,10 @@ class UIData:
     def direction_one(self, name: str) -> dict:
         """方向セット 1 つ: 一覧の項目に、層どうしの方向の cos(行列)と、層ごとの mean_A − mean_B の長さ。モデルは使わない。"""
         if not re.fullmatch(r"[\w.\-]+", name or ""):
-            raise GneError("BAD_ARGS", f"方向の名前 {name!r} が不正です")
+            raise GneError("BAD_ARGS", f"方向名 {name!r} 无效")
         it = next((x for x in self.directions_list() if x["name"] == name), None)
         if it is None:
-            raise GneError("NOT_FOUND", f"方向 {name} がありません", "gne direction --contrast <対照集合> で作れます")
+            raise GneError("NOT_FOUND", f"方向 {name} 不存在", "可用 gne direction --contrast <对照集> 创建")
         ds = self.s.direction_set(name)
 
         def build():
@@ -626,7 +626,8 @@ class UIData:
         return {**it, **self._get(("direction_cos", name), [ds.path], build)}
 
     def recipe_extras(self, name: str) -> dict:
-        """保存したレシピの、proj のユニット(CHANGE-06)が使う方向の既定(default_direction)と方向の層(direction_layer)。"""
+        """保存したレシピの、proj・keyed のユニット(CHANGE-06・07)が使う方向の既定(default_direction)と方向の層
+        (direction_layer)、keyed のユニットが使う鍵の既定(default_key)。"""
         import yaml
         p = self.s.store.recipes_dir() / f"{name}.yaml"
 
@@ -635,13 +636,77 @@ class UIData:
                 d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
             except (OSError, ValueError, yaml.YAMLError):
                 d = {}
-            return {"default_direction": d.get("default_direction") or None, "direction_layer": str(d.get("direction_layer") or "own")}
+            if not isinstance(d, dict):
+                d = {}
+            return {"default_direction": d.get("default_direction") or None, "direction_layer": str(d.get("direction_layer") or "own"),
+                    "default_key": None if d.get("default_key") in (None, "") else str(d["default_key"])}
         return self._get(("recipe_extras", name), [p], build)
+
+    # --- CHANGE-07 G: 鍵つきの書き込み(direction ビューの「鍵」、recipe タブの keyed の鍵の選択) ----------------------------
+    def keys_list(self) -> list[dict]:
+        """<root>/keys/<model_id>/ の鍵の要約(Session.keys、パスなし)。ファイルの更新時刻が変わるまで覚えておく。"""
+        d = self.s.store.key_dir(self.s.meta.model_id)
+        ps = sorted(d.glob("*.npz"))
+        return self._get(("keys", tuple(p.name for p in ps)), ps, self.s.keys)
+
+    def key_one(self, name: str) -> dict:
+        """鍵 1 つ: 要約(層ごとの kn・gain・q_rank、作成の条件)と、作成のときの記録(mode・作成に使った例での AUC・外した層・
+        弱い層・dont_touch・返事の出どころ・比較用の鍵の本数)。モデルは使わない。"""
+        from ..keyed import load_key
+        if not re.fullmatch(r"[\w.][\w.\-]*", name or ""):
+            raise GneError("BAD_ARGS", f"键名 {name!r} 无效")
+        p = self.s.store.key_dir(self.s.meta.model_id) / f"{name}.npz"
+        if not p.exists():
+            raise GneError("NOT_FOUND", f"键 {name} 不存在", "可在 direction 视图的“键”中创建，或使用 gne direction key")
+
+        def build():
+            ks = load_key(self.s, name)
+            info = ks.info or {}
+            keep = ("mode", "positions_b", "q_energy", "q_max_rank", "q_max_samples", "pseudo", "pseudo_method", "seed", "contrast",
+                    "replies", "dont_touch", "iv", "dropped", "weak", "q_rows", "build_auc")
+            return {**ks.summary(), "model_id": ks.model_id, "info": {k: info[k] for k in keep if k in info}}
+        return self._get(("key", name), [p], build)
+
+    def contrasts_list(self) -> list[dict]:
+        """鍵を作る対照集合の候補: リポジトリの configs/contrast/*.yaml と、<root>/contrasts/*.yaml(UI や JSON から受け取った
+        もの)。中身は YAML を読んで要約だけ(名前・質問の数・positions・dont_touch の群の名前・返事を持つか・mode)。
+        mode は positions が before:<正規表現> なら same(推論時と同じ文脈の返事の位置で書き込みたい位置を作る)、それ以外は system。"""
+        import yaml
+
+        from ..store import CONFIGS
+        out = []
+        for src, d in (("configs", CONFIGS / "contrast"), ("root", self.s.store.contrast_dir())):
+            if not d.is_dir():
+                continue
+            for p in sorted(d.glob("*.yaml")):
+                def build(p=p):
+                    try:
+                        x = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+                    except (OSError, ValueError, yaml.YAMLError):
+                        return None
+                    if not isinstance(x, dict):
+                        return None
+                    qs = [x.get(k) for k in ("user_prompts", "prompts_a", "prompts_b")]
+                    n = max((len(q) for q in qs if isinstance(q, list)), default=None)
+                    dts = x.get("dont_touch") if isinstance(x.get("dont_touch"), list) else []
+                    pos = x.get("positions")
+                    return {"name": str(x.get("name") or p.stem), "positions": None if pos is None else str(pos),
+                            "positions_b": None if x.get("positions_b") is None else str(x["positions_b"]),
+                            "n_prompts": n, "dont_touch": [str(t.get("name") or f"dt{i}") if isinstance(t, dict) else f"dt{i}"
+                                                           for i, t in enumerate(dts)],
+                            "replies": any(x.get(k) is not None for k in ("replies", "replies_a", "replies_b")),
+                            "system_a": bool(x.get("system_a")), "recipe": x.get("recipe_a") is not None or x.get("recipe_b") is not None,
+                            "mode": "same" if str(pos or "").startswith("before:") else "system"}
+                it = self._get(("contrast", str(p)), [p], build)
+                if it is not None:
+                    label = f"configs/contrast/{p.name}" if src == "configs" else f"contrasts/{p.name}"
+                    out.append({**it, "file": p.stem, "label": label, "src": src, "path": str(p.resolve())})
+        return out
 
     # --- 方向とヘッドの一括(head_pipeline のジョブ、Session.heads_pipeline): direction ビューの「JSON から作る」 ----------
     def _pipeline_path(self, name: str) -> Path:
         if not re.fullmatch(r"[\w.\-]+", name or ""):
-            raise GneError("BAD_ARGS", f"名前 {name!r} が不正です")
+            raise GneError("BAD_ARGS", f"名称 {name!r} 无效")
         return self.s.store.heads_dir(self.s.meta.model_id) / f"{name}.pipeline.json"
 
     def _pipeline(self, name: str, p: Path) -> dict:
@@ -679,9 +744,19 @@ class UIData:
     @staticmethod
     def pipeline_templates() -> list[dict]:
         """用途別の質問集のテンプレート(configs/pipeline/*.json): ファイル名・説明(about の ja / en)・中身(about を除く)。"""
+        return UIData._templates("pipeline")
+
+    @staticmethod
+    def keyed_templates() -> list[dict]:
+        """鍵つきの書き込みの対照集合のひな形(configs/keyed/*.json、鍵のタブの「ひな形」): pipeline_templates と同じ形。
+        中身の keyed(UI の欄の既定と、「+ レシピ」の α)はそのまま残す(ジョブが対照集合に書くときに捨てる)。"""
+        return UIData._templates("keyed")
+
+    @staticmethod
+    def _templates(sub: str) -> list[dict]:
         from ..store import CONFIGS
         out = []
-        for p in sorted((CONFIGS / "pipeline").glob("*.json")):
+        for p in sorted((CONFIGS / sub).glob("*.json")):
             try:
                 d = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -701,7 +776,7 @@ class UIData:
         import yaml
         p = self._pipeline_path(name)
         if not p.exists():
-            raise GneError("NOT_FOUND", f"一括の結果 {name} がありません", "direction ビューの「JSON から方向とヘッドを作る」で作れます")
+            raise GneError("NOT_FOUND", f"批处理结果 {name} 不存在", "可在 direction 视图的“从 JSON 创建方向和注意力头”中创建")
         x = self._pipeline(name, p)
         spec = None
         c = Path(str(x.get("contrast") or ""))
@@ -716,9 +791,9 @@ class UIData:
     def _candidates_name(self, name: str) -> str:
         """名前だけを受け付ける(Session.candidates_path はパスも受けるので、UI からはファイルの場所を指させない)。"""
         if not re.fullmatch(r"[\w.\-]+", name or ""):
-            raise GneError("BAD_ARGS", f"候補の名前 {name!r} が不正です")
+            raise GneError("BAD_ARGS", f"候选名称 {name!r} 无效")
         if not (self.s.store.heads_dir(self.s.meta.model_id) / f"{name}.candidates.json").exists():
-            raise GneError("NOT_FOUND", f"候補の結果 {name} がありません", "パイプラインの結果の「候補を作る」で作れます")
+            raise GneError("NOT_FOUND", f"候选结果 {name} 不存在", "可通过流水线结果的“生成候选”创建")
         return name
 
     def candidates_list(self) -> list[dict]:
@@ -739,9 +814,9 @@ class UIData:
     def candidates_score(self, name: str, scores) -> dict:
         """点({番号: [P, C]} か「番号 P C」の行)を採点のファイルに足して集計し直す。同時に来ても書き込みは 1 つずつ。"""
         if not isinstance(scores, dict | str):
-            raise GneError("BAD_ARGS", "scores は {番号: [P, C]} か「番号 P C」の行です")
+            raise GneError("BAD_ARGS", "scores 必须是 {编号: [P, C]} 或“编号 P C”行")
         if isinstance(scores, dict) and not all(isinstance(v, list | tuple) and len(v) == 2 for v in scores.values()):
-            raise GneError("BAD_ARGS", "scores の値は [P, C] です")
+            raise GneError("BAD_ARGS", "scores 的值必须是 [P, C]")
         name = self._candidates_name(name)
         with self._guard_scores:
             d = self.s.heads_candidates_tally(name, scores=scores)
@@ -751,9 +826,9 @@ class UIData:
     def search(self, q: str, *, mode: str = "lens", limit: int = 500) -> dict:
         qq = q.casefold().strip()
         if not qq:
-            raise GneError("BAD_ARGS", "検索語が空です")
+            raise GneError("BAD_ARGS", "搜索词为空")
         if mode not in ("lens", "words", "name"):
-            raise GneError("BAD_ARGS", "mode は lens / words / name です")
+            raise GneError("BAD_ARGS", "mode 必须是 lens / words / name")
         hits: dict[tuple[int, int], dict] = {}
 
         def add(L, n, where, pos, token, score):

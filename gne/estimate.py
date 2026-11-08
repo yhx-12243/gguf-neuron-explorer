@@ -165,8 +165,28 @@ def estimate(session, kind: str, params: dict) -> dict:
                 per += sp.gen(len(items), st.max_tokens[cat], 8 if when == "all" else 1)
         per += len(st.ppl) * 4 * sp.setprefill / 1000
         n_ctrl = int(p.get("random_controls", 0))
+        kd = _keyed_eval(session, sp, p, n_d - 1, n_ctrl)          # CHANGE-07: keyed のレシピの eval の選択性(prefill だけ)
+        if kd is not None:
+            n_ctrl = kd["controls"]                                # keyed の対照は鍵の比較用の鍵の本数まで
         sec = per * (n_d + n_ctrl * (n_d - 1))
         detail = {"doses": n_d, "seconds_per_dose": round(per, 1)}
+        if kd is not None:
+            sec += kd["seconds"]
+            detail["keyed"] = kd
+    elif kind in ("direction_key", "direction_key_check", "direction_key_experts"):   # CHANGE-07: 鍵の作成・確かめ
+        kd = _keyed_job(session, sp, kind, p)
+        sec = kd["seconds"]
+        detail = kd
+    elif kind == "direction_key_pipeline":                     # CHANGE-07: 方向(返事を作る)+ 鍵 + key-check
+        kd = _keyed_pipeline(session, sp, p)
+        sec = kd["seconds"]
+        detail = kd
+    elif kind == "direction_key_verify":                       # CHANGE-07 V30: 文を無介入 1 回 + α ごとに 1 回流す(生成なし)
+        n_t = len(p.get("texts") or []) if not isinstance(p.get("texts"), str) else len([x for x in p["texts"].splitlines() if x.strip()])
+        n_t = n_t or 2
+        n_a = len(p.get("alphas") or (1.0, 2.0))
+        sec = (1 + n_a) * n_t * sp.setprefill / 1000 + 1.0       # + LoRA を作る分
+        detail = {"texts": n_t, "alphas": n_a}
     elif kind == "connections":
         from .connections import dense_layers
         Ls = dense_layers(session.weights)
@@ -215,7 +235,7 @@ def estimate(session, kind: str, params: dict) -> dict:
             per_a = int(p.get("hard", 16))
         sec = trials * (per_a + b) * sp.setprefill / 1000 * 1.2
         detail = {"trials": trials, "prefills_per_trial": per_a + b}
-    elif kind == "head_pipeline":                               # 方向(全部の質問)+ 物差し + 因果 + 配分(間引いた質問)
+    elif kind == "head_pipeline":                               # 方向(全部の質問)+ 射影の値 + 因果 + 配分(間引いた質問)
         spec = p.get("spec") or {}
         if not isinstance(spec, dict):
             import yaml
@@ -295,6 +315,197 @@ def estimate(session, kind: str, params: dict) -> dict:
             "needs_confirm": bool(sec is not None and sec > CONFIRM_S)}
 
 
+# --- CHANGE-07: 鍵つきの書き込み(keyed)----------------------------------------------------------------------
+# 鍵の作成(direction_key)・確かめ(direction_key_check)・専門家の選ばれ方(direction_key_experts)と、eval の keyed の選択性
+# (keyed_eval.KeyedMetrics)は、どれも対照集合の会話を 1 本ずつ prefill して捕捉する(返事を与えていない組は無介入で 1 回だけ
+# 生成する)。会話 1 本(60〜120 トークン)の prefill は set_cvec + prefill(4 本 × 20 トークン)1 回とみる。
+# 実測(granite-3.1-1b-a400m Q8_0、CPU、ずんだもんの語尾の対照集合で返事は与えたもの、expert:e の鍵): 鍵の作成 5.5 秒、
+# key-check 6 秒。この式ではどちらも 6.2 秒(会話 8 本 + dont_touch の英語 2 本、英語の返事は 32 トークン生成)。
+
+
+def _key_sets(spec, pos_a: str, pos_b: str | None, subset: str, replies_a=None, replies_b=None) -> list[tuple[int, list[str], bool]]:
+    """keyed_build._plan と同じ会話の組を、会話の数・位置・返事があるかだけ数える(介入は作らない。見積もり用)。
+    戻り値 [(会話の数, [位置の書き方], 返事が与えてあるか)]。"""
+    from .direction import _subset
+    from .keyed_build import _resolve_mode, parse_positions
+    cs = spec.contrast
+    pa = parse_positions(pos_a)
+    mode, pb = _resolve_mode(pa, pos_b)
+    out = []
+    if mode == "system":
+        for side, pos, rep in (("A", pa, replies_a), ("B", pb, replies_b)):
+            n = len(_subset(len(cs.prompts(side)), subset))
+            out.append((n, [pos.text], rep is not None or spec.replies.get(side) is not None))
+    else:
+        rep = replies_b if replies_b is not None else replies_a
+        n = len(_subset(len(cs.prompts("B")), subset))
+        given = rep is not None or spec.replies.get("same") is not None or spec.replies.get("B") is not None
+        out.append((n, [pa.text, pb.text], given))
+    for dt in spec.dont_touch:
+        out.append((len(_subset(len(dt.prompts), subset)), [dt.positions or pb.text], dt.replies is not None))
+    return out
+
+
+def _plan_cost(sp: Speed, sets, max_tokens: int, max_examples: int | None = None) -> dict:
+    """_key_sets の会話の組 → 会話の数・書き込みたい位置を含む会話の数・生成する会話の数と、prefill 1 回分 + 生成の秒数。
+    max_examples は組ごとに読む会話の数の上限(eval の keyed_examples、等間隔に間引く)。"""
+    from .keyed_build import parse_positions
+    n = n_a = n_gen = 0
+    gen_s = 0.0
+    for i, (k0, groups, given) in enumerate(sets):
+        k = min(k0, max_examples) if max_examples else k0
+        n += k
+        n_a += k if i == 0 else 0                     # 書き込みたい位置は最初の組(mode system の A、mode same の AB)
+        if not given and any(parse_positions(x).needs_reply for x in groups):
+            n_gen += k
+            gen_s += sp.gen(k, int(max_tokens))
+    return {"conversations": n, "conversations_a": n_a, "generated": n_gen, "max_tokens": int(max_tokens),
+            "seconds": gen_s + n * sp.setprefill / 1000}
+
+
+def _spec_of(p: dict):
+    """見積もりの対照集合: p の spec(UI の入力欄の表)か contrast(パス)→ (KeySpec, keyed の設定)。表は一時ファイルに書いて
+    読む(本番は <root>/contrasts/ に書く。見積もりでは置き場所を変えない)。"""
+    import tempfile
+
+    import yaml
+
+    from .keyed_build import _as_spec, read_key_spec
+    from .keyed_pipeline import clean_spec, file_settings
+    if p.get("spec") is not None:
+        d, settings = clean_spec(p["spec"])
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / f"{d['name']}.yaml"
+            path.write_text(yaml.safe_dump(d, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            return read_key_spec(path), settings
+    c = p["contrast"]
+    return _as_spec(c), (file_settings(c) if isinstance(c, str | Path) else {})
+
+
+def _keyed_pipeline(session, sp: Speed, p: dict) -> dict:
+    """direction_key_pipeline の見積もり: 方向(A・B の返事を response_tokens まで作って流す。同じ名前の方向があって作り直さない
+    なら 0)+ 鍵の作成 + 作成と反対側の subset での key-check。"""
+    try:
+        spec, settings = _spec_of(p)
+        q = {**{k: v for k, v in settings.items() if k != "alpha"}, **{k: v for k, v in p.items() if v is not None}}
+        cs = spec.contrast
+        dname = q.get("direction") or cs.name
+        try:
+            session.direction_set(dname)
+            have = True
+        except Exception:  # noqa: BLE001
+            have = False
+        dir_s = 0.0
+        if not have or q.get("rebuild_direction"):
+            n_conv = len(cs.prompts("A")) + len(cs.prompts("B"))
+            dir_s = n_conv * sp.setprefill / 1000 * 2 + sp.gen(len(cs.prompts("A")), int(q.get("response_tokens") or 96)) \
+                + sp.gen(len(cs.prompts("B")), int(q.get("response_tokens") or 96))
+        pos = q.get("positions") or spec.positions or "response"
+        pos_b = q.get("positions_b") or spec.positions_b
+        subset = q.get("subset") or "even"
+        mt = int(q.get("max_tokens") or 96)
+        build = _plan_cost(sp, _key_sets(spec, pos, pos_b, subset, q.get("replies_a"), q.get("replies_b")), mt)
+        check = {"seconds": 0.0}
+        if q.get("check", True) is not False:
+            sub = q.get("check_subset") or {"even": "odd", "odd": "even"}.get(subset, "all")
+            check = _plan_cost(sp, _key_sets(spec, pos, pos_b, sub, q.get("replies_a"), q.get("replies_b")), mt)
+        return {"direction_seconds": dir_s, "direction_reused": have and not q.get("rebuild_direction"),
+                "build": build, "check": check, "seconds": dir_s + build["seconds"] + check["seconds"]}
+    except Exception:  # noqa: BLE001  対照集合が読めなくても見積もりで止めない(本番がエラーを返す)
+        return {"seconds": 3 * 32 * sp.setprefill / 1000, "guess": True}
+
+
+def _keyed_job(session, sp: Speed, kind: str, p: dict) -> dict:
+    """direction_key・direction_key_check・direction_key_experts の見積もり(会話の prefill と返事の生成)。"""
+    from .keyed_build import _as_spec
+    try:
+        if kind == "direction_key_check":
+            from .keyed import load_key
+            ks = load_key(session, str(p["key"]))
+            if p.get("contrast") is None:                       # 鍵に保存した作成時の例で測る(捕捉なし)
+                return {"conversations": 0, "conversations_a": 0, "generated": 0, "max_tokens": 0, "seconds": 0.0}
+            spec = _as_spec(p["contrast"])
+            pos = p.get("positions") or ks.positions or "response"
+            pos_b = p.get("positions_b") or (ks.info.get("positions_b") if p.get("positions") is None else None)
+            mt = p.get("max_tokens") or ks.max_tokens
+            subset = p.get("subset") or "odd"
+        else:
+            spec, settings = _spec_of(p)
+            p = {**{k: v for k, v in settings.items() if k != "alpha"}, **{k: v for k, v in p.items() if v is not None}}
+            pos = p.get("positions") or spec.positions or "response"
+            pos_b = p.get("positions_b") or spec.positions_b
+            mt = p.get("max_tokens") or 96
+            subset = p.get("subset") or "even"
+        sets = _key_sets(spec, pos, pos_b, subset, p.get("replies_a"), p.get("replies_b"))
+        return _plan_cost(sp, sets, int(mt))
+    except Exception:  # noqa: BLE001  対照集合が読めなくても見積もりで止めない(本番がエラーを返す)
+        return {"conversations": None, "seconds": 32 * sp.setprefill / 1000, "guess": True}
+
+
+def _eval_recipe(session, p: dict):
+    """eval の見積もりのレシピ: params の recipe(Recipe か保存したレシピの名前・パス)か units(ユニットの書き方)。"""
+    from .steer import Recipe, parse_unit
+    r = p.get("recipe")
+    if isinstance(r, Recipe):
+        return r
+    if p.get("units"):
+        return Recipe([parse_unit(u) for u in p["units"]], session.meta.model_id)
+    if r:
+        return Recipe.load(session.recipe_path(r))
+    return None
+
+
+def _keyed_eval(session, sp: Speed, p: dict, n_nonzero: int, n_ctrl: int) -> dict | None:
+    """eval が keyed のレシピで余分にする仕事(keyed_eval.KeyedMetrics、evalx.evaluate の進み具合と同じ数え方): 返事の生成
+    (対照集合に返事が無い組だけ、1 回)+ 会話の prefill(無介入 1 回 + 0 以外の倍率ごと + 対照(比較用の鍵)ごと + 方式の比較と
+    比較用の鍵の選択性 block_cost)。keyed でない・keyed_metrics=False なら None。対照集合が分からず eval が keyed を飛ばすなら 0 秒。
+    戻り値 {"seconds", "controls"(比較用の鍵の本数で抑えた対照の数), 会話の数など}。"""
+    if p.get("keyed_metrics") is False:
+        return None
+    try:
+        r = _eval_recipe(session, p)
+    except Exception:  # noqa: BLE001
+        return None
+    if r is None or not r.keyed_units:
+        return None
+    from .keyed_eval import DEFAULT_EXAMPLES, DEFAULT_PSEUDO, MATCH_STEPS
+    mx = p.get("keyed_examples", DEFAULT_EXAMPLES) or None
+    match = p.get("keyed_match", True) is not False
+    pseudo = int(p.get("keyed_pseudo", DEFAULT_PSEUDO) or 0)
+
+    def plan():                                   # keyed_eval.KeyedMetrics と keyed_build.eval_plan と同じ対照集合・位置・subset
+        from .keyed import keyed_units, load_key, split_key_spec
+        from .keyed_build import _as_spec, opposite_subset
+        from .keyed_eval import resolve_keyed_contrast
+        ku = keyed_units(r)
+        ks = load_key(session, split_key_spec(ku[0].key)[0])
+        kc = p.get("keyed_contrast")                 # 名前も受ける(Session.eval と同じ)
+        kc = session._contrast_file(kc) if kc else None
+        spec, _ = resolve_keyed_contrast(session, ks, session.direction_set(ku[0].direction), kc)
+        if spec is None:
+            return None, ks
+        sub = p.get("keyed_subset") or opposite_subset(ks.subset)
+        sets = _key_sets(_as_spec(spec), ks.positions or "response", ks.info.get("positions_b"), sub)
+        return _plan_cost(sp, sets, int(ks.max_tokens), mx), ks
+    try:
+        cost, ks = plan()
+    except Exception:  # noqa: BLE001  鍵・対照集合が読めなくても見積もりで止めない(eval が keyed を飛ばして warnings に書く)
+        k = mx or DEFAULT_EXAMPLES
+        cost, ks = {"conversations": 3 * k, "conversations_a": k, "generated": 0, "max_tokens": 0,
+                    "seconds": 3 * k * sp.setprefill / 1000, "guess": True}, None
+    if cost is None:                                             # eval は keyed を測らない(skipped)
+        return {"seconds": 0.0, "controls": n_ctrl, "skipped": True}
+    if ks is not None:
+        n_ctrl = min(n_ctrl, int(ks.n_pseudo))
+        pseudo = min(pseudo, int(ks.n_pseudo))
+    n, n_a = cost["conversations"], cost["conversations_a"]
+    block = (2 + (3 if match else 0)) * n + pseudo * n + (3 * MATCH_STEPS * n_a if match else 0)
+    prefills = n * (1 + n_nonzero + n_ctrl * n_nonzero) + block
+    gen_s = cost["seconds"] - n * sp.setprefill / 1000
+    sec = gen_s + prefills * sp.setprefill / 1000
+    return {**cost, "prefills": prefills, "pseudo": pseudo, "match": match, "controls": n_ctrl, "seconds": round(sec, 1)}
+
+
 def fmt_seconds(s: float | None) -> str:
     if s is None:
         return "—"
@@ -302,7 +513,7 @@ def fmt_seconds(s: float | None) -> str:
         return f"{s:.0f} 秒"
     if s < 5400:
         return f"{s / 60:.0f} 分"
-    return f"{s / 3600:.1f} 時間"
+    return f"{s / 3600:.1f} 小时"
 
 
 def fit_count(per_unit_s: float, budget_s: float, fixed_s: float = 0.0, *, lo: int = 1, hi: int | None = None) -> int:

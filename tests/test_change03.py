@@ -167,7 +167,7 @@ def test_parse_budget_and_spec():
     with pytest.raises(GneError):
         parse_budget("soon")
     assert fit_count(2.0, 100, 10) == 45 and fit_count(2.0, 5, 10) == 1 and fit_count(1.0, 100, hi=7) == 7
-    assert fmt_seconds(45) == "45 秒" and fmt_seconds(1800) == "30 分" and fmt_seconds(7200) == "2.0 時間"
+    assert fmt_seconds(45) == "45 秒" and fmt_seconds(1800) == "30 分" and fmt_seconds(7200) == "2.0 小时"
     assert _spec([5, 0, 1, 2, 9, 7, 8]) == "0-2,5,7-9"
 
 

@@ -177,7 +177,7 @@ class Verifier:
         tol_med, tol_max = V2_TOL.get(self.w.meta.ffn_down_qtype, V2_TOL_DEFAULT)
         med, mx = float(np.median(rel)), float(rel.max())
         ok = med < tol_med and mx < tol_max and float(np.median(rel_shift)) > 0.5
-        return VResult("V2", "FFN 线性性（W_down 的方向・下标，down 之后无变换）", "pass" if ok else "fail",
+        return VResult("V2", "FFN 线性性（W_down 的方向、下标，down 之后无变换）", "pass" if ok else "fail",
                        f"L{L} `{act}` → W_down@a vs `ffn_out-{L}`：相对误差 中位数 {med:.4f} / 最大 {mx:.4f}"
                        f"（允许 {tol_med}/{tol_max}，{len(rel)} 个 token）。将下标错开 1 后中位数为 {np.median(rel_shift):.2f}",
                        {"act_name": act, "median": med, "max": mx, "shift_median": float(np.median(rel_shift)),
@@ -336,7 +336,7 @@ class Verifier:
                         "base_med_dev": float(np.median([x["base_dev_med"] for x in rows])), "rows": rows})
         detail = "; ".join(f"{v['kind']}（{v['n_tensors']} 个张量、r 分量期望值 {v['expect']}）：最大 {v['max_dev']:.2e}"
                            f"（消除前中位数 {v['base_med_dev']:.2e}）、与 r 正交分量的变化第 0 层为 "
-                           f"{v['rows'][0]['perp_change_med']:.3f}・末层为 {v['rows'][-1]['perp_change_med']:.3f}" for v in out)
+                           f"{v['rows'][0]['perp_change_med']:.3f}、最后一层为 {v['rows'][-1]['perp_change_med']:.3f}" for v in out)
         lora = out[0]
         return VResult("V13", "方向投影消除", "pass" if ok else "fail",
                        f"随机方向（{len(ids)} 个 token、第 0～{lora['rows'][-1]['layer']} 层、将嵌入"

@@ -1,5 +1,6 @@
 """UI のライブ機能(別冊 U2): 3 列チャットの逐次生成、fires、reads you、レシピ、cvec の書き出し、ジョブ。
 CHANGE-04 G: HEAD パネルの注目のパターン(attention)と、fires の文章でのヘッドの注目(fires_heads)。
+CHANGE-07 G: レシピの keyed のユニット(鍵と α)。keyed は cvec に入らない(書き出しは headproj_export のジョブ)。
 
 GPU を使う処理は GpuArbiter を通す。ジョブ(sweep・lens など)はユニットの切れ目で GPU を譲るので、
 チャットや fires はジョブの実行中でも数秒以内に始まる(§8.1)。
@@ -64,10 +65,10 @@ class Live:
         when は足す位置(§6.15)。列ごとに指定が無ければ全体の when、それも無ければ all。"""
         cols = body.get("columns") or []
         if not cols or len(cols) > 6:
-            raise GneError("BAD_ARGS", "columns は 1〜6 列です")
+            raise GneError("BAD_ARGS", "columns 必须在 1～6 列之间")
         max_tokens = int(body.get("max_tokens", 128))
         if not 1 <= max_tokens <= 2048:
-            raise GneError("BAD_ARGS", "max_tokens は 1〜2048 です")
+            raise GneError("BAD_ARGS", "max_tokens 必须在 1～2048 之间")
         recipes = [self.recipe(c.get("units") or [], ablate=c.get("ablate")) for c in cols]   # 形式の誤りは始める前に返す
         from ..when import generate_when, parse_when
         whens = [parse_when(c.get("when") or body.get("when") or "all") for c in cols]
@@ -76,7 +77,7 @@ class Live:
             from ..engine import Sampling
             from ..steer import SAMPLING_PRESETS, sampling_values
             if not isinstance(body["sampling"], dict):
-                raise GneError("BAD_ARGS", "sampling は {seed, temperature, top_k, top_p, min_p, presence_penalty} の表です")
+                raise GneError("BAD_ARGS", "sampling 必须是 {seed, temperature, top_k, top_p, min_p, presence_penalty} 映射表")
             vals = sampling_values(body["sampling"], base=SAMPLING_PRESETS["common"])
             seed = vals.pop("seed", None)
             sampling = Sampling(**vals, seed=seed if seed is not None else int.from_bytes(uuid.uuid4().bytes[:4], "little"))
@@ -104,8 +105,8 @@ class Live:
                             msgs = ([{"role": "system", "content": system}] if system else []) + hist[i]
                             ids = e.chat_ids(msgs)
                             if len(ids) + max_tokens > e.n_ctx:
-                                raise GneError("CONTEXT_FULL", f"会話が長すぎます({len(ids)} トークン、n_ctx {e.n_ctx})",
-                                               "会話をやり直すか、max_tokens を減らしてください")
+                                raise GneError("CONTEXT_FULL", f"会话过长（{len(ids)} token，n_ctx {e.n_ctx}）",
+                                               "请重开会话，或减少 max_tokens")
                             vecs = self.s.vectors(r)[0] if r is not None else None
                             q.put({"type": "column", "col": i, "n_prompt": len(ids)})
                             dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -163,7 +164,7 @@ class Live:
     def fires(self, text: str, *, top: int = 50) -> dict:
         from ..fires import fires
         if not text or not text.strip():
-            raise GneError("BAD_ARGS", "文章が空です")
+            raise GneError("BAD_ARGS", "文本为空")
         r, warns = self._gpu(lambda: fires(self.s, text, top=top, keep_max=True))
         fid = uuid.uuid4().hex[:8]
         with self._lock:
@@ -176,7 +177,7 @@ class Live:
     def _fire(self, fid: str) -> dict:
         f = self._fires.get(fid)
         if f is None:
-            raise GneError("NOT_FOUND", f"fires {fid} はもうありません", "文章をもう一度流してください")
+            raise GneError("NOT_FOUND", f"fires {fid} 已不存在", "请重新输入文本")
         return f
 
     def fires_fields(self, fid: str, tok: int) -> tuple[bytes, list[int], dict]:
@@ -196,7 +197,7 @@ class Live:
                     while len(f["by_token"]) > FIRES_TOKEN_KEEP:
                         f["by_token"].popitem(last=False)
         else:
-            raise GneError("BAD_ARGS", f"tok は -1 か 1〜{len(f['ids']) - 1} です")
+            raise GneError("BAD_ARGS", f"tok 必须是 -1 或 1～{len(f['ids']) - 1}")
         m = self.s.meta
         sizes = [self.s.weights.n_units(L) for L in range(m.n_layer)]        # MoE の層は全専門家の通し番号(CHANGE-05)
         parts = [fields[L] if L in fields else np.full(n, np.nan, np.float32) for L, n in enumerate(sizes)]
@@ -252,7 +253,7 @@ class Live:
         Ls = [L for L in range(self.s.meta.n_layer) if arch.layers[L].head_dim and arch.layers[L].mixer == "attention"]
         linear = [L for L in range(self.s.meta.n_layer) if arch.layers[L].head_dim and arch.layers[L].mixer != "attention"]
         if not Ls:
-            raise GneError("ARCH_UNSUPPORTED", "このモデルには注目のパターンを持つ attention の層がありません")
+            raise GneError("ARCH_UNSUPPORTED", "此模型没有带注意力模式的 attention 层")
         ids = f["ids"][:e.probe_ubatch]
         T = len(ids)
         nh = max(arch.layers[L].n_head for L in Ls)
@@ -288,12 +289,12 @@ class Live:
         compare = True なら、同じユーザーの発話を system あり(with)となし(without)のチャットで流し、両方を返す
         (ペルソナあり/なしの差分表示用。共通の末尾をそろえるのはブラウザ側)。"""
         if not text or not text.strip():
-            raise GneError("BAD_ARGS", "文章が空です")
+            raise GneError("BAD_ARGS", "文本为空")
         if layer is not None:
             self.data._check(layer)
         system = (system or "").strip() or None
         if compare and not system:
-            raise GneError("BAD_ARGS", "ペルソナあり/なしを比べるには system が要ります")
+            raise GneError("BAD_ARGS", "要比较有 / 无 persona，需要 system")
 
         def one(sys_, chat_):
             return self.s.attention(text, pos=pos, layer=layer, head=head, top=top, system=sys_, chat=chat_)
@@ -340,13 +341,13 @@ class Live:
     def reads(self, L: int, n: int, text: str) -> dict:
         from ..fires import fire_ids, fire_scores
         if not 0 <= n < self.data._check(L):                                  # MoE の層は通し番号(CHANGE-05)
-            raise GneError("BAD_ARGS", f"L{L} N{n} は範囲外です")
+            raise GneError("BAD_ARGS", f"L{L} N{n} 超出范围")
 
         def fn():
             ids = fire_ids(self.s, text)
             kept, scores, raw, norm = fire_scores(self.s, ids, [L])
             if L not in kept:
-                raise GneError("ARCH_UNSUPPORTED", f"層 {L} の活性を捕捉できませんでした")
+                raise GneError("ARCH_UNSUPPORTED", f"层 {L} 的激活捕获失败")
             toks = [self.s.engine.token_text(t, special=False) for t in ids]
             return {"first": toks[0], "tokens": toks[1:], "score": [float(x) for x in scores[0][:, n]],
                     "act": [float(x) for x in raw[0][:, n]], "normalization": norm[str(L)]}
@@ -365,18 +366,25 @@ class Live:
             out.append({"name": p.stem, "model_id": r.model_id, "dose_unit": r.dose_unit,
                         "units": [{"layer": u.layer, "neuron": u.neuron, "dose": u.dose, "kind": u.kind, "mode": u.mode,
                                    "k": u.k, "direction": u.direction, "head": u.head, "seek": getattr(u, "seek", None),
-                                   "expert": u.expert} for u in r.units],                  # expert: MoE(CHANGE-05)
+                                   "expert": u.expert,                                     # expert: MoE(CHANGE-05)
+                                   # keyed(CHANGE-07): 鍵と強さ α(Unit.k、YAML の alpha)。方向の先頭の - は α の符号に畳んである
+                                   **({"key": u.key, "alpha": u.k} if u.mode == "keyed" else {})} for u in r.units],
                         "ablate": r.ablate.to_dict() if r.ablate else None, "when": r.when, "sampling": r.sampling,
                         "this_model": r.model_id in (None, self.s.meta.model_id)})
         return out
 
-    def export(self, units: list[str], name: str, *, verify: bool = False) -> dict:
+    def export(self, units: list[str], name: str, *, verify: bool = False, keyed: int = 0) -> dict:
+        """control vector(add のユニットだけ)の書き出し。keyed は UI がレシピから外した鍵つきの書き込み(CHANGE-07)の数で、
+        cvec には入らない(入力の活性に鍵が反応するときだけ書くので定数の足し算にならない)ことを警告に出す。keyed のレシピは
+        headproj_export のジョブ(LoRA・焼き込み)で書き出す。"""
         import re
         if not re.fullmatch(r"[\w.\-]+", name or ""):
-            raise GneError("BAD_ARGS", f"名前 {name!r} は英数字・_・-・. だけにしてください")
+            raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含英数字、_、-、.")
         path = self.s.store.root / "export" / f"{name}.cvec.gguf"
         recipe = self.s.recipe(units=list(units), dose_unit="rel", name=name)        # GGUF の中のレシピにも名前を入れる
         r, warns = self._gpu(lambda: self.s.export_cvec(recipe, path, verify=verify))
+        if keyed:
+            warns = [f"带键写入（keyed，{int(keyed)} 个）无法放入 control vector，已移除（因为只在输入激活触发键响应时才写入，不是常量加法）。请用配方标签页中的“LoRA / 烧录”（headproj_export）导出", *warns]
         saved = (self.s.store.recipes_dir() / f"{name}.yaml").exists()
         return {**r, "file": f"{name}.cvec.gguf", "url": f"/api/export/file/{name}.cvec.gguf", "warnings": warns,
                 "recipe_saved": saved}
@@ -384,7 +392,7 @@ class Live:
     def export_path(self, file: str) -> Path:
         p = (self.s.store.root / "export" / file).resolve()
         if p.parent != (self.s.store.root / "export").resolve() or not p.name.endswith((".cvec.gguf", ".lora.gguf")) or not p.exists():
-            raise GneError("NOT_FOUND", f"{file} はありません")
+            raise GneError("NOT_FOUND", f"{file} 不存在")
         return p
 
     # --- ジョブ(§8.3) ----------------------------------------------------------------------------------

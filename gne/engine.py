@@ -206,7 +206,7 @@ class Engine:
         self.n_batch = n_batch
         self.probe_ubatch = probe_ubatch
         self.kv_unified = kv_unified
-        self.n_threads = n_threads or max(1, (os.cpu_count() or 2) // 2)
+        self.n_threads = n_threads or int(os.environ.get("GNE_THREADS") or 0) or max(1, (os.cpu_count() or 2) // 2)
         self.n_gpu_layers = n_gpu_layers
         self.chat_template = self.meta_str("tokenizer.chat_template")
         self.arch = self.meta_str("general.architecture") or ""
@@ -280,7 +280,7 @@ class Engine:
     def fit_ctx(self, need: int | None) -> int:
         """読ませる最長の列(トークン数)に合わせたコンテキストの長さ: 256 の倍数に切り上げ、n_ctx を上限にする。
         None なら n_ctx。KV キャッシュと計算用のバッファはこの長さに比例するので、短い会話しか読まない処理
-        (方向の点数・因果・配分)では VRAM が大きく空く(大きいモデルで VRAM からあふれて遅くなるのを避ける)。"""
+        (方向への射影の値・因果・配分)では VRAM が大きく空く(大きいモデルで VRAM からあふれて遅くなるのを避ける)。"""
         if need is None:
             return self.n_ctx
         if need > self.n_ctx:
@@ -326,7 +326,7 @@ class Engine:
             self._attn_probe = None
 
     def free_steer(self) -> None:
-        """生成用のコンテキスト(チャット・eval が作り、残しておくもの)を解放する。生成しない長い処理(方向の点数・
+        """生成用のコンテキスト(チャット・eval が作り、残しておくもの)を解放する。生成しない長い処理(方向への射影の値・
         因果・配分)の前に呼んで VRAM を空ける。次に生成するときに作り直す。"""
         if self._steer is not None:
             self._steer.free()
