@@ -166,7 +166,7 @@ def is_multi(q) -> bool:
     return not isinstance(q, str)
 
 
-def check_question(q, where: str = "質問", *, in_progress: bool = True) -> None:
+def check_question(q, where: str = "问题", *, in_progress: bool = True) -> None:
     """1 問を確かめる。文字列か、[{"role": "user", "content": …}, {"role": "assistant", …}, …, {"role": "user", …}]。
     assistant で終われば書きかけの返事(その最後のトークンで測り、生成はその続きから)。in_progress=False の道具は断る。"""
     if isinstance(q, str):

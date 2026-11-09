@@ -1122,7 +1122,8 @@ def direction(c: Common, holder: dict,
     """从对照集创建并保存全层方向 r_L（mean_A − mean_B），再用 --select auto 选择效果较大的层（§6.17）。
     创建的方向可用 L:dir:NAME:dose 单元加入（gne steer / chat / eval / export-cvec）。
     gne direction score は、方向の分離度(層ごとの cohen_d)と介入の効き目を生成なしで測る(CHANGE-06 B)。
-    gne direction key / key-check / keys / key-verify / key-experts は鍵つきの書き込み(keyed、CHANGE-07)の鍵を作る・確かめる(key-experts は MoE の expert:e の鍵の専門家を選ぶ材料)。"""
+    gne direction key / key-check / keys / key-verify / key-experts は鍵つきの書き込み(keyed、CHANGE-07)の鍵を作る・確かめる(key-experts は MoE の expert:e の鍵の専門家を選ぶ材料)。
+    key-from-behave は CHiPS のレシピを当てても振る舞いが残った質問(gne behave の結果)から keyed の対照集合の JSON を作る。"""
     if contrast is None:
         raise GneError("BAD_ARGS", "--contrast 是必需的", "创建方向：gne direction --contrast <对照集>；"
                                                           "测量：gne direction score --name <方向> --contrast <对照集>")
@@ -2061,6 +2062,61 @@ def direction_key_experts(c: Common, holder: dict,
     return d, "\n".join(lines), 0
 
 
+@gne_command(direction_app, "key-from-behave", "direction key-from-behave")
+def direction_key_from_behave(c: Common, holder: dict,
+                              behave: str = typer.Option(..., "--behave", help="gne behave 结果名称（<root>/behave/<model_id>/<名称>.json）或路径。必须是应用 CHiPS 配方回答 A 侧问题的结果"),
+                              recipe: str = typer.Option(..., "--recipe", help="CHiPS 配方（已保存配方的名称或路径）。键在应用该配方的状态下创建，因此写入输出的 keyed.iv"),
+                              direction: Optional[str] = typer.Option(None, "--direction", help="CHiPS 方向名称（输出的 keyed.direction）。省略 --contrast 时，使用创建该方向所用对照集"),
+                              contrast: Optional[str] = typer.Option(None, "--contrast", help="CHiPS 方向的对照集（路径或 configs/contrast/ 中的名称）。获取 B 侧问题、validate.match 和 A 侧问题。省略 --direction 时，方向名称使用该 name"),
+                              label: Optional[list[str]] = typer.Option(None, "--label", help="视为“留下”的读取方判定标签（例如 --label P。可多个）。省略时用正则表达式判定"),
+                              match: Optional[str] = typer.Option(None, "--match", help="视为“留下”的正则表达式（区分大小写）。省略时使用 behave 结果的 --match，若没有则使用对照集的 validate.match（忽略大小写）"),
+                              min_rate: float = typer.Option(1.0, "--min-rate", help="纳入行为在种子中出现比例不低于此值的问题（默认 1.0 = 所有种子。A 侧只纳入行为确定出现的问题）"),
+                              positions: Optional[str] = typer.Option(None, "--positions", help="写入位置 before:<正则表达式>（默认 before:<validate.match>。若含字母则加 (?i)）。匹配过宽会警告，因此传入对应行为开头的正则表达式"),
+                              name: Optional[str] = typer.Option(None, "--name", help="输出名称（默认 <behave 名称>_keyed）。也会成为键的默认名称"),
+                              out: Optional[Path] = typer.Option(None, "--out", "-o", help="输出的 JSON 路径（默认 <root>/keyed/<名称>.json。会出现在键标签页的模板中）"),
+                              replies: bool = typer.Option(True, "--replies/--no-replies", help="将提取问题的 behave 回复放入输出的 replies（默认。创建键时直接读取而不重新生成）。--no-replies 时在创建键时生成回复"),
+                              prompts: Optional[Path] = typer.Option(None, "--prompts", help="交给 behave 的问题集（仅用于未记录问题的旧 behave 结果）"),
+                              strict: bool = typer.Option(False, "--strict", help="如果 behave 结果不是应用该配方回答 A 侧问题得到的，则报错（默认仅警告）")):
+    """CHiPS のレシピを当てても消したい振る舞いが残った A 側の質問だけを集めて、keyed(鍵つきの書き込み)の対照集合の JSON を作る
+    (モデルは動かさない)。user_prompts = 抜き出した質問、dont_touch の ordinary = CHiPS の対照集合の B 側の質問、
+    keyed = {direction: CHiPS の方向, alpha: -1, iv: CHiPS のレシピ}。次に鍵のタブか gne direction key --contrast <出力> で鍵を作る。"""
+    s = holder["session"] = c.session()
+    d = s.direction_key_from_behave(behave, recipe=recipe, direction=direction, contrast=contrast, labels=label or None,
+                                    match=match, min_rate=min_rate, positions=positions, name=name, out=out, replies=replies,
+                                    prompts=prompts, strict=strict)
+    d.pop("warnings", None)                        # 警告はエンベロープの warnings に入っている
+    j = d["judge"]
+    how = (f"读取方标签 {', '.join(j['labels'])}" if j["method"] == "label"
+           else f"正则表达式 {j['match']}" + ("（忽略大小写）" if j["ignore_case"] else "")
+           + {"behave": "（behave 的 --match）", "validate": "（对照集的 validate.match）", "match": ""}[j["source"]])
+    rate = "所有种子" if j["min_rate"] >= 1 else f"至少 {j['min_rate']:g} 的种子"
+    lines = [(f"{d['path']}（" if d["path"] else "未写出（") + f"behave {d['behave']} · {d['n_prompts']} 个问题 · {d['n_seeds']} 个种子，"
+             f"配方 {d['recipe']}、方向 {d['direction']}、对照集 {d['contrast']}）",
+             f"  留下的问题：{len(d['extracted'])} 个（{how} 在 {rate} 中出现。仅部分种子 {d['n_partial']} 个，未出现 {d['n_none']} 个）",
+             f"  写入位置：{d['positions']}" + ("（来自 validate.match）" if d["positions_source"] == "validate" else ""),
+             ]
+    ps = d["position_share"]
+    if ps["share"] is not None:
+        lines.append(f"  匹配广度：回复 token 中约 {ps['share'] * 100:.1f}% 是匹配起点（匹配 {ps['starts']} · token {ps['tokens']:g}，"
+                     f"{ps['threshold'] * 100:.0f}% 以上过宽）" + ("  ← 过宽" if ps["broad"] else ""))
+    h = d["halves"]
+    if d["extracted"]:
+        lines.append(f"  预计写入位置：创建键（偶数序号）{h['even']['examples']} 个示例 · {h['even']['positions']} 个位置，"
+                     f"key-check（奇数序号）{h['odd']['examples']} 个示例 · {h['odd']['positions']} 个位置，无匹配问题 {d['no_match']} 个"
+                     + ("" if d["replies"] else "（未放入回复，因此创建键时会重新生成回复而变化）"))
+    lines.append(f"  dont_touch 的 ordinary：B 侧问题 {d['ordinary']['n']} 个" + (f"（已去掉与 user_prompts 相同的 {d['ordinary']['removed']} 个）"
+                                                                                if d["ordinary"]["removed"] else ""))
+    for r in d["extracted"][:12]:
+        lines.append(f"    {r['i']:>3} {r['rate']:.2f} 匹配 {r['starts']:>2}  {r['question']}" + ("  （重复）" if r["loop"] else ""))
+    if len(d["extracted"]) > 12:
+        lines.append(f"    … 另外 {len(d['extracted']) - 12} 个")
+    lines += [f"注：{t}" for t in d["notes"]]
+    if d["path"]:
+        lines.append(f"下一步：gne direction key --contrast {d['path']} --layers <层> --iv {d['iv']}"
+                     "（在键标签页选择模板并运行“从方向到 key-check”。方向复用 keyed.direction 中的方向）")
+    return d, "\n".join(lines), 0 if d["path"] else 1
+
+
 @gne_command(direction_app, "key-verify", "direction key-verify")
 def direction_key_verify(c: Common, holder: dict,
                          layer: int = typer.Option(..., "--layer", help="层 L"),
@@ -2245,7 +2301,7 @@ def heads_allocate(c: Common, holder: dict,
 
 @gne_command(app, "behave")
 def behave_cmd(c: Common, holder: dict,
-               prompts: Path = typer.Option(..., "--prompts", exists=True, help="问题集(JSON / YAML 的字符串或对话历史列表)"),
+               prompts: Path = typer.Option(..., "--prompts", exists=True, help="问题集（JSON / YAML 的字符串或对话历史列表。若是对照集则为 A 侧问题）"),
                recipe: Optional[list[Path]] = typer.Option(None, "--recipe", help="应用的配方(多个则叠加)"),
                match: Optional[str] = typer.Option(None, "--match", help="统计回复中匹配的正则表达式"),
                judge: Optional[Path] = typer.Option(None, "--judge", exists=True, help="给读取方的提示词文件({q} 为问题，{a} 为回复)"),

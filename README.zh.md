@@ -349,6 +349,8 @@ gne headproj export --recipe R                        # 每层、每个键的 ra
 
 在 UI 中，direction 视图的“keys（keyed）”标签页用一个按钮运行整个循环：从对照集（文件，或从 `configs/keyed/` 中三个模板之一开始的 JSON：改变句子结尾方式、只改变某一类场景中的回复、使用由 system 提示词制造的状态）出发，构建方向、构建键，并在留出问题上检查键。随后它会逐层显示键的反应强度，将已选好新方向的键控单元加入配方，并从每一行检查 LoRA 是否按公式写入。在 MoE 模型上，它还会显示每个专家被选中的频率，从表中选择一个专家即可在该专家上设置键。[docs/keyed-write.md](docs/keyed-write.md) 说明了方法、完整示例以及 MoE 模型的细节。
 
+**抑制 CHiPS 配方留下的场景。** 当 CHiPS 配方在某些问题上仍让行为出现时，`gne direction key-from-behave --behave B --recipe R --direction D` 会从应用该配方运行得到的 `gne behave` 结果中收集这些问题，并将键控对照集写入 `<root>/keyed/`（以 α = −1 写入方向 D，在应用 R 的状态下构建键）。它会出现在键标签页的模板中，生成的键控单元加入 R 后合并为一个 LoRA（docs/keyed-write.md §17）。键标签页也能在界面上完成整套流程：“从 CHiPS 留下的场景创建”会应用配方在 A 侧问题上运行 behave，构建 JSON，并放入输入框以运行一键流程。
+
 秩 1 条件编辑 `ΔW = α d kᵀ / (μᵀk)`（其中 `k = μ − QQᵀμ`，`Q` 是不希望写入位置输入所张成子空间的正交基）来自 nwn 的 Zenn 文章 [“Weight-Space Programming でずんだもん語尾”](https://zenn.dev/nwn/articles/cf9fe78aa33861)（2026）。gne 从对照集构建键，沿 `gne direction` 的方向写入，并在留出示例上用打乱标签构建的对照键检查每个键。
 
 ### 实际使用测试：按真实用法检验文件
@@ -408,7 +410,7 @@ gne serve -m models/Qwen3.5-4B-Q8_0.gguf      # http://127.0.0.1:8791
 主要视图：
 - **map：** 每一层作为一张神经元图板，并带有叠加层。
 - **layers：** 每层摘要。
-- **direction：** 查看已保存的方向在每一层多大程度分开对照集两侧、基准层在哪里，以及所选层的逐示例投影。第二个标签页接收 JSON 形式的对照集（粘贴、从文件加载，或从五种用途模板开始），用一个按钮运行完整流程：创建方向、选择基准层、筛选层和注意力头、分配强度。结果会展示每一步的简短说明、被排除的注意力头及原因、按效率与按停头所得的排名差异，以及头数更少的组；每组都可加载到配方标签页或送去 eval。比较表下方生成的强度候选会出现在第三个标签页“强度候选”，可并排查看回复、匿名评分并汇总。第四个标签页“keys（keyed）”从文件或 JSON 接收对照集（可从三个用途模板开始），用一个按钮构建方向、为键控写入构建键，并在留出示例上对照用打乱标签构建的对照键检查该键。结果中的键控单元可加入配方，每一层都可按公式检查（key-verify）；在 MoE 模型上，还会用每个专家被选中频率的表格在某个专家上设置键。
+- **direction：** 查看已保存的方向在每一层多大程度分开对照集两侧、基准层在哪里，以及所选层的逐示例投影。第二个标签页接收 JSON 形式的对照集（粘贴、从文件加载，或从五种用途模板开始），用一个按钮运行完整流程：创建方向、选择基准层、筛选层和注意力头、分配强度。结果会展示每一步的简短说明、被排除的注意力头及原因、按效率与按停头所得的排名差异，以及头数更少的组；每组都可加载到配方标签页或送去 eval。比较表下方生成的强度候选会出现在第三个标签页“强度候选”，可并排查看回复、匿名评分并汇总。第四个标签页“keys（keyed）”从文件或 JSON 接收对照集（可从三个用途模板开始），用一个按钮构建方向、为键控写入构建键，并在留出示例上对照用打乱标签构建的对照键检查该键。结果中的键控单元可加入配方，每一层都可按公式检查（key-verify）；在 MoE 模型上，还会用每个专家被选中频率的表格在某个专家上设置键。其第一部分会收集 CHiPS 配方仍让行为出现的问题：应用配方运行 behave（作为作业，带进度和停止按钮），根据结果构建键控对照集并显示红色和黄色警告，然后填入输入框，并已自动设置方向和配方。
 - **eval：** 将已保存的 eval 显示为每个剂量的图表和表格，以及示例输出和用于 eval 当前配方的按钮。方式比较和头数更少的组比较也会显示在这里，带键控单元的配方是否只在应该写入的位置写入（选择性）也会显示。
 - **embed：** rollout 文本的 UMAP。
 
@@ -459,7 +461,7 @@ r = client.chat.completions.create(
 claude mcp add gne -- gne mcp --model /path/to/model.gguf
 ```
 
-可用工具包括 `model_overview`、`layer_summary`、`neuron`、`search`、`steer`、`steer_lens`、`fires`、`reverse`、`recipe_save`、`export_cvec`、`gain_export`、`bake`、`eval`、`direction`、`ablate_export`、`head`、`heads_contrast`、`attention`、`direction_score`、`heads_causal`、`heads_allocate`、`headproj_export`、`direction_key`、`direction_key_check`、`direction_key_experts`、`direction_key_verify`、`direction_key_pipeline`、`keys`、`keyed_export`、`set_name`，以及 `job_start` / `job_status` / `job_cancel`。
+可用工具包括 `model_overview`、`layer_summary`、`neuron`、`search`、`steer`、`steer_lens`、`fires`、`reverse`、`recipe_save`、`export_cvec`、`gain_export`、`bake`、`eval`、`direction`、`ablate_export`、`head`、`heads_contrast`、`attention`、`direction_score`、`heads_causal`、`heads_allocate`、`headproj_export`、`direction_key`、`direction_key_check`、`direction_key_experts`、`direction_key_verify`、`direction_key_pipeline`、`direction_key_from_behave`、`behave`、`keys`、`keyed_export`、`set_name`，以及 `job_start` / `job_status` / `job_cancel`。
 
 如果 Web UI 已打开，请添加 `--ui-url http://127.0.0.1:8791`。这样 agent 就可以高亮、注释神经元并在浏览器中打开它们（`ui_highlight`、`ui_note`、`ui_open`）。当 UI 已占用同一 GPU 上的模型时，还请添加 `--n-gpu-layers 0`。
 
