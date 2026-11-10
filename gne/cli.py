@@ -1123,7 +1123,8 @@ def direction(c: Common, holder: dict,
     创建的方向可用 L:dir:NAME:dose 单元加入（gne steer / chat / eval / export-cvec）。
     gne direction score は、方向の分離度(層ごとの cohen_d)と介入の効き目を生成なしで測る(CHANGE-06 B)。
     gne direction key / key-check / keys / key-verify / key-experts は鍵つきの書き込み(keyed、CHANGE-07)の鍵を作る・確かめる(key-experts は MoE の expert:e の鍵の専門家を選ぶ材料)。
-    key-from-behave は CHiPS のレシピを当てても振る舞いが残った質問(gne behave の結果)から keyed の対照集合の JSON を作る。"""
+    key-from-behave は CHiPS のレシピを当てても振る舞いが残った質問(gne behave の結果)から keyed の対照集合の JSON を作る。
+    key-causal / key-causal-verify は keyed の効く場所(層・書き込み先・α)を、生成なしのふるい分けと生成での確かめの 2 段で探す。"""
     if contrast is None:
         raise GneError("BAD_ARGS", "--contrast 是必需的", "创建方向：gne direction --contrast <对照集>；"
                                                           "测量：gne direction score --name <方向> --contrast <对照集>")
@@ -1976,6 +1977,13 @@ def direction_key_check(c: Common, holder: dict,
         why = ([f"同一对照集中 subset 重叠(创建 {ov.get('built_subset')}、确认 {ov.get('subset')})"] if ov.get("subset_overlap") else []) \
             + ([f"与创建相同的 (system, 问题) 有 {ov['hash_overlap']} 个"] if ov.get("hash_overlap") else [])
         lines.append("保留集: 否(" + "、".join(why or ["创建时使用的样本"]) + ")。AUC、选择性为偏乐观的值")
+    dts = d.get("dont_touch_start") or {}
+    has_dt = any(g.startswith("dt:") for g in d.get("counts") or {})
+    if dts.get("on"):
+        grp = "、".join(f"{g} {n} 个位置" for g, n in dts["groups"].items())
+        lines.append(f"dont_touch 回复开始前的位置：与建键时相同进行了测量（{grp or '无'}。位于回复开头的 ρ 位置 0）")
+    elif has_dt and dts.get("recorded") is False:
+        lines.append("dont_touch 回复开始前的位置：这是没有记录的旧键，因此仅在进入 dont_touch 群的 positions 时测量")
     lines.append(f"  {'层':>4} {'AUC':>6} {'AUC(tok)':>8} {'选择性':>7} {'比较用p95':>7} {'比较用AUCp95':>10} {'二分AUC':>7}  判定")
     for r in d["layers"]:
         pa = (r["pseudo_auc_token"] if r["auc_token"] is not None else r["pseudo_auc"])["p95"]
@@ -1991,10 +1999,11 @@ def direction_key_check(c: Common, holder: dict,
         if r["layer"] == d["best_layer"]:
             line += "  ← 最佳"
         lines.append(line)
-    lines.append(("  选择性 = key-check 的选择性(每个样本键反应强度 ρ 的平均，写入位置 − 不希望写入位置)。比较用p95、比较用AUCp95 = "
-        "比较用键的选择性、AUC 的 p95(AUC 若存在 token 级 AUC 则为 token 级)。判定 ○ = 选择性超过比较用键的 p95，且 AUC "
-        "> 0.5。二分AUC = 将不希望写入位置分成两组创建的键的 AUC(参考值)。回复开头的 ρ = 不希望写入侧、dont_touch "
-        "在开始写回复紧前方位置的 ρ 中位数(0.4 以上警告) "))
+    lines.append("  选择性 = key-check 的选择性(每个样本键反应强度 ρ 的平均，写入位置 − 不希望写入位置)。比较用p95、比较用AUCp95 = "
+                 "比较用键的选择性、AUC 的 p95(AUC 若存在 token 级 AUC 则为 token 级)。判定 ○ = 选择性超过比较用键的 p95，且 AUC "
+                 "> 0.5。二分AUC = 将不希望写入位置分成两组创建的键的 AUC(参考值)。回复开头的 ρ = 不希望写入侧、dont_touch "
+                 "在开始写回复紧前方位置的 ρ 中位数(0.4 以上警告。dont_touch 的该位置，如果是建键时纳入 Q 的键，即使回复开头匹配 "
+                 "positions 的正则表达式也会测量)")
     ab = d["all_beat_pseudo"]
     lines.append("在全部层超过比较用键: " + {True: "是", False: "否"}.get(ab, "无判定(没有比较用键或不希望写入位置)"))
     lines += [f"注: {t}" for t in d["notes"]]
@@ -2151,6 +2160,249 @@ def direction_key_verify(c: Common, holder: dict,
                  + ("、对不希望写入侧的泄漏 < 0.1" if d["judged_leak"] else "、对不希望写入侧的泄漏无判定")
                  + ("、其他专家的槽位差 < 1e-3、选择方式变化 0" if kind == "expert" else "") + ")")
     return d, "\n".join(lines), 0 if d["v30"] else 1
+
+
+def _kc_e(e: dict | None, w: int = 13) -> str:
+    """key-causal の効き目の列: 平均±95% の幅(無ければ —)。"""
+    if not e:
+        return format("—", f">{w}")
+    ci = e.get("ci")
+    return format(f"{e['mean']:+.3f}" + (f"±{ci:.3f}" if ci is not None else ""), f">{w}")
+
+
+def _kc_range(r: dict | None, w: int = 15) -> str:
+    return format("—", f">{w}") if not r else format(f"{r['min']:+.3f}～{r['max']:+.3f}", f">{w}")
+
+
+KC_SORTS = ("place", "effect", "ratio", "side")
+
+
+def _kc_eff_short(e: dict | None, mark, w: int = 9) -> str:
+    """1 か所 1 行の表の効き目の欄: 平均(印が付けば ★)。"""
+    if not e:
+        return format("—", f">{w}")
+    return format(f"{e['mean']:+.2f}" + ("★" if mark else ""), f">{w}")
+
+
+def kc_ratio_alpha(d: dict, ratio_alpha: float | None = None) -> float:
+    """「確率の下がり方 ÷ 副作用」と副作用を出す α(既定は |α| が最大のもの)。"""
+    alphas = [float(a) for a in d["alphas"]]
+    if ratio_alpha is None:
+        return max(alphas, key=abs)
+    for a in alphas:
+        if abs(a - float(ratio_alpha)) < 1e-9:
+            return a
+    raise GneError("BAD_ARGS", f"--ratio-alpha {ratio_alpha:g} 必须是已测量的 α（{', '.join(f'{a:g}' for a in alphas)}）之一")
+
+
+def kc_sorted(cands: list[dict], sort: str, a: float) -> list[dict]:
+    """1 か所 1 行の候補の並べ替え: place(書き込み先・層の順)/ effect(α での確率の下がり方の大きい順)/ ratio(下がり方 ÷ 副作用の
+    大きい順)/ side(副作用の小さい順)。値の無い候補は後ろ。"""
+    if sort not in KC_SORTS:
+        raise GneError("BAD_ARGS", f"--sort 必须为 {' / '.join(KC_SORTS)}（{sort!r}）")
+    key = f"{a:g}"
+    if sort == "place":
+        return list(cands)
+
+    def val(c):
+        b = (c.get("by_alpha") or {}).get(key) or {}
+        e = b.get("reply") or b.get("probe")
+        if sort == "effect":
+            return None if not e else e["mean"]
+        if sort == "ratio":
+            return None if b.get("ratio") is None else -b["ratio"]
+        sb = b.get("side_b")
+        return None if not sb else -sb["mean"]
+    return sorted(cands, key=lambda c: (val(c) is None, val(c) if val(c) is not None else 0.0))
+
+
+def key_causal_lines(d: dict, *, only_marked: bool = False, ratio_alpha: float | None = None, sort: str = "place") -> list[str]:
+    """第 1 段(key-causal)の結果の表(CLI と MCP の説明用)。1 か所(書き込み先 × 層)につき 1 行で、強さ(α)ごとの確率の下がり方と
+    印、全部の強さで印が付いたか、ratio_alpha での「確率の下がり方 ÷ 副作用」と副作用を並べる。"""
+    from .keyed_causal import with_candidates
+    d = with_candidates(d)
+    has_reply = d["measure"]["regex"] is not None
+    has_probe = any(r.get("probe") for r in d["rows"])
+    alphas = [float(a) for a in d["alphas"]]
+    ra = kc_ratio_alpha(d, ratio_alpha)
+    iv = d.get("iv_spec")
+    lines = [f"有效位置筛选（不生成文本。对照集合 {d['contrast']}、方向 {d['direction']}、"
+             + (f"干预 {iv if isinstance(iv, str) else ' '.join(iv)}、" if iv else "无干预、")
+             + f"写入目标 {','.join(d['targets'])}、候选 {d['n_candidates']} 处、强度（α）{','.join(f'{a:g}' for a in alphas)}、"
+             f"每个候选的比较用键 {d['pseudo']} 个、{d['seconds']:.1f} 秒）",
+             f"注: {d['notes'][0]}"]
+    c = d.get("counts") or {}
+    ca = c.get("a") or {}
+    if has_reply:
+        src = "positions 的正则表达式" if d["measure"]["source"] == "positions" else "--measure-match"
+        lines.append(f"概率降幅（效果、回复）：在未用于创建的 {ca.get('examples', 0)} 个问题中，对匹配 {d['measure']['regex']}（{src}）的"
+                     f" {ca.get('matched', 0)} 个问题的回复，计算匹配字符的对数概率变化（负 = 行为更难出现）")
+    if has_probe:
+        pc = c.get("probe") or {}
+        lines.append(f"效果（probe）：在 {pc.get('a', 0)} 行中，log p（行为答案）− log p（期望答案）的变化（负 = 更偏向期望答案）")
+    for a, mk in d["marks"].items():
+        for m, v in mk.items():
+            pl = d["pool"][a][m]
+            lines.append(f"α {a}（{'回复' if m == 'reply' else 'probe'}）：标记 {v['marked']} / 候选 {v['candidates']}"
+                         f"（即使偶然也会有 {v['candidates']} × {d['chance'] * 100:.0f}% = {v['expected']:g} 个被标记），"
+                         f"比较用键的 5% 分位 {pl['p5']:+.3f}（{pl['n']} 个）")
+    head = f"  {'写入':>4} {'层':>3} |"
+    if has_reply:
+        head += "".join(f" {'α ' + format(a, 'g'):>9}" for a in alphas) + f" {'全显著':>4} |"
+    if has_probe:
+        head += "".join(f" {'probe ' + format(a, 'g'):>9}" for a in alphas) + f" {'全显著':>4} |"
+    head += f" {'降幅÷副作用':>8} {'副作用':>7} {'dt最小':>7} | {'kc余量':>7} {'比例':>6}  （右侧 4 列为 α {ra:g}）"
+    lines.append(head)
+    key = f"{ra:g}"
+    for cd in kc_sorted(d["candidates"], sort, ra):
+        ba = cd["by_alpha"]
+        marked = any(b.get("mark") or b.get("probe_mark") for b in ba.values())
+        if only_marked and not marked:
+            continue
+        ln = f"  {_target_who(cd['target']):>4} {cd['layer']:>3} |"
+        if has_reply:
+            ln += "".join(" " + _kc_eff_short((ba.get(f"{a:g}") or {}).get("reply"), (ba.get(f"{a:g}") or {}).get("mark")) for a in alphas)
+            ln += f" {('○' if cd.get('all_marked') else ''):>4} |"
+        if has_probe:
+            ln += "".join(" " + _kc_eff_short((ba.get(f"{a:g}") or {}).get("probe"), (ba.get(f"{a:g}") or {}).get("probe_mark")) for a in alphas)
+            ln += f" {('○' if cd.get('all_marked_probe') else ''):>4} |"
+        b = ba.get(key) or {}
+        lin = cd.get("linear") or {}
+        lr = lin.get("ratio")
+        lin_s = "方向×" if lin and not lin.get("consistent") else (f"×{lr:.2f}" if lr is not None else "—")
+        ln += (f" {_fc(b.get('ratio'), '>8.1f')} {_fc((b.get('side_b') or {}).get('mean'), '>+7.3f')} {_fc(b.get('dt_min'), '>+7.3f')} |"
+               f" {_fc((cd.get('key_check') or {}).get('margin'), '>+7.3f')} {lin_s:>6}")
+        lines.append(ln)
+    floor = d.get("ratio_floor") or 0.01
+    lines.append("  α 各列 = 概率降幅（应用 keyed 时，行为部分的对数概率变化。与仅 iv 状态的差按示例平均。"
+                 "负 = 下降）。★ = 在该强度下显著（比所有候选的比较用键的 5% 分位下降更多）。比较用键 = 将想要写入的场景与"
+                 "不希望写入场景的标签随机打乱，并按相同步骤创建的键（偶然变化幅度基准）。"
+                 "全显著 = 在任何强度下都有 ★。副作用 = 不希望写入位置的回复每个 token 的对数概率变化（负 = 下降）。"
+                 f"降幅÷副作用 = (−概率降幅)÷(−副作用)。副作用小于 {floor:g} 时（包括上升时）除以 {floor:g}，"
+                 "若概率没有下降则为 —。数值越大，表示在不改变不希望写入场景的情况下降低行为。dt最小 = dont_touch 各群回复的"
+                 "每 token 变化中下降最多的群。kc余量 = key-check 的选择性 − 比较用键的 p95（参考）。比例 = 最大 |α| 时的"
+                 "效果 ÷ 最小 |α| 时的效果，再除以 |α| 之比（1 = 成比例，方向× = 强度间符号不一致，— = 最小 |α| 时的效果在"
+                 "95% 区间内）")
+    lines.append("  选择参考：将概率降幅、副作用、是否在所有强度下显著这 3 项并排后自行选择。只按概率降幅选择时，可能会挑到"
+                 "通过破坏回复来降低概率的候选（副作用也接近比较用键）。可用 --sort ratio / effect / side 排序")
+    for x in d.get("dropped") or []:
+        lines.append(f"  {x['target']} L{x['layer']}: 已排除（{x['error']}）")
+    lines += [f"注: {t}" for t in d["notes"][1:]]
+    marked = [r for r in d["rows"] if r.get("mark") or r.get("probe_mark")]
+    pick = marked[0]["unit"] if marked else (d["rows"][0]["unit"] if d["rows"] else "<单元>")
+    lines.append(f"下一步：gne direction key-causal-verify --from {d['name']} --unit {pick}（用生成确认所选候选。--unit 可多次指定。"
+                 "若要将多个层合并为 1 个候选，请使用 --combo \"<单元>,<单元>\"）")
+    return lines
+
+
+@gne_command(direction_app, "key-causal", "direction key-causal")
+def direction_key_causal(c: Common, holder: dict,
+                         contrast: Path = typer.Option(..., "--contrast", help="键的对照集合（YAML 或 JSON。configs/keyed/ 中的模板，或 gne direction key-from-behave 生成的 JSON）"),
+                         layers: Optional[str] = typer.Option(None, "--layers", help="候选层（默认全部层。例 4-20 / 8,14,20。排除最终层与 MTP 层）"),
+                         target: str = typer.Option("ffn,attn", "--target", help="写入目标（逗号分隔）：ffn / attn / shared / expert:e。默认 ffn,attn（排除不可写入的目标）"),
+                         alphas: Optional[str] = typer.Option(None, "--alphas", help="α 的档位（例 --alphas=-1,-2,-4）。默认将 1,2,4 乘以对照集合 keyed.alpha 的符号"),
+                         pseudo: int = typer.Option(3, "--pseudo", help="每个候选要测量的比较用键（打乱标签后创建的键）数量"),
+                         iv: Optional[list[str]] = typer.Option(None, "--iv", help="预先应用的干预（默认为对照集合的 keyed.iv）。" + _KEY_IV),
+                         no_iv: bool = typer.Option(False, "--no-iv", help="也不应用对照集合的 keyed.iv"),
+                         direction: Optional[str] = typer.Option(None, "--direction", help="写入方向（默认为对照集合的 keyed.direction，不存在则用对照集合的 name；仍不存在则创建）"),
+                         measure_match: Optional[str] = typer.Option(None, "--measure-match", help="用于测量效果的行为部分正则表达式（默认为 positions 中 before: 的正则表达式）"),
+                         probe: Optional[Path] = typer.Option(None, "--probe", help="用于选择题行为：每行 1 题的 JSONL（{\"prompt\", \"prefix\": \"Answer:\", \"behavior\": \" B\", \"desired\": \" C\"}，不希望写入场景的行使用 \"group\": \"<群>\"）"),
+                         max_tokens: Optional[int] = typer.Option(None, "--max-tokens", help="生成回复时的长度（默认为对照集合的 keyed.max_tokens，若不存在则为 96）"),
+                         side_tokens: int = typer.Option(32, "--side-tokens", help="用于测量副作用的回复 token 数（从回复开头算起）"),
+                         name: Optional[str] = typer.Option(None, "--name", help="结果与键的名称（默认 <对照集合的名称>-causal。键保存为 <名称>-ffn 等）"),
+                         only_marked: bool = typer.Option(False, "--only-marked", help="表中只显示带标记的行（结果 JSON 中包含全部内容）"),
+                         ratio_alpha: Optional[float] = typer.Option(None, "--ratio-alpha", help="输出「概率降幅 ÷ 副作用」和副作用的强度（默认为 |α| 最大者）"),
+                         sort: str = typer.Option("place", "--sort", help="表排序方式：place（按写入目标、层顺序，默认）/ effect（按概率降幅从大到小）/ ratio（按降幅 ÷ 副作用从大到小）/ side（按副作用从小到大）。使用 --ratio-alpha 指定的强度"),
+                         yes: bool = _YES):
+    """keyed の効く場所を探す第 1 段(生成なしのふるい分け)。候補(層 × 書き込み先)ごとに鍵を作り(偶数番目)、作成に使っていない
+    奇数番目の返事で、keyed を当てたときに振る舞いの部分の対数確率がどれだけ下がるか、dont_touch の返事がどれだけ変わるかを、
+    比較用の鍵と並べて測る。比較用の鍵の 5% 点より下がった候補に印を付け、偶然でも印が付く数(候補の数 × 5%)を並べる。
+    生成なしの目安なので、効くかどうかは gne direction key-causal-verify の生成で数える。"""
+    s = holder["session"] = c.session()
+    _gate(s, "direction_key_causal", {"contrast": str(contrast), "layers": layers, "targets": target, "alphas": alphas,
+                                      "pseudo": pseudo, "probe": str(probe) if probe else None, "max_tokens": max_tokens}, yes, None)
+    d = s.direction_key_causal(contrast, layers=layers, targets=target, alphas=alphas, pseudo=pseudo, iv=_iv_arg(iv), no_iv=no_iv,
+                               direction=direction, measure_match=measure_match, probe=probe, max_tokens=max_tokens,
+                               side_tokens=side_tokens, name=name, seed=c.seed, progress=s.progress)
+    d.pop("warnings", None)
+    if sort not in KC_SORTS:
+        raise GneError("BAD_ARGS", f"--sort 必须为 {' / '.join(KC_SORTS)}（{sort!r}）")
+    return d, "\n".join(key_causal_lines(d, only_marked=only_marked, ratio_alpha=ratio_alpha, sort=sort)), 0
+
+
+def _kcv_count(x: dict | None, key: str = "behavior") -> str:
+    if not x:
+        return "—"
+    v = x.get(key)
+    return "—" if v is None else f"{v}/{x['n']}"
+
+
+def key_causal_verify_lines(d: dict) -> list[str]:
+    """第 2 段(key-causal-verify)の結果の表。"""
+    j = d["judge"]
+    how = (f"读取方标签 {', '.join(j['labels'])}" if j["method"] == "label" else f"正则表达式 {j['match']}")
+    dts = "、".join(f"{g} {n} 题" for g, n in d["n_dt"].items())
+    lines = [f"生成确认（想要写入的场景 {d['n_a']} 题（未用于创建的奇数编号）" + (f"，dont_touch {dts}" if dts else "")
+             + f"，回复 {d['max_tokens']} 个 token，" + ("greedy" if d["greedy"] else f"温度 {d['temperature']:g}、种子 {len(d['seeds'])} 个")
+             + f"，{d['seconds']:.1f} 秒）", f"  判定：{how}"]
+    b = d["base"]
+    lines.append(f"  仅 iv：行为 {_kcv_count(b['a'])}、重复 {b['a']['loop']}、空 {b['a']['empty']}、上限 {b['a']['at_limit']}"
+                 + ("" if "hits" not in b["a"] else f"、匹配总数 {b['a']['hits']}"))
+    for r in d["rows"]:
+        k, p = r["a"]["keyed"], r["a"]["pseudo"]
+        lines.append(f"  组 {r.get('label') or ''}: {r['unit']}" if r.get("combo") else f"  {r['unit']}")
+        lines.append(f"    想要写入的场景：行为 keyed {_kcv_count(k)} / 比较用键 {_kcv_count(p)}（仅 iv {_kcv_count(b['a'])}）"
+                     + ("" if "hits" not in k else f"、匹配总数 {k['hits']} / {p['hits']}（仅 iv {b['a']['hits']}）")
+                     + ("" if k.get("changed") is None else f"、回复发生变化 {k['changed']}/{k['n']} / {p['changed']}/{p['n']}"))
+        lines.append(f"    重复、空、上限：keyed {k['loop']}、{k['empty']}、{k['at_limit']} / 比较用键 {p['loop']}、{p['empty']}、{p['at_limit']}")
+        for g, v in r["dt"].items():
+            kk, pp = v["keyed"], v["pseudo"]
+            lines.append(f"    dont_touch {g}: 回复发生变化 " + ("—" if kk.get("changed") is None else
+                                                          f"{kk['changed']}/{kk['n']} / {pp['changed']}/{pp['n']}"
+                                                          f"（从开头相同的部分 {kk['same_prefix'] * 100:.0f}% / {pp['same_prefix'] * 100:.0f}%）")
+                         + f"、行为 {_kcv_count(kk)} / {_kcv_count(pp)}（仅 iv {_kcv_count(b['dt'].get(g))}）"
+                         + f"、重复、空、上限 {kk['loop']}、{kk['empty']}、{kk['at_limit']} / {pp['loop']}、{pp['empty']}、{pp['at_limit']}")
+    lines += [f"注: {t}" for t in d["notes"]]
+    lines.append(f"返事: {d['path']}")
+    return lines
+
+
+@gne_command(direction_app, "key-causal-verify", "direction key-causal-verify")
+def direction_key_causal_verify(c: Common, holder: dict,
+                                unit: Optional[list[str]] = typer.Option(None, "--unit", help="待确认候选的 keyed 单元（key-causal 表中的行。例 14:ffn:keyed:a-2@方向#鍵。可多次指定）。每个都成为独立候选"),
+                                combo: Optional[list[str]] = typer.Option(None, "--combo", help="将多个层合并为 1 个候选进行确认的组（单元用逗号分隔。例 \"11:attn:keyed:a2,18:attn:keyed:a2,23:attn:keyed:a2\"。不同行的强度可以不同。可多次指定，也可与 --unit 并用）"),
+                                result: Optional[str] = typer.Option(None, "--from", help="第 1 阶段（gne direction key-causal）的结果名称。作为对照集合、干预、方向、键、正则表达式的默认值"),
+                                contrast: Optional[Path] = typer.Option(None, "--contrast", help="键的对照集合（默认为 --from 结果中的值）"),
+                                iv: Optional[list[str]] = typer.Option(None, "--iv", help="预先应用的干预（默认为 --from 结果中的值）。" + _KEY_IV),
+                                no_iv: bool = typer.Option(False, "--no-iv", help="不应用干预"),
+                                pseudo_index: int = typer.Option(0, "--pseudo-index", help="要比较的比较用键编号（NAME~j 中的 j）"),
+                                match: Optional[str] = typer.Option(None, "--match", help="用于统计行为的正则表达式（默认为第 1 阶段测量的正则表达式，若不存在则用对照集合的 validate.match）"),
+                                judge: Optional[str] = typer.Option(None, "--judge", help="读取方判定提示文本（{q} 为问题，{a} 为回复。与 gne behave 相同）"),
+                                labels: str = typer.Option("R,P,C", "--labels", help="判定标签（与 gne behave 相同）"),
+                                label: Optional[list[str]] = typer.Option(None, "--label", help="视为行为的标签（使用 --judge 时。例 --label P）"),
+                                max_tokens: int = typer.Option(256, "--max-tokens", help="回复长度"),
+                                temperature: float = typer.Option(0.0, "--temperature", help="温度(0 = greedy)"),
+                                seeds: Optional[str] = typer.Option(None, "--seeds", help="种子（逗号分隔。存在温度时）"),
+                                no_dont_touch: bool = typer.Option(False, "--no-dont-touch", help="不让 dont_touch 的问题作答"),
+                                name: Optional[str] = typer.Option(None, "--name", help="结果名称（默认为 --from 的名称。<名称>.verify.json 中也会保存回复）"),
+                                yes: bool = _YES):
+    """keyed の効く場所を探す第 2 段(生成での確かめ)。選んだ候補と、それぞれの比較用の鍵 1 本で、作成に使っていない質問
+    (と dont_touch の質問)に gne behave と同じ生成をさせ、振る舞いが出た数を介入(iv)だけのときと比べる。dont_touch では
+    返事が変わった数、どれも繰り返し・空の返事・上限で切れた数を出す。--combo の組は、複数のユニットを一緒に当てて 1 つの候補に
+    し、比較用の鍵も組の各ユニットを同じ番号の比較用の鍵に替えた組にする。"""
+    if not unit and not combo:
+        raise GneError("BAD_ARGS", "请通过 --unit 或 --combo 传入待确认候选")
+    s = holder["session"] = c.session()
+    sd = [int(x) for x in seeds.split(",") if x.strip()] if seeds else None
+    _gate(s, "direction_key_causal_verify", {"units": list(unit or []), "combos": list(combo or []), "result": result,
+                                             "contrast": str(contrast) if contrast else None,
+                                             "max_tokens": max_tokens, "seeds": sd, "judge": judge}, yes, None)
+    d = s.direction_key_causal_verify(list(unit or []), result=result, contrast=contrast, iv=_iv_arg(iv), no_iv=no_iv,
+                                      pseudo_index=pseudo_index, match=match, judge=judge, labels=labels, label=label or None,
+                                      max_tokens=max_tokens, temperature=temperature, seeds=sd, dont_touch=not no_dont_touch,
+                                      name=name, combos=list(combo or []) or None, progress=s.progress)
+    d.pop("warnings", None)
+    return d, "\n".join(key_causal_verify_lines(d)), 0
 
 
 @gne_command(heads_app, "causal", "heads causal")

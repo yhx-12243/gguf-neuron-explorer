@@ -77,6 +77,10 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    若只想用 keyed 抑制 CHiPS 配方未能完全消除的场景，可从 behave（作业。应用 CHiPS 配方回答 A 侧问题）的结果中，
    用 direction_key_from_behave(behave, recipe, direction) 创建 JSON（<root>/keyed/<name>.json。keyed.iv 写配方，keyed.direction 写
    CHiPS 的方向，alpha −1），再用 direction_key_pipeline(contrast=该名称, layers) 创建键。
+   key-check 无法判断写入哪一层、哪个写入目标才有效（它只看键能否区分场景）。direction_key_causal(contrast) 会为
+   全层 × ffn,attn 的候选，在不生成文本的情况下将行为部分的对数概率降幅与比较用键并排测量（第 1 阶段，筛选。
+   将标记数量与“即使偶然也会被标记的数量”比较）。不生成的值并非保证，因此由使用者挑选几个候选，通过
+   direction_key_causal_verify(units, result) 的生成，将行为数量与仅 iv、比较用键比较（第 2 阶段）。不会自动决定为 1 个。
    MoE 层用 direction_key(target="shared")写入 shared expert，用 target="expert:e" 写入专家 e(单元为 L:S / L:Ee:keyed:…)。
    专家用 direction_key_experts 选择在写入位置经常被选中的(rate_a 大且 rate_b 小)专家。烧录时
    默认(auto)与 requant="keep" 下，原为 Q8_0 的专家张量保持原类型(f16 会使整个张量变为 F16 而变大)。
@@ -596,7 +600,10 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         層ごとの start_rho は書き込みたくない位置と dont_touch の、返事の冒頭(位置 0 = 返事を書き始める直前の位置、1・2 = 返事の
         最初の 2 トークンを読んだ位置)での ρ の中央値。dont_touch の ρ の中央値は返事の全位置の中央値なので、返事の冒頭の
         1 位置で反応しても見えない。中央値が 0.4 以上なら warnings に出る(dont_touch なら書き込みたくない場面への漏れ。
-        ふつうの質問を dont_touch に足して鍵を作り直す。dont_touch の質問の、返事を書き始める直前の位置は鍵の作成で自動で Q に入る)。保留集合の書き込みたい位置を含む例が
+        ふつうの質問を dont_touch に足して鍵を作り直す。dont_touch の質問の、返事を書き始める直前の位置は鍵の作成で自動で Q に入る)。
+        この位置を Q に入れて作った鍵では、key-check も dont_touch の各群のこの位置を測り(返事の冒頭が positions の正規表現に
+        一致しても)、start_rho の位置 0 と層ごとの dont_touch_start_median、counts の dts:<群>、dont_touch_start に入れる
+        (AUC・選択性には入れない)。保留集合の書き込みたい位置を含む例が
         2 未満か、書き込みたい位置が 8 未満でも warnings に出る(選択性が揺れる)。"""
         try:
             p = {"key": key, "subset": subset, "layers": layers, "positions": positions, "positions_b": positions_b,
@@ -690,6 +697,80 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                  "subset": subset, "pseudo": pseudo, "replies_a": replies_a, "replies_b": replies_b, "iv": iv, "seed": seed,
                  "dont_touch_start": dont_touch_start, "check": None if check else False, "compact": True}
             return jobs.start("direction_key_pipeline", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def direction_key_causal(contrast: dict[str, Any] | str, layers: list[int] | str | None = None,
+                                   targets: list[str] | str | None = None, alphas: list[float] | str | None = None,
+                                   pseudo: int = 3, iv: str | list[str] | None = None, no_iv: bool = False,
+                                   direction: str | None = None, measure_match: str | None = None,
+                                   probe: str | list[dict[str, Any]] | None = None, max_tokens: int | None = None,
+                                   side_tokens: int = 32, name: str | None = None) -> dict:
+        """寻找 keyed 有效位置（层、写入目标、α）的第 1 阶段：不生成文本的筛选（作业，用 job_status 查看结果）。
+        key-check 只看键能否区分场景（键的反应强度），因此这里测量写到哪里才会改变行为。
+        对每个候选（layers 的层 × targets 的写入目标。默认全层 × ffn,attn），使用对照集合的偶数编号创建键（保存为 <name>-ffn 等），
+        并在未用于创建的奇数编号回复上，测量将 keyed 单元（按 alphas 档位，默认 1,2,4 乘以 keyed.alpha 的符号）加到已应用干预 iv
+        （默认是对照集合的 keyed.iv）状态时产生的变化：rows[].reply = 行为部分（默认是 positions 正则表达式匹配的字符，也可用
+        measure_match 另行指定）的对数概率变化（负 = 更难出现），rows[].probe = probe（JSONL 路径或行列表。
+        每行 {prompt, prefix（例 "Answer:"）, behavior（行为答案）, desired（期望答案）, group?（不希望写入场景的行）}）的
+        log p（行为答案）− log p（期望答案）变化，rows[].side = dont_touch 各群与不希望写入位置每 token 的对数概率变化，
+        rows[].pseudo = 每个候选的比较用键（pseudo 个）的值。mark = 低于所有候选比较用键的 5% 分位
+        （marks[α] 中包含候选数、标记数、即使偶然也会被标记的数量 expected = 候选数 × 5%）。key_check 仅供参考，linear.ratio 是比例参考。
+        candidates 每处（写入目标 × 层）一个：by_alpha[α] 中包含 reply（降幅）、mark、side_b（副作用）、ratio（降幅 ÷ 副作用，
+        副作用下限 ratio_floor = 0.01）、unit，以及 all_marked（全部强度均显著）。将降幅、副作用、all_marked 3 项并排选择候选
+        （依据是 Qwen3.5-4B 语尾的 1 个案例。只按降幅选择，会挑到副作用也大 = 破坏回复的候选）。
+        如 notes[0] 所述，这是不生成文本的参考，用于排除与比较用键无法区分的候选。若标记数量与 expected 相近，
+        仅凭标记无法与比较用键区分（不过，若在几个 α 上连续出现标记，且相对于效果 side.b（不希望写入位置的变化）较小的候选，
+        仍值得尝试。即使效果最大，若 side.b 与比较用键相当大，也可能只是破坏了回复）。是否有效请通过 direction_key_causal_verify
+        的生成来统计。contrast 可以是对照集合的表或路径、configs/keyed/ 中模板的名称、<root>/keyed/ 中的名称。"""
+        from .jobs import _layers
+        try:
+            spec, path = None, None
+            if isinstance(contrast, dict):
+                spec = contrast
+            else:
+                try:
+                    path = str(_contrast_path(session, contrast, None, None, None, None))
+                except GneError:
+                    tpl = CONFIGS / "keyed" / f"{contrast}.json"
+                    if not tpl.exists() and re.fullmatch(r"[\w.\-]+", str(contrast)) and getattr(session, "store", None) is not None:
+                        tpl = session.store.root / "keyed" / f"{contrast}.json"
+                    if not tpl.exists():
+                        raise
+                    spec = json.loads(tpl.read_text(encoding="utf-8"))
+            if layers is not None and layers != "all" and not _layers(layers):
+                raise GneError("BAD_ARGS", "layers 应为层列表，或 \"8-20\"、\"all\"")
+            p = {"spec": spec, "contrast": path, "layers": layers, "targets": targets, "alphas": alphas, "pseudo": pseudo,
+                 "iv": iv, "no_iv": no_iv or None, "direction": direction, "measure_match": measure_match, "probe": probe,
+                 "max_tokens": max_tokens, "side_tokens": side_tokens, "name": name, "compact": True}
+            return jobs.start("direction_key_causal", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def direction_key_causal_verify(units: list[str] | str | None = None, result: str | None = None, contrast: str | None = None,
+                                          iv: str | list[str] | None = None, no_iv: bool = False, pseudo_index: int = 0,
+                                          match: str | None = None, judge: str | None = None, labels: str = "R,P,C",
+                                          label: list[str] | str | None = None, max_tokens: int = 256,
+                                          temperature: float = 0.0, seeds: list[int] | str | None = None,
+                                          dont_touch: bool = True, name: str | None = None,
+                                          combos: list[list[str]] | list[str] | None = None) -> dict:
+        """寻找 keyed 有效位置的第 2 阶段：用生成确认所选候选（作业，用 job_status 查看结果）。units 是 direction_key_causal 的
+        rows[].unit（例 "14:ffn:keyed:a-2@方向#鍵"）中的几个。result 是该结果的名称（作为对照集合、iv、方向、键、所测正则表达式的默认值）。
+        每个候选还加入 1 个比较用键（#鍵~pseudo_index），并对未用于创建的奇数编号问题（以及 dont_touch 的奇数编号）执行与 behave
+        相同的生成（回复长度 max_tokens，温度和种子也与 behave 相同）。结果：base（仅 iv）以及 rows[] 中 a（想要写入的场景）、
+        dt（按群）的 keyed、pseudo 各自的 n、behavior（行为出现次数。match 的正则表达式或 judge 的 label）、hits（匹配总数）、
+        changed（从仅 iv 时起回复发生变化的数量，greedy 时）、loop、empty、at_limit。若比较用键也有同等变化，
+        则该变化并非因为键区分了场景。回复保存在 path 文件中。combos 是将多个层的组作为 1 个候选进行确认
+        （每个组是单元列表，或用 "11:attn:keyed:a2,18:attn:keyed:a2" 字符串。强度按单元写法。比较用键是将
+        组内各单元替换为相同编号比较用键后的组）。与 units 一起传入时，单点候选和组会并列在结果 rows 中（组为 combo: true）。"""
+        try:
+            p = {"units": units, "combos": combos, "result": result, "contrast": None if contrast is None else str(_contrast_path(session, contrast, None, None, None, None)),
+                 "iv": iv, "no_iv": no_iv or None, "pseudo_index": pseudo_index or None, "match": match, "judge": judge,
+                 "labels": labels, "label": label, "max_tokens": max_tokens, "temperature": temperature or None,
+                 "seeds": seeds, "dont_touch": None if dont_touch else False, "name": name}
+            return jobs.start("direction_key_causal_verify", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -821,7 +902,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def job_start(kind: str, params: dict[str, Any] | None = None, workers: str | None = None) -> dict:
-        """提交长时间处理。kind: stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast / heads_causal / heads_allocate / head_pipeline / heads_candidates / heads_refine / headproj_export / fieldtest / direction_key / direction_key_check / direction_key_experts / direction_key_pipeline / direction_key_verify。
+        """提交长时间处理。kind: stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast / heads_causal / heads_allocate / head_pipeline / heads_candidates / heads_refine / headproj_export / fieldtest / direction_key / direction_key_check / direction_key_experts / direction_key_pipeline / direction_key_verify / direction_key_causal / direction_key_causal_verify / behave。
         params 是 gne.api 中同名方法的参数（例 sweep：{"layer": 22, "neurons": "random:64", "design": "quick"}）。
         预计超过 30 分钟的任务不会运行，而是返回 NEEDS_CONFIRM 与估算。在 params 中加入 budget("30m" 等)可按预算
         缩小范围（lens_steer 取靠近方向的上位神经元，sweep 用 quick 设计取 steer lens 前几名，reverse 减少
@@ -888,14 +969,13 @@ def _contrast_path(session, contrast, system_a, system_b, user_prompts, name) ->
         return p
     if not (system_a and system_b and user_prompts):
         raise GneError("BAD_ARGS", "请传入 contrast，或同时传入 system_a、system_b、user_prompts 三项")
-    import yaml
+    from .yamlio import write_yaml
     nm = name or "contrast"
     if not re.fullmatch(r"[\w.\-]+", nm):
         raise GneError("BAD_ARGS", "name 只能包含字母、数字、_、-、.")
     p = session.store.root / "contrast" / f"{nm}.yaml"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(yaml.safe_dump({"name": nm, "system_a": system_a, "system_b": system_b,
-                                 "user_prompts": list(user_prompts)}, allow_unicode=True), encoding="utf-8")
+    write_yaml(p, {"name": nm, "system_a": system_a, "system_b": system_b, "user_prompts": list(user_prompts)})
     return p
 
 

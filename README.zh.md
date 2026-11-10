@@ -351,6 +351,8 @@ gne headproj export --recipe R                        # 每层、每个键的 ra
 
 **抑制 CHiPS 配方留下的场景。** 当 CHiPS 配方在某些问题上仍让行为出现时，`gne direction key-from-behave --behave B --recipe R --direction D` 会从应用该配方运行得到的 `gne behave` 结果中收集这些问题，并将键控对照集写入 `<root>/keyed/`（以 α = −1 写入方向 D，在应用 R 的状态下构建键）。它会出现在键标签页的模板中，生成的键控单元加入 R 后合并为一个 LoRA（docs/keyed-write.md §17）。键标签页也能在界面上完成整套流程：“从 CHiPS 留下的场景创建”会应用配方在 A 侧问题上运行 behave，构建 JSON，并放入输入框以运行一键流程。
 
+**寻找键有效的位置。** `key-check` 只能说明键能否区分场景；即使某层的 key-check 余量很大，写入后行为也可能不变。`gne direction key-causal --contrast C` 会为每个候选（默认全层 × `ffn`、`attn`）构建键，并在未用于创建的回复上，在不生成文本的情况下测量加入每个键控单元后行为部分（`positions` 正则表达式匹配的文本；如果是选择题行为，则用 `--probe` 给出的答案组）的对数概率下降多少，并与用打乱标签构建的比较用键以及 `dont_touch` 回复的变化并排比较。候选低于所有比较用键的第 5 百分位时会打上标记，表还会显示仅凭偶然会出现多少标记（候选数 × 5%）。表按每个位置（写入目标 × 层）一行，列出三项选择依据：各强度下的降幅（显著时带标记）、不希望写入位置回复上的副作用、是否在所有强度下都显著，以及降幅除以副作用；每一列都可排序。目前选择这种方式的依据只有一个案例（Qwen3.5-4B 的句尾），而且只按降幅选择可能会挑到通过破坏回复来降低概率的位置。这只是筛选：不生成文本时的概率变化并不保证模型写出的回复会改变。然后 `gne direction key-causal-verify --from NAME --unit U …` 会对所选候选在留出问题上生成，每个候选与一个比较用键并排，统计相对于仅干预时的行为数量；`--combo` 会将多个层一起写入作为一个候选检查。不会自动选择单一层。键标签页在“寻找有效层”下也有相同的两个阶段（docs/keyed-write.md §18）。
+
 秩 1 条件编辑 `ΔW = α d kᵀ / (μᵀk)`（其中 `k = μ − QQᵀμ`，`Q` 是不希望写入位置输入所张成子空间的正交基）来自 nwn 的 Zenn 文章 [“Weight-Space Programming でずんだもん語尾”](https://zenn.dev/nwn/articles/cf9fe78aa33861)（2026）。gne 从对照集构建键，沿 `gne direction` 的方向写入，并在留出示例上用打乱标签构建的对照键检查每个键。
 
 ### 实际使用测试：按真实用法检验文件
@@ -461,7 +463,7 @@ r = client.chat.completions.create(
 claude mcp add gne -- gne mcp --model /path/to/model.gguf
 ```
 
-可用工具包括 `model_overview`、`layer_summary`、`neuron`、`search`、`steer`、`steer_lens`、`fires`、`reverse`、`recipe_save`、`export_cvec`、`gain_export`、`bake`、`eval`、`direction`、`ablate_export`、`head`、`heads_contrast`、`attention`、`direction_score`、`heads_causal`、`heads_allocate`、`headproj_export`、`direction_key`、`direction_key_check`、`direction_key_experts`、`direction_key_verify`、`direction_key_pipeline`、`direction_key_from_behave`、`behave`、`keys`、`keyed_export`、`set_name`，以及 `job_start` / `job_status` / `job_cancel`。
+可用工具包括 `model_overview`、`layer_summary`、`neuron`、`search`、`steer`、`steer_lens`、`fires`、`reverse`、`recipe_save`、`export_cvec`、`gain_export`、`bake`、`eval`、`direction`、`ablate_export`、`head`、`heads_contrast`、`attention`、`direction_score`、`heads_causal`、`heads_allocate`、`headproj_export`、`direction_key`、`direction_key_check`、`direction_key_experts`、`direction_key_verify`、`direction_key_pipeline`、`direction_key_from_behave`、`direction_key_causal`、`direction_key_causal_verify`、`behave`、`keys`、`keyed_export`、`set_name`，以及 `job_start` / `job_status` / `job_cancel`。
 
 如果 Web UI 已打开，请添加 `--ui-url http://127.0.0.1:8791`。这样 agent 就可以高亮、注释神经元并在浏览器中打开它们（`ui_highlight`、`ui_note`、`ui_open`）。当 UI 已占用同一 GPU 上的模型时，还请添加 `--n-gpu-layers 0`。
 
@@ -492,7 +494,7 @@ python -m pytest -q
 - [CHiPS：知道与回答之间的少数注意力头](https://balaena01.github.io/chips-steering/)：文章，包含测量结果与数据。
 - [docs/qwen4exp.md](docs/qwen4exp.md)：Qwen3.8-Flash-Next（`qwen4exp`）：分割 GGUF 文件、四条残差流，以及在不使用 control vector 时哪些功能可用。
 - [docs/head-component-steering.md](docs/head-component-steering.md)：CHiPS，只改变少数由因果选出的注意力头中沿方向的分量（`mode: proj`、`gne direction score`、`gne heads causal`、`gne heads allocate`、`gne eval --compare-methods`），以及它与全层消融的关系。
-- [docs/keyed-write.md](docs/keyed-write.md)：键控写入。只有当从对照集构建的键对写入残差流的权重矩阵输入产生反应时，才进行秩 1 写入（`mode: keyed`、`gne direction key`、`gne direction key-check`），包含句子结尾的完整示例，以及它与 CHiPS 的关系。
+- [docs/keyed-write.md](docs/keyed-write.md)：键控写入。只有当从对照集构建的键对写入残差流的权重矩阵输入产生反应时，才进行秩 1 写入（`mode: keyed`、`gne direction key`、`gne direction key-check`），包含句子结尾的完整示例、它与 CHiPS 的关系，以及如何寻找键有效的位置（`gne direction key-causal`）。
 - [docs/persona_workflow.md](docs/persona_workflow.md)：从神经元逐步构建人格（使用 `examples/persona_neurons/` 中的脚本，并以病娇案例作为完整示例），并从示例对话中提取注意力头与神经元。
 
 ## 许可证
