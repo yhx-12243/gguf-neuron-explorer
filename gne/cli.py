@@ -37,6 +37,8 @@ app.add_typer(experts_app, name="experts")
 # gne direction(方向を作る)は、サブコマンドが無ければ従来どおり動くグループ。gne direction score は速い指標(CHANGE-06 B)
 direction_app = typer.Typer(no_args_is_help=False, invoke_without_command=True)
 app.add_typer(direction_app, name="direction")
+nw_app = typer.Typer(no_args_is_help=True, help="FiSH（Formula-instantiated Scene-gated Hidden units）：计算生成的神经元（mode: nw。无需训练，用计算出的权重覆盖神经元，docs/fish.md）")
+app.add_typer(nw_app, name="nw")
 from .modal_cli import modal_app  # noqa: E402
 app.add_typer(modal_app, name="modal")
 headproj_app = typer.Typer(no_args_is_help=True, help="导出注意力头的方向分量投影（mode: proj，CHANGE-06 E）")
@@ -1118,13 +1120,16 @@ def direction(c: Common, holder: dict,
               judge_model: Optional[Path] = typer.Option(None, "--judge-model", help="用于判定的另一个 GGUF（替代 validate.match）"),
               judge_target: Optional[str] = typer.Option(None, "--judge-target", help="传给 judge 的目的人格（默认 validate.target 或 system_a）"),
               random_controls: int = typer.Option(16, "--random-controls", help="--select auto：每层同等大小的随机方向对照数量（0 为无对照）"),
+              same_reply: bool = typer.Option(False, "--same-reply", help="--positions response：B 侧也读取 A 侧的回复（让两种条件读取同一回复所得之差，不包含读取文字不同带来的成分）。默认仍与以往相同，读取各自条件自己的回复"),
+              segments: Optional[str] = typer.Option(None, "--segments", help="--positions response：同时按回复位置分段创建方向（例如 0,1-3,4-。位置 0 = 开始写回复之前）。第 i 段的方向可用 NAME.seg<i> 这个名称"),
+              stack_layers: Optional[str] = typer.Option(None, "--stack-layers", help="与 --same-reply 和 --segments 一起使用：让带分段的方向按写入这些层（例如 11,18,23）后叠加的前提取值（上层取补上下面各层后的剩余）。逐 token 读取，因此耗时较长"),
               yes: bool = _YES):
     """从对照集创建并保存全层方向 r_L（mean_A − mean_B），再用 --select auto 选择效果较大的层（§6.17）。
     创建的方向可用 L:dir:NAME:dose 单元加入（gne steer / chat / eval / export-cvec）。
-    gne direction score は、方向の分離度(層ごとの cohen_d)と介入の効き目を生成なしで測る(CHANGE-06 B)。
-    gne direction key / key-check / keys / key-verify / key-experts は鍵つきの書き込み(keyed、CHANGE-07)の鍵を作る・確かめる(key-experts は MoE の expert:e の鍵の専門家を選ぶ材料)。
-    key-from-behave は CHiPS のレシピを当てても振る舞いが残った質問(gne behave の結果)から keyed の対照集合の JSON を作る。
-    key-causal / key-causal-verify は keyed の効く場所(層・書き込み先・α)を、生成なしのふるい分けと生成での確かめの 2 段で探す。"""
+    gne direction score 无需生成，测量方向的分辨度（每层的 cohen_d）和干预效果（CHANGE-06 B）。
+    gne direction key / key-check / keys / key-verify / key-experts 创建并验证键控写入（keyed、CHANGE-07）的键（key-experts 用于选择 MoE expert:e 键的专家）。
+    key-from-behave 从应用 CHiPS 配方后行为仍然出现的问题（gne behave 的结果）创建 keyed 对照集 JSON。
+    key-causal / key-causal-verify 分两步寻找 keyed 有效的场所（层、写入目标、α）：先不生成文本做筛选，再用生成结果验证。"""
     if contrast is None:
         raise GneError("BAD_ARGS", "--contrast 是必需的", "创建方向：gne direction --contrast <对照集>；"
                                                           "测量：gne direction score --name <方向> --contrast <对照集>")
@@ -1141,8 +1146,13 @@ def direction(c: Common, holder: dict,
     d = s.direction(contrast=contrast, name=name, positions=positions, select=select, mode=mode, layers=layers,
                     dose=dose, max_tokens=max_tokens, kl_max=kl_max, min_distinct=min_distinct, per_layer=per_layer,
                     judge_model=judge_model, judge_target=judge_target, response_tokens=response_tokens,
-                    random_controls=random_controls)
+                    random_controls=random_controls, same_reply=same_reply, segments=segments, stack_layers=stack_layers)
     lines = [f"{d['path']}（A/B 各 {d['n_prompts']} 个会话、行数 {d['n_rows']}、位置 {d['positions']}、{d['seconds']:.0f} 秒）",
+             "创建方式：" + ("让 A 侧、B 侧两种条件都读取同一回复（A 侧的回复）所得之差（--same-reply）" if d.get("same_reply")
+                         else "读取各自条件自己的文字所得之差（以往的创建方式）"),
+             *([("带分段的方向：" + "、".join(f"{x['name']}（位置 {x['positions']}）" for x in d["segments"])
+                 + (f"。层 {','.join(map(str, d['stack_layers']))} 是补上下面各层后的剩余" if d.get("stack_layers") else ""))]
+               if d.get("segments") else []),
              "各层 ‖平均差‖/ρ（换算为 rel dose 的幅度）及与上一层的 cos："]
     lines.append("  " + " ".join(f"L{r['layer']}:{r['rel']:.2f}" if r["rel"] is not None else f"L{r['layer']}:—"
                                  for r in d["layers"]))
@@ -1881,7 +1891,7 @@ def direction_key(c: Common, holder: dict,
                   replies_a: Optional[Path] = typer.Option(None, "--replies-a", help=_KEY_REPLIES_A),
                   replies_b: Optional[Path] = typer.Option(None, "--replies-b", help=_KEY_REPLIES_B),
                   iv: Optional[list[str]] = typer.Option(None, "--iv", help=_KEY_IV),
-                  target: str = typer.Option("ffn", "--target", help=("写入目标: ffn(dense 的 ffn_down 输入)/ attn(attn_output、ssm_out 的输入 = 注意力头输出的拼接)/ "
+                  target: str = typer.Option("ffn", "--target", help=("写入目标: mlpin(用于计算生成的神经元。dense 的 MLP 输入 = 归一化后的空间。回复位置的键写成 --positions pos:1-3)/ ffn(dense 的 ffn_down 输入)/ attn(attn_output、ssm_out 的输入 = 注意力头输出的拼接)/ "
         "shared(MoE 层的 shared expert 的 ffn_down_shexp 输入)/ expert:e(ffn_down_exps 中专家 e "
         "的输入。仅在专家 e 被选中的位置创建) ")),
                   dont_touch_start: Optional[bool] = typer.Option(None, "--dont-touch-start/--no-dont-touch-start", help="dont_touch 各群问题的、开始写回复紧前方的位置也加入 Q(默认为对照集的 dont_touch_start，没有则加入)。不希望写入侧问题的此位置不加入")):
@@ -2962,6 +2972,140 @@ def fieldtest_cmd(c: Common, holder: dict,
                     reasoning_effort=reasoning_effort, llama_server=llama_server, server_args=server_args, ppl=ppl, skip_long=skip_long, skip_tools=skip_tools,
                     bench=bench, bench_n=bench_n, bench_tokens=bench_tokens)
     return d, _fieldtest_text(d), 0
+
+
+# --- 计算生成的神经元(mode: nw)------------------------------------------------------------------------------
+
+@gne_command(nw_app, "neurons", "nw neurons")
+def nw_neurons(c: Common, holder: dict,
+               layers: str = typer.Option(..., "--layers", help="要测量的层(例 11,18,23)"),
+               top: int = typer.Option(20, "--top", help="每层显示的数量(按活跃度从小到大)"),
+               sort: str = typer.Option("sum", "--sort", help="排序方式: sum(最大值的排名 + 平均值的排名，默认)/ max / mean"),
+               max_tokens: int = typer.Option(96, "--max-tokens", help="生成普通问题回复的长度"),
+               corpus_tokens: int = typer.Option(2048, "--corpus-tokens", help="从默认语料读取的 token 数(0 表示不读取)"),
+               iv: Optional[list[str]] = typer.Option(None, "--iv", help="在应用此干预(配方名称或路径，或单元的写法)的状态下测量(例: CHiPS 配方)")):
+    """测量各神经元平时的活跃度(|门控后的激活| × 输出列的长度 = 在一个位置写入残差的长度)，按活跃度从小到大输出表格。
+    要覆盖的神经元可参考此表选择(把编号写进 nw 单元)。覆盖后，该神经元原本的作用会消失。"""
+    Ls = parse_layers(layers)
+    if not Ls:
+        raise GneError("BAD_ARGS", "请在 --layers 中指定层", "例 --layers 11,18,23")
+    s = holder["session"] = c.session()
+    d = s.nw_neurons(Ls, top=top, sort=sort, max_tokens=max_tokens, corpus_tokens=corpus_tokens, iv=_iv_arg(iv))
+    lines = [f"平时的活跃度({d['n_prompts']} 个问题的回复 + 语料 {d['corpus_tokens']} 个 token、{d['seconds']:.0f} 秒)。排序方式: {d['sort']}"]
+    for r in d["layers"]:
+        om = r["out_norm_median"]
+        lines.append(f"L{r['layer']}({r['positions']} 个位置、MLP 输出长度的中位数 {_f(om, '.2f')}。全部神经元的中位数: 平均值 {r['median']['mean']:.4f}、"
+                     f"最大值 {r['median']['max']:.3f}、最小的最大值 {r['min']['max']:.3f})")
+        lines.append(f"  {'编号':>6} {'平均':>8} {'最大':>7} {'最大÷输出':>9} {'排名 最大/平均':>14}")
+        for x in r["rows"]:
+            lines.append(f"  {x['neuron']:>6} {x['mean']:>8.4f} {x['max']:>7.3f} {_f(x['max_share'], '.1%'):>9} {x['rank_max']:>7}/{x['rank_mean']}")
+    lines += [f"注: {n}" for n in d["notes"]]
+    return d, "\n".join(lines), 0
+
+
+@gne_command(nw_app, "key", "nw key")
+def nw_key(c: Common, holder: dict,
+           contrast: Path = typer.Option(..., "--contrast", help="对照集(user_prompts = 目标场景的问题、dont_touch = 不希望其产生反应的问题组)"),
+           layers: str = typer.Option(..., "--layers", help="创建键的层(例 11,18,23)"),
+           role: str = typer.Option("scene", "--role", help="scene(对目标场景问题的回复全程都反应的键)/ one(在任意位置都几乎返回 1 的键。用于带上限的形式)"),
+           name: Optional[str] = typer.Option(None, "--name", help="键的名称(默认 <对照集的 name>_<role>)"),
+           subset: str = typer.Option("even", "--subset", help="使用的问题: even(默认)/ odd / all"),
+           max_tokens: int = typer.Option(96, "--max-tokens", help="生成回复时的长度"),
+           pseudo: int = typer.Option(16, "--pseudo", help="比较用键(打乱问题标签后按相同步骤创建的键)的数量(仅 scene)"),
+           iv: Optional[list[str]] = typer.Option(None, "--iv", help="用应用此干预(配方名称或路径，或单元的写法)后的回复和激活创建")):
+    """创建计算生成神经元的“场景键”和“几乎返回 1 的键”(MLP 输入空间、target mlpin)。
+    按回复位置分段反应的“位置键”用 gne direction key --target mlpin --positions pos:1-3 创建。"""
+    Ls = parse_layers(layers)
+    if not Ls:
+        raise GneError("BAD_ARGS", "请在 --layers 中指定层", "例 --layers 11,18,23")
+    s = holder["session"] = c.session()
+    d = s.direction_key(contrast, role=role, name=name, layers=Ls, subset=subset, max_tokens=max_tokens, pseudo=pseudo,
+                        iv=_iv_arg(iv), seed=c.seed, progress=s.progress)
+    lines = [f"{d['path']}(键 {d['name']}、{d['role']}、MLP 输入空间、{d['seconds']:.1f} 秒)"]
+    for r in d["layers"]:
+        if d["role"] == "one":
+            lines.append(f"  L{r['layer']}: 反应平均值 {r['response_mean']:.3f} ± {r['response_sd']:.3f}(最小 {r['response_min']:.2f}、最大 {r['response_max']:.2f}、{r['rows']} 个位置)")
+        else:
+            lines.append(f"  L{r['layer']}: kn {r['kn']:.3f}、目标问题 {r['examples_a']}、其他问题 {r['examples_b']}、创建所用问题上的差 {r['build_selectivity']:+.3f}"
+                         f"(比较用键的 p95 {_f(r['pseudo_selectivity_p95'], '+.3f')})")
+    lines += [f"注: {n}" for n in d["notes"]]
+    return d, "\n".join(lines), 0
+
+
+@gne_command(nw_app, "verify", "nw verify")
+def nw_verify(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optional[list[str]] = _UNIT,
+              direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 时单元的默认方向"),
+              key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 时单元的默认键"),
+              text: Optional[list[str]] = typer.Option(None, "--text", help="要读取的文本(默认是英文和日文各一句)。可指定多个"),
+              iv: Optional[list[str]] = typer.Option(None, "--iv", help="在预先应用此干预(配方名称或路径，或单元的写法)的状态下验证")):
+    """验证 nw 的 LoRA 是否按公式工作。逐层检查被覆盖神经元的门控、输入、激活是否符合公式，其他神经元是否没有变化，
+    MLP 输出的变化是否为 (新激活 × 新列) − (原激活 × 原列)。"""
+    s = holder["session"] = c.session()
+    r = s.recipe(units=unit, path=recipe, default_direction=direction, default_key=key)
+    d = s.nw_verify(r, texts=text or None, iv=_iv_arg(iv))
+    lines = []
+    for x in d["layers"]:
+        lines.append(f"L{x['layer']} N{','.join(map(str, x['neurons']))}: 门控误差 {x['gate_err']:.2e}、输入误差 {x['up_err']:.2e}、激活误差 {x['act_err']:.1e}、"
+                     f"其他神经元的变化 {x['others_changed_max']:.1e}、输出变化的相对误差(中位数){x['out_rel_err_median']:.2e}  {'○' if x['ok'] else '×'}")
+    lines.append(f"{'合格' if d['ok'] else '不合格'}(门控、输入、输出误差 < 5%，激活误差 < 0.1%，其他神经元的变化 < 1e-4。"
+                 "门控和输入仍会残留 1～2% 的偏差，来自按量化状态相乘与把行还原为 float 后相减的计算差异)")
+    return d, "\n".join(lines), 0 if d["ok"] else 1
+
+
+@gne_command(nw_app, "check", "nw check")
+def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optional[list[str]] = _UNIT,
+             contrast: Path = typer.Option(..., "--contrast", help="对照集(user_prompts = 目标场景、dont_touch = 不希望写入的场景)"),
+             direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 时单元的默认方向"),
+             key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 时单元的默认键"),
+             subset: str = typer.Option("odd", "--subset", help="使用的问题: odd(默认。创建键时未使用的一侧)/ even / all"),
+             replies: str = typer.Option("own", "--replies", help="own(读取应用配方后创建的回复，并保持配方应用状态 = 实际发生的情况)/ base(读取无干预的回复，但应用配方)"),
+             max_tokens: int = typer.Option(96, "--max-tokens"),
+             n_pos: int = typer.Option(8, "--positions", help="从位置 0 起逐位置输出到第几个(之后合并显示)"),
+             iv: Optional[list[str]] = typer.Option(None, "--iv", help="在预先应用此干预(配方名称或路径，或单元的写法)的状态下测量")):
+    """按位置类型输出键的反应和实际写入量(以 α·d 为 1)。在目标场景(对照集的问题)和不希望写入的场景
+    (dont_touch 组)中，从回复位置 0(开始书写之前)起依次显示。检查是否存在写入量远大于 1 的位置、
+    在不希望写入的场景中偏离 0 的位置，以及为负(反向)的位置。"""
+    s = holder["session"] = c.session()
+    r = s.recipe(units=unit, path=recipe, default_direction=direction, default_key=key)
+    d = s.nw_check(r, contrast, subset=subset, max_tokens=max_tokens, replies=replies, n_pos=n_pos, iv=_iv_arg(iv))
+    lines = [f"对照集 {d['contrast']}(subset {d['subset']}、回复 {d['replies']}、{d['seconds']:.0f} 秒)。值为写入量的平均值(α·d 为 1。括号内为最小～最大)"]
+    for g, x in d["groups"].items():
+        lines.append(f"[{g}] {x['n']} 个问题、循环 {x['loops']}")
+        for u in x["units"]:
+            cells = []
+            for b, p in u["positions"].items():
+                a = p["amount"]
+                cells.append(f"{b}: " + ("—" if a is None else f"{a['mean']:+.2f}({a['min']:+.2f}～{a['max']:+.2f})"))
+            lines.append(f"  {u['unit']}\n    " + "  ".join(cells))
+    lines += [f"注: {n}" for n in d["notes"]]
+    return d, "\n".join(lines), 0
+
+
+@gne_command(nw_app, "export", "nw export")
+def nw_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optional[list[str]] = _UNIT,
+              out: Optional[Path] = typer.Option(None, "--out", "-o", help="输出(默认 <root>/export/<配方名>-nw.lora.gguf)"),
+              direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 时单元的默认方向"),
+              key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 时单元的默认键"),
+              bake: bool = typer.Option(False, "--bake", help="烧录(不支持。会返回明确错误)"),
+              strip_meta: bool = typer.Option(False, "--strip-meta", help="不保留 gne 的记录(用于交给别人的版本)")):
+    """把 nw 单元导出为 LoRA 适配器 GGUF(用 llama.cpp 的 --lora 应用)。通过替换 ffn_gate、ffn_up、ffn_down，
+    每个神经元对应 3 个秩 1 张量。不提供烧录(Q8_0 的 ffn_down 中 32 个权重共享一个倍率，
+    只把 1 列替换成方向时误差会超过九成)。"""
+    s = holder["session"] = c.session()
+    r = s.recipe(units=unit, path=recipe, default_direction=direction, default_key=key)
+    if bake:
+        s._no_nw(r, bake=True)
+        raise GneError("BAD_ARGS", "计算生成的神经元(nw)不能烧录", "请导出为 LoRA 适配器(不加 --bake)")
+    out = out or (s.store.root / "export" / f"{r.name or 'recipe'}-nw.lora.gguf")
+    d = s.nw_export(r, out, strip_meta=strip_meta)
+    d.pop("warnings", None)
+    lines = [f"{d['path']}({d['bytes'] / 1e6:.2f} MB、LoRA)"]
+    for x in d["nw"]:
+        lines.append(f"  L{x['layer']} N{','.join(map(str, x['neurons']))}: {x['form']}、s {x['s']:g}、α {x['alpha']:+g}、方向 {x['direction']}、键 {x['key']}"
+                     + (f" & {x['key2']}" if x["key2"] else "") + f"、在键有反应的位置 |α|‖d‖ = {x['norm']:.2f}")
+    lines.append("在 llama.cpp 中用 --lora <此文件> 应用(倍率 1)。")
+    return d, "\n".join(lines), 0
+
 
 if __name__ == "__main__":
     app()

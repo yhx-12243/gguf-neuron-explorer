@@ -256,7 +256,7 @@ class Session:
         for u in r.units:
             if not 0 <= u.layer < self.meta.n_layer:
                 raise GneError("BAD_RECIPE", f"第 {u.layer} 层超出范围（0..{self.meta.n_layer - 1}）")
-            if u.mode == "keyed":                                   # CHANGE-07: まとめて _check_keyed で確かめる
+            if u.mode in ("keyed", "nw"):                           # CHANGE-07: まとめて _check_keyed で確かめる(nw は nw_plan)
                 continue
             if u.kind == "neuron" and self.weights.is_moe(u.layer):
                 raise GneError("BAD_RECIPE", f"第 {u.layer} 层是 MoE。专家神经元请按 {u.layer}:E<专家>:N{u.neuron} 的形式指定",
@@ -289,8 +289,12 @@ class Session:
                 self.warn(f"第 {u.layer} 层：第 0～2 层残差较小，rel dose 可能无法直接适用（R9）")
         if r.keyed_units:
             self._check_keyed(r)
+        if r.nw_units:                                              # 計算で作るニューロン: 層の形・鍵・方向・ニューロンの重なり
+            from .nwrite import nw_plan
+            nw_plan(self.weights, r, self._key_of, self.direction_set)
         if r.when != "all":                                         # レビュー P3: LoRA は位置で切り替えられない
-            lora_kinds = [k for k, us in (("keyed", r.keyed_units), ("gain", r.gain_units), ("proj", r.proj_units)) if us]
+            lora_kinds = [k for k, us in (("keyed", r.keyed_units), ("gain", r.gain_units), ("proj", r.proj_units),
+                                          ("nw", r.nw_units)) if us]
             if lora_kinds:
                 self.warn(f"when={r.when} 对 {"、".join(lora_kinds)} 无效（LoRA 从生成开始到结束始终生效。能按位置切换的只有 add 的 control vector）")
         return r.scaled(scale) if scale != 1.0 else r
@@ -362,8 +366,15 @@ class Session:
         raise GneError("FILE_NOT_FOUND", f"方向 {name} 不存在", "请用 gne direction --contrast <对照集> 创建")
 
     def direction_set(self, name: str):
+        """方向の名前 → DirectionSet。NAME.seg<i> は、区切りつきで作った方向 NAME の区切り i だけを 1 本の方向として見る版。"""
         from .direction import DirectionSet
-        p = self.direction_path(name)
+        try:
+            p = self.direction_path(name)
+        except GneError:
+            m = re.fullmatch(r"(.+)\.seg(\d+)", str(name))
+            if not m:
+                raise
+            return self.direction_set(m.group(1)).segment(int(m.group(2)))
         key, mt = str(p.resolve()), p.stat().st_mtime
         cache = self.__dict__.setdefault("_dirsets", {})
         if key not in cache or cache[key][0] != mt:
@@ -449,6 +460,8 @@ class Session:
         if recipe.keyed_units and any(u.k for u in recipe.keyed_units):   # CHANGE-07: 鍵つきの書き込み
             kpath, ref = self.keyed_lora(recipe)
             out.append((str(kpath), float(ref)))
+        if recipe.nw_units and any(u.k for u in recipe.nw_units):         # 計算で作るニューロン(ffn_gate・ffn_up・ffn_down の差し替え)
+            out.append((str(self.nw_lora(recipe)), 1.0))
         for u in recipe.query_units:                     # CHANGE-04 E: ヘッドの条件付きクエリ操作(実験的)
             if u.k:
                 out.append((str(self.query_lora(u)), 1.0))
@@ -546,6 +559,54 @@ class Session:
             tmp.replace(path)
         return path, ref
 
+    def nw_lora(self, recipe: Recipe) -> Path:
+        """レシピの nw のユニット → 実行時の LoRA(<root>/keys/<model_id>/lora/nw-<中身のハッシュ>.lora.gguf に作って使い回す)。
+        ファイル名は LoRA の中身で決まるので、鍵・方向・強さを変えれば別のファイルになる。"""
+        from .ablate import write_lora_tensors
+        from .nwrite import cache_hash, nw_meta, nw_plan, nw_tensors
+        nr = recipe.like([u for u in recipe.nw_units if u.k])
+        if not nr.units:
+            raise GneError("BAD_RECIPE", "没有 nw 单元（α 不为 0。例 --unit 11:N2045:nw:a1@NAME#KEY）")
+        rows = nw_plan(self.weights, nr, self._key_of, self.direction_set)
+        tens = nw_tensors(self.weights, rows)
+        d = self.store.key_dir(self.meta.model_id) / "lora"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"nw-{cache_hash(tens)}.lora.gguf"
+        if not path.exists():
+            tmp = path.with_suffix(".part")
+            write_lora_tensors(self.weights, tens, tmp, name=f"{self.meta.name} nw",
+                               kv={"gne.nw": json.dumps(nw_meta(rows), ensure_ascii=False)})
+            tmp.replace(path)
+        return path
+
+    def nw_export(self, recipe: Recipe | str | Path, out: str | Path, *, strip_meta: bool = False) -> dict:
+        """レシピの nw のユニットを LoRA アダプタ GGUF に書き出す(llama.cpp の --lora で当てる)。焼き込みは無い。"""
+        from .nwrite import export_nw_lora
+        r = recipe if isinstance(recipe, Recipe) else self.recipe(path=self.recipe_path(recipe))
+        others = sorted({u.mode for u in r.units if u.mode != "nw"})
+        rep = export_nw_lora(self.weights, r, out, self._key_of, self.direction_set, strip_meta=strip_meta)
+        if others or r.ablate is not None:
+            self.warn(f"此文件只包含 nw 单元（配方的其他干预 {'、'.join(others + (['ablate'] if r.ablate else []))} 不会写入。"
+                      "若要和 proj、keyed、gain 合并为一个 LoRA，请使用 gne headproj export）")
+        return {**rep, "recipe": r.name, "warnings": list(self.warnings)}
+
+    def nw_neurons(self, layers, **kw) -> dict:
+        """各ニューロンのふだんの働きを測り、働きの小さい順の表を返す(gne nw neurons)。"""
+        from .nwrite import neuron_usage
+        return neuron_usage(self, layers, **kw)
+
+    def nw_verify(self, recipe: Recipe | str | Path, **kw) -> dict:
+        """nw の LoRA が式どおりに動くか(gne nw verify)。"""
+        from .nwrite import verify
+        r = recipe if isinstance(recipe, Recipe) else self.recipe(path=self.recipe_path(recipe))
+        return verify(self, r, **kw)
+
+    def nw_check(self, recipe: Recipe | str | Path, contrast: str | Path, **kw) -> dict:
+        """位置の種類ごとの、鍵の反応と実際に足した量(gne nw check)。"""
+        from .nwrite import check
+        r = recipe if isinstance(recipe, Recipe) else self.recipe(path=self.recipe_path(recipe))
+        return check(self, r, contrast, **kw)
+
     def query_lora(self, u) -> Path:
         """query 单元 → attn_q 的 rank-1 LoRA（在 <root>/heads/<model_id>/ 中创建并复用）。计算 u・v 需要捕获对照集。"""
         from .heads import query_vectors, write_query_lora
@@ -617,11 +678,13 @@ class Session:
         from .gain import bake_gain_gguf, export_gain_lora
         from .headproj import merge_tensors
         recipe = self._as_recipe(recipe)
+        self._no_nw(recipe, bake=bake)                   # nw は焼き込めない(LoRA には入る)
         W = self.weights if into is None else self._target_weights(into)
         if recipe.add_units:
             self.warn("add 单元不会进入 gain 导出（可通过 gne export-cvec 导出为 control vector）")
         routes = [u for u in recipe.units if u.mode == "route"]
-        if not recipe.gain_units and not recipe.query_units and not routes and not recipe.proj_units and not recipe.keyed_units:
+        if not recipe.gain_units and not recipe.query_units and not routes and not recipe.proj_units and not recipe.keyed_units \
+                and not recipe.nw_units:
             raise GneError("BAD_RECIPE", "没有 gain 单元（例：--unit 14:8949:x2，注意力头为 21:H7:x0，方向分量投影为 33:H16:s6@NAME，带键写入为 19:ffn:keyed:a1@NAME#KEY）")
         if not bake and (routes or any(u.kind == "expert" for u in recipe.gain_units)):
             raise GneError("BAD_RECIPE", "专家整体的 gain 与 route 无法导出为 LoRA（会变成全秩）",
@@ -645,7 +708,20 @@ class Session:
             kb = self._keyed_bundle(recipe, W)
             extra_kv["gne.keyed"] = json.dumps(kb["meta"], ensure_ascii=False)
             summary = {**summary, "keyed_layers": kb["layers"], "keyed_rank": kb["rank"]}
-        extra = merge_tensors(ptens, kb["tensors"] if kb else {})
+        nwt = {}
+        if recipe.nw_units:                              # 計算で作るニューロンも同じ LoRA に入れる(ffn_gate・ffn_up・ffn_down の差し替え)
+            from .nwrite import nw_meta, nw_plan, nw_tensors
+            if into is not None:
+                raise GneError("BAD_ARGS", "nw 单元不能与 --into 一起导出（需要从应用目标模型读取要替换的原始行、列）")
+            nrows = nw_plan(W, recipe.like([u for u in recipe.nw_units if u.k]), self._key_of, self.direction_set)
+            clash = sorted({u.layer for u in recipe.gain_units if u.kind == "neuron"} & {r["layer"] for r in nrows})
+            if clash:
+                raise GneError("BAD_RECIPE", f"层 {', '.join(map(str, clash))} 同时存在神经元 gain 和 nw（两者都会修改 ffn_up，"
+                                             "无法合并为 1 个 LoRA）", "请用 gne nw export 将 nw 单独导出为适配器")
+            nwt = nw_tensors(W, nrows)
+            extra_kv["gne.nw"] = json.dumps(nw_meta(nrows), ensure_ascii=False)
+            summary = {**summary, "nw": nw_meta(nrows)["units"]}
+        extra = merge_tensors(ptens, kb["tensors"] if kb else {}, nwt)
         if via_f16 and not bake:
             raise GneError("BAD_ARGS", "--via-f16 需要与 --bake 一起使用")
         if strip_meta and (recipe.query_units or (bake and requant in ("patch", "auto") and not extra and not via_f16
@@ -765,6 +841,16 @@ class Session:
             what = f"专家张量 {len(grown)} 个（{grown[0]} 等）" if grown else "专家张量"
             self.warn(f"{what} 已用与原始文件不同的类型重写，因此文件增大了 {tot / 2 ** 20:.0f} MiB（一个张量只有一个类型，所以未编辑的专家也会被转换）。要按原类型写回，请使用 --requant keep（未编辑的专家保持原字节。普通烧录中 K-quant、IQ 类型会变为 Q8_0）。若用于分发，LoRA（不加 --bake）更小且更准确")
 
+    def _no_nw(self, recipe: Recipe, *, bake: bool) -> None:
+        """nw のユニットは、この書き出しには入れられない(焼き込みは無い。LoRA は gne nw export)。"""
+        if not recipe.nw_units:
+            return
+        if bake:
+            raise GneError("BAD_ARGS", "计算生成的神经元（nw）不能烧录",
+                           "Q8_0 的 ffn_down 中 32 个权重共享 1 个缩放，仅将 1 列替换为方向会产生超过 90% 的误差。"
+                           "请用 gne nw export 生成 LoRA 适配器，并通过 llama.cpp 的 --lora 应用")
+        # LoRA なら、gne gain / gne headproj export が proj・keyed・gain と同じファイルに入れる(Session.gain)
+
     def _warn_when(self, recipe: Recipe, what: str) -> None:
         if recipe.ablate is not None:
             self.warn(f"ablate（{recipe.ablate.label()}）无法用 {what} 表示，已移除（§6.17）。"
@@ -854,6 +940,7 @@ class Session:
     def bake(self, recipe: Recipe | list[str], dst: str | Path, *, verify: bool = False,
              verify_prompt: str = "Who are you?", n_tokens: int = 32) -> dict:
         recipe = self._as_recipe(recipe)
+        self._no_nw(recipe, bake=True)
         self._warn_when(recipe, "bake")
         if not recipe.add_units:
             raise GneError("BAD_RECIPE", "没有 add 单元", "gain 可通过 gne gain --bake 写入改写后的 GGUF")
@@ -1318,10 +1405,14 @@ class Session:
                   select: str | int | None = None, mode: str = "ablate", layers: str | list[int] | None = None,
                   dose: float = 0.5, max_tokens: int = 64, kl_max: float = 0.1, min_distinct: float = 0.8,
                   per_layer: bool = False, judge_model: str | Path | None = None, judge_target: str | None = None,
-                  response_tokens: int = 96, random_controls: int = 16) -> dict:
+                  response_tokens: int = 96, random_controls: int = 16, same_reply: bool = False,
+                  segments: str | list | None = None, stack_layers: str | list[int] | None = None) -> dict:
         """根据对照集创建并保存所有层方向 r_L；select="auto" 时选择效果较大的层（数字则手动指定）。
         random_controls > 0 时，在层选择中加入同量级的随机方向对照，只选择超过对照 p95 的层（CHANGE-03 A）。
-        positions="response" 时从回复 token 创建（用 A / B 的 system 生成到 response_tokens 的回复再计算）。"""
+        positions="response" 时从回复 token 创建（用 A / B 的 system 生成到 response_tokens 的回复再计算）。
+        same_reply(positions response だけ): B 側も A 側の返事を読む(同じ返事を両方の条件で読ませた差。読んでいる語の違いから来る
+        成分が入らない)。segments("0,1-3,4-"): 返事の位置で分けた方向も作る(名前 NAME.seg<i> で 1 本の方向として使える)。
+        stack_layers: 区切りつきの方向を、これらの層に重ねて書く前提の値にする(direction.response_directions)。"""
         from .direction import (DirectionSet, candidate_layers, layer_table, load_contrast, response_directions,
                                 save_directions, save_select, select_layer)
         from .evalx import Judge
@@ -1333,8 +1424,14 @@ class Session:
         name = name or cs.name
         if not re.fullmatch(r"[\w.\-]+", name):
             raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含字母、数字、_、-、.")
+        if isinstance(stack_layers, str):
+            stack_layers = [int(x) for x in re.split(r"[,\s]+", stack_layers.strip()) if x]
+        if (same_reply or segments or stack_layers) and positions != "response":
+            raise GneError("BAD_ARGS", "same_reply、segments、stack_layers 只能在 positions 为 response 时使用",
+                           "gne direction --contrast C --positions response --same-reply")
         if positions == "response":
-            cr = response_directions(self, cs, max_tokens=response_tokens, progress=self.progress)
+            cr = response_directions(self, cs, max_tokens=response_tokens, progress=self.progress, same_reply=same_reply,
+                                     segments=segments, stack_layers=stack_layers)
         else:
             from .reverse import side_interventions
             cr = contrastive_directions(self.engine, cs, positions=positions, with_act=False, progress=self.progress,
@@ -1366,7 +1463,12 @@ class Session:
                     judge.close()
         if sel is not None:
             save_select(path.with_suffix(".select.json"), sel)
-        return {"name": name, "path": str(path), "contrast": str(contrast), "contrast_sha": cs.sha, "positions": positions,
+        how = {"method": cr.method, "same_reply": bool(getattr(cr, "same_reply", False))}
+        if ds.segments:
+            how["segments"] = [{"index": i, "positions": sg, "name": f"{name}.seg{i}",
+                                "rows": {"A": cr.seg_rows["A"][i], "B": cr.seg_rows["B"][i]}} for i, sg in enumerate(ds.segments)]
+            how["stack_layers"] = list(getattr(cr, "stack_layers", []) or [])
+        return {"name": name, "path": str(path), "contrast": str(contrast), "contrast_sha": cs.sha, "positions": positions, **how,
                 **({"sides": cs.describe()} if (cs.has_recipes or cs.separate_prompts or cs.system_a is None
                                                 or cs.system_b is None) else {}),
                 "n_prompts": len(cs.user_prompts), "n_rows": cr.n_rows, "layers": layer_table(ds, rho),
@@ -1962,7 +2064,7 @@ class Session:
 
     PIPELINE_DEFAULTS = {"positions": "last", "score_positions": "last", "target": None, "n_heads": [6, 5, 4], "hard": 16,
                          "top_layers": 4, "max_examples": 64, "s_max": 30.0, "direction_layer": "own", "resume": True,
-                         "include_score_layers": False}
+                         "include_score_layers": False, "same_reply": False}
 
     def heads_pipeline(self, spec: dict | str | Path, **over) -> dict:
         """対照集合(JSON か YAML、または dict)から、方向づくり → 基準層 → 因果スクリーニング → 強さの配分 を 1 回で回す。
@@ -2028,8 +2130,8 @@ class Session:
                     reused.append("direction")
             except GneError:
                 d = None
-        if d is None:
-            d = self.direction(contrast=path, name=name, positions=pipe["positions"])
+        if d is None:                                      # same_reply は positions response のときだけ(違えば direction が断る)
+            d = self.direction(contrast=path, name=name, positions=pipe["positions"], same_reply=bool(pipe["same_reply"]))
         out["direction"] = {"path": d["path"], "positions": d["positions"], "n_rows": d["n_rows"],
                             "seconds": time.perf_counter() - ts, "reused": "direction" in reused}
         ts = time.perf_counter()                                   # 2. 基準層(cohen_d が最大の層)
@@ -2553,7 +2655,8 @@ class Session:
         verification.md F132・F139)。keyed を含まないレシピの auto は q8_0。
         verify なら焼き込み版と LoRA 版を V26 の 4 項目で比べる(keyed だけなら keyed の方向で測る)。"""
         recipe = self._as_recipe(recipe)
-        if not recipe.proj_units and not recipe.gain_units and not recipe.keyed_units:
+        self._no_nw(recipe, bake=bake)                   # nw は焼き込めない(LoRA には入る)
+        if not recipe.proj_units and not recipe.gain_units and not recipe.keyed_units and not recipe.nw_units:
             raise GneError("BAD_RECIPE", "没有 proj 单元（例 --unit 33:H16:s6@NAME，带键写入为 19:ffn:keyed:a1@NAME#KEY）")
         if requant is None:
             requant = "auto" if recipe.keyed_units else "q8_0"
@@ -2588,6 +2691,18 @@ class Session:
 
     def direction_key(self, contrast: str | Path, **kw) -> dict:
         """対照集合から keyed の鍵を作る(gne direction key)。中身は gne/keyed_build.py の build_keys。"""
+        role = kw.pop("role", None)
+        if role in ("scene", "one"):                     # 計算で作るニューロン用の、場面の鍵・ほぼ 1 を返す鍵(target mlpin)
+            from .nwrite import build_role_key
+            if str(kw.pop("target", "mlpin") or "mlpin") != "mlpin":
+                raise GneError("BAD_ARGS", "role scene / one 的键只能使用 target mlpin")
+            keep = ("layers", "name", "subset", "max_tokens", "pseudo", "iv", "seed", "q_energy", "progress")
+            extra = sorted(k for k, v in kw.items() if k not in keep and v not in (None, False))
+            if extra:
+                raise GneError("BAD_ARGS", f"role {role} 的键不能使用 {', '.join(extra)}")
+            return build_role_key(self, contrast, role=role, **{k: v for k, v in kw.items() if k in keep and v is not None})
+        if role not in (None, "position"):
+            raise GneError("BAD_ARGS", f"role 必须为 position / scene / one（{role!r}）")
         from .keyed_build import build_keys
         return build_keys(self, contrast, **kw)
 
@@ -2831,6 +2946,12 @@ def vector_key_of(path: Path) -> str:
 def _unit_spec(u: dict) -> str:
     """to_dict() 的单元 → L:N:+dose / L:N:xk / L:Hh:xk（query 为 L:Hh:query:方向:×scale，用于显示）。
     keyed(CHANGE-07)は L:ffn|attn|S|Ee:keyed:aα[@方向][#鍵]。"""
+    if u.get("mode") == "nw":
+        a = u.get("k") if u.get("k") is not None else u.get("alpha")
+        return (f"{u['layer']}:N{u.get('neuron')}" + (f"+N{u['pair']}" if u.get("pair") is not None else "")
+                + ":nw:" + ("a?" if a is None else f"a{a:g}") + (f"@{u['direction']}" if u.get("direction") else "")
+                + (f"#{u['key']}" if u.get("key") else "") + (f"&{u['key2']}" if u.get("key2") else "")
+                + (f"!s{u['s']:g}" if u.get("s") is not None else "") + (f"!cap{u['cap']}" if u.get("cap") else ""))
     if u.get("mode") == "keyed":
         kind = u.get("kind")
         who = {"ffn": "ffn", "attn": "attn", "shared": "S"}.get(kind, f"E{u.get('expert')}")

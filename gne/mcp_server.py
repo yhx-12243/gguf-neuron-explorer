@@ -81,9 +81,21 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    全层 × ffn,attn 的候选，在不生成文本的情况下将行为部分的对数概率降幅与比较用键并排测量（第 1 阶段，筛选。
    将标记数量与“即使偶然也会被标记的数量”比较）。不生成的值并非保证，因此由使用者挑选几个候选，通过
    direction_key_causal_verify(units, result) 的生成，将行为数量与仅 iv、比较用键比较（第 2 阶段）。不会自动决定为 1 个。
+   方向创建方式：direction(positions="response", same_reply=True) 会让 A 侧、B 侧两种条件读取同一份回复，取其差
+   （只含条件差异的成分）。默认创建方式（各自读取自己的回复后的差）的方向还包含“所读词语差异”的成分，持续写入时
+   更容易陷入重复（Qwen3.5-4B 性格的 1 个示例。docs/keyed-write.md §19）。
    MoE 层用 direction_key(target="shared")写入 shared expert，用 target="expert:e" 写入专家 e(单元为 L:S / L:Ee:keyed:…)。
    专家用 direction_key_experts 选择在写入位置经常被选中的(rate_a 大且 rate_b 小)专家。烧录时
    默认(auto)与 requant="keep" 下，原为 Q8_0 的专家张量保持原类型(f16 会使整个张量变为 F16 而变大)。
+11. FiSH（Formula-instantiated Scene-gated Hidden units。计算生成的神经元，mode nw，docs/fish.md）。无需训练，用计算出的权重覆盖 MLP 神经元，
+   只在键响应的位置写入方向。单元："L:Nn:nw:aα@方向#键"（1 个键）、"L:Nn:nw:aα@方向#场景键&位置键"（2 个键 = 场景且位置）、
+   "L:Nn+Nm:nw:aα@方向#键&返回 1 的键"（2 个一组，为写入量设置上限。反向写入很小。默认 s 16、阈值 0.4-0.8）。
+   步骤：用 direction(positions="response", same_reply=True, segments="0,1-3,4-") 创建方向（区段 i 为 "NAME.seg<i>"）→ 用 nw_neurons(layers)
+   查看活动量小的神经元表并选择编号 → 用 direction_key(target="mlpin", positions="pos:1-3") 创建位置键、
+   direction_key(role="scene") 创建场景键、direction_key(role="one") 创建返回接近 1 的键 → nw_verify（是否符合公式）→ nw_check（各位置的
+   写入量。目标场景约为 1、不希望写入场景约为 0 吗）→ 用 steer / behave 阅读回复 → nw_export（LoRA。不烧录）。
+   仅支持带门控的 MLP（SiLU 门控 × 输入、无偏置）的 dense 层（MoE 层及其他形式会返回 ARCH_UNSUPPORTED）。
+   要改变语气，必须在整段回复中持续写入（只写前几个 token 不够）。强度范围较窄，请阅读回复后决定。
 
 """
 
@@ -194,7 +206,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def direction(contrast: str, name: str | None = None, select: str | None = None, mode: str = "ablate",
                         layers: str | None = None, dose: float = 1.0, positions: str = "last",
-                        random_controls: int = 16) -> dict:
+                        random_controls: int = 16, same_reply: bool = False, segments: str | None = None,
+                        stack_layers: str | list[int] | None = None, response_tokens: int = 96) -> dict:
         """从对照集（configs/contrast/ 的名称或路径。system_a / system_b / user_prompts，选层使用 validate.match）
         创建并保存所有层方向 r_L = mean_A − mean_B（生成提示词的最后一个 token）（§6.17）。
         select="auto" 时按候选层测量效果并用任务选层（结果用 job_status 查看）。mode="add" 检查在第 L 层
@@ -202,11 +215,17 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         创建的方向可用 "L:dir:NAME:+0.5"（rel dose）加入 steer 的 units。
         positions="response" 时用 A / B 的 system 生成回复，并用回复 token 测量（添加人格时通常更有效）。
         按层运行 random_controls 个同量级随机方向作为对照，只选择效果超过对照 p95 的层
-        （行中的 ctrl_effect_p95・null_pct，所选层的 selected_null_pct。0 表示无对照）。"""
+        （行中的 ctrl_effect_p95・null_pct，所选层的 selected_null_pct。0 表示无对照）。
+        方向の作り方(positions="response" のとき。結果の method に記録): same_reply=False(既定)は今までどおり、A 側・B 側が
+        それぞれ自分の返事を読んだ差。same_reply=True は、同じ返事(A 側の返事)を A 側の条件と B 側の条件の両方で読ませた差
+        (条件の違いだけの成分。読んでいる語の違いから来る成分が入らない)。segments="0,1-3,4-" で返事の位置で分けた方向も作る
+        (位置 0 = 返事を書き始める直前。区切り i は "NAME.seg<i>" という名前でユニットに書ける)。stack_layers="11,18,23" は、
+        区切りつきの方向をその層に重ねて書く前提の値にする(上の層は、下の層に足した後の残り。時間がかかる)。"""
         try:
             params = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
                       "select": select, "mode": mode, "layers": layers, "dose": dose, "positions": positions,
-                      "random_controls": random_controls}
+                      "random_controls": random_controls, "same_reply": same_reply, "segments": segments,
+                      "stack_layers": stack_layers, "response_tokens": response_tokens}
         except Exception as e:  # noqa: BLE001
             return _err(e)
         if select == "auto":
@@ -554,24 +573,28 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                             q_max_samples: int = 4096, subset: str = "even", pseudo: int = 16,
                             replies_a: str | list[str] | None = None, replies_b: str | list[str] | None = None,
                             iv: str | list[str] | None = None, target: str = "ffn", seed: int = 0,
-                            dont_touch_start: bool | None = None) -> dict:
-        """鍵つきの書き込みの鍵 κ を作るジョブを投げる(CHANGE-07、job_status で結果)。対照集合(configs/contrast/ の名前かパス)の
-        書き込みたい位置の活性の平均 μ を、書き込みたくない位置と dont_touch の活性が張る空間に直交させ、κᵀμ = 1 にして
-        <root>/keys/<model_id>/<name>.npz に保存する。layers は必須(例 [8, 14, 20])。positions(省くと対照集合の値)が
-        "before:<正規表現>" なら推論時と同じ文脈のモデル自身の返事で、一致する文字を書く直前を書き込みたい位置、残りの位置を書き込みたくない位置にする。
-        replies_a / replies_b は返事を読ませるファイルかリスト(生成しない)。q_mode: examples(既定)/ means / samples。
-        subset は既定 even(direction_key_check は odd で確かめる)。iv はこの介入(レシピかユニット)を当てた状態で作る。
-        target は書き込み先: ffn(既定、dense の ffn_down の入力)/ attn(attn_output・ssm_out の入力 = ヘッド出力の連結)/
-        shared(MoE の層の shared expert の ffn_down_shexp の入力)/ expert:e(ffn_down_exps の専門家 e の入力。専門家 e が
-        選ばれた位置だけで作るので、書き込みたい位置でよく選ばれる専門家を選ぶ)。ユニットは L:ffn / L:attn / L:S / L:Ee:keyed:…。
-        dont_touch の各群の質問の、返事を書き始める直前の位置も Q に入る(既定。dont_touch_start=False か
-        対照集合の dont_touch_start: false で切る。入れた行の数は結果の dont_touch_start。書き込みたくない側の、返事を書き始める直前の位置は入れない)。
-        結果の層ごとの kn(1 に近いほど書き込みたくない位置と重ならない、0.05 未満は弱い)と build_auc(作成に使った例での値で甘い)。
-        warnings を必ず見る: 書き込みたい位置を含む例が 2 未満か、書き込みたい位置が 8 未満(専門家の鍵は層ごとの行)なら少ない。
-        "before:<正規表現>" で書き込みたい位置の 25% 以上(μ に占める重み、結果の reply_start.share)が返事の冒頭(最初の
-        3 トークンを決める位置)にあると、鍵がどの返事の冒頭にも反応しやすい。dont_touch の群があれば、その質問の、返事を
-        書き始める直前の位置が Q に入っているので注(notes)になり、無ければ
-        警告になる(ふつうの質問を dont_touch に足して作り直す)。"""
+                            dont_touch_start: bool | None = None, role: str | None = None) -> dict:
+        """提交创建键控写入所用键 κ 的作业（CHANGE-07，用 job_status 查看结果）。将对照集合（configs/contrast/ 中的名称或路径）
+        在目标写入位置的平均激活 μ，与不希望写入位置及 dont_touch 激活张成的空间正交，使 κᵀμ = 1，并保存到
+        <root>/keys/<model_id>/<name>.npz。必须指定 layers（例 [8, 14, 20]）。positions（省略时使用对照集合的值）为
+        "before:<正则表达式>" 时，使用与推理时相同上下文中模型自身的回复，将匹配文字之前的位置作为目标写入位置，其余位置作为不希望写入位置。
+        replies_a / replies_b 是用于读取回复的文件或列表（不生成）。q_mode：examples（默认）/ means / samples。
+        subset 默认 even（direction_key_check 使用 odd 验证）。iv 表示在应用该干预（配方或单元）的状态下创建。
+        target 是写入目标：ffn（默认，dense 的 ffn_down 输入）/ attn（attn_output、ssm_out 的输入 = 注意力头输出拼接）/
+        shared（MoE 层的 shared expert 的 ffn_down_shexp 输入）/ expert:e（ffn_down_exps 中专家 e 的输入。仅在专家 e
+        被选中的位置创建，因此会选择在目标写入位置经常被选中的专家）。单元为 L:ffn / L:attn / L:S / L:Ee:keyed:…。
+        dont_touch 各题组问题在开始写回复之前的位置也会进入 Q（默认。可用 dont_touch_start=False 或
+        对照集合中的 dont_touch_start: false 关闭。写入的行数见结果中的 dont_touch_start。不会加入不希望写入侧开始写回复之前的位置）。
+        结果中各层的 kn（越接近 1 越不与不希望写入位置重叠，低于 0.05 表示较弱）和 build_auc（来自建键示例，偏乐观）。
+        务必查看 warnings：若包含目标写入位置的示例少于 2 个，或目标写入位置少于 8 个（专家键按层计行），则数量偏少。
+        使用 "before:<正则表达式>" 时，若目标写入位置中有 25% 以上（占 μ 的权重，结果中的 reply_start.share）位于回复开头（决定前
+        3 个 token 的位置），键就更容易对任何回复开头产生响应。若存在 dont_touch 组，其问题开始写回复之前的位置会进入 Q，
+        因此会成为注记（notes）；若不存在，则会成为
+        警告（请将普通问题加入 dont_touch 后重建）。
+        FiSH（计算生成的神经元，mode nw）的键使用 target="mlpin"（dense MLP 的输入空间）。对回复位置区段响应的键使用
+        positions="pos:1-3"（位置 0 = 开始写回复之前，"pos:4-" 表示 4 及之后）。role="scene" 会在目标场景问题（user_prompts）的
+        整段回复中响应，且不会对 dont_touch 问题响应；role="one" 是任意位置都返回接近 1 的键（用于带上限的形式）。
+        传入 role 时 target 固定为 mlpin，且不使用 positions、q_mode 等。"""
         from .jobs import _layers
         try:
             if not _layers(layers):
@@ -581,9 +604,78 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                  "q_mode": q_mode, "q_energy": q_energy, "q_max_rank": q_max_rank, "q_max_samples": q_max_samples,
                  "subset": subset, "pseudo": pseudo, "replies_a": replies_a, "replies_b": replies_b, "iv": iv,
                  "target": target, "seed": seed, "dont_touch_start": dont_touch_start}
+            if role in ("scene", "one"):
+                p = {"contrast": p["contrast"], "layers": layers, "name": name, "max_tokens": max_tokens, "subset": subset,
+                     "pseudo": pseudo, "iv": iv, "seed": seed, "role": role}
+            elif role not in (None, "position"):
+                raise GneError("BAD_ARGS", f"role 必须为 position / scene / one（{role!r}）")
             return jobs.start("direction_key", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
+
+    @srv.tool()
+    async def nw_neurons(layers: list[int] | str, top: int = 20, sort: str = "sum", max_tokens: int = 96,
+                         corpus_tokens: int = 2048, iv: str | list[str] | None = None) -> dict:
+        """提交用于选择 FiSH（计算生成的神经元，mode nw）覆盖对象的作业（用 job_status 查看结果）。对每层测量各神经元的
+        日常活动量（|门控后激活| × 输出列长度 = 在 1 个位置写入残差的长度），使用普通问题的无干预回复和默认语料，
+        返回按活动量从小到大排序的表（编号、平均、最大、最大 ÷ MLP 输出长度、排名）。sort：sum（最大排名 + 平均排名，默认）/
+        max / mean。使用哪个由查看表格后选择（不会自动决定）。覆盖后，该神经元原有的功能将消失。
+        传入 iv（已保存配方的名称或路径，或单元写法列表）时，在应用该干预的状态下测量（例：在应用 CHiPS 配方
+        的状态下选择神经元）。nw_verify、nw_check、direction_key 的 iv 含义相同。"""
+        try:
+            return jobs.start("nw_neurons", {k: v for k, v in {"layers": layers, "top": top, "sort": sort, "max_tokens": max_tokens,
+                                                               "corpus_tokens": corpus_tokens, "iv": iv}.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def nw_verify(units: list[str] | None = None, recipe: str | None = None, texts: list[str] | None = None,
+                        iv: str | list[str] | None = None) -> dict:
+        """验证 nw 单元（"L:Nn:nw:aα@方向#键" = 1 个键、"…#场景键&位置键" = 2 个键、"L:Nn+Nm:nw:aα@方向#键&返回 1 的键" = 带上限）的
+        LoRA 是否按公式工作。检查被覆盖神经元的门控、输入、激活是否符合公式，其他神经元是否未改变，
+        MLP 输出变化是否匹配（各层的 ok）。recipe 是已保存配方的名称，或使用 units。"""
+        try:
+            if bool(recipe) == bool(units):
+                raise GneError("BAD_ARGS", "请通过 recipe（已保存配方的名称）或 units 之一传入")
+            r = session.recipe(path=session.recipe_path(recipe)) if recipe else session.recipe(units=units)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+        return await call(session.nw_verify, r, texts=texts, iv=iv)
+
+    @srv.tool()
+    async def nw_check(contrast: str, units: list[str] | None = None, recipe: str | None = None, subset: str = "odd",
+                       replies: str = "own", max_tokens: int = 96, n_pos: int = 8, iv: str | list[str] | None = None) -> dict:
+        """提交测量 nw 配方在不同位置类型下的键响应与实际写入量的作业（以 α·d 为 1，用 job_status 查看结果）。
+        对对照集合的问题（目标场景 = groups.scene）和 dont_touch 组（不希望写入的场景），按回复位置 0（开始写回复之前）～
+        n_pos−1 及之后，为每个单元给出 amount、rho_gate、rho_up 的平均、最小、最大。replies="own" 表示应用配方
+        生成回复并保持应用状态读取（实际发生的情况。重复数量见 groups.<名称>.loops），"base" 表示读取无干预回复。
+        关注点：目标场景中写入量明显偏离 1 的位置、不希望写入场景中远离 0 的位置、负值（反向）位置。"""
+        try:
+            if bool(recipe) == bool(units):
+                raise GneError("BAD_ARGS", "请通过 recipe（已保存配方的名称）或 units 之一传入")
+            r = str(session.recipe_path(recipe)) if recipe else session.recipe(units=units)
+            return jobs.start("nw_check", {"recipe": r, "contrast": str(_contrast_path(session, contrast, None, None, None, None)),
+                                           "subset": subset, "replies": replies, "max_tokens": max_tokens, "n_pos": n_pos,
+                                           **({"iv": iv} if iv is not None else {})}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def nw_export(recipe: str | None = None, units: list[str] | None = None, name: str | None = None,
+                        strip_meta: bool = False) -> dict:
+        """将 nw 单元导出为 LoRA 适配器 GGUF（<root>/export/<名称>-nw.lora.gguf）。通过 llama.cpp 的 --lora 应用（倍率 1）。
+        替换 ffn_gate、ffn_up、ffn_down，每个神经元对应 3 个秩 1 张量。不烧录（Q8_0 的 ffn_down 中
+        32 个权重共享 1 个缩放，仅将 1 列替换为方向会产生超过 90% 的误差）。配方的其他干预（keyed、gain 等）
+        不会进入此文件。若要和 proj（CHiPS）、keyed、gain 合并为 1 个 LoRA，请使用 headproj_export / keyed_export
+        （nw 单元也会写入同一文件。bake=True 会报错）。"""
+        try:
+            if bool(recipe) == bool(units):
+                raise GneError("BAD_ARGS", "请通过 recipe（已保存配方的名称）或 units 之一传入")
+            r = session.recipe(path=session.recipe_path(recipe)) if recipe else session.recipe(units=units, name=name or "units")
+            out = session.store.root / "export" / f"{r.name or 'recipe'}-nw.lora.gguf"
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+        return await call(session.nw_export, r, out, strip_meta=strip_meta)
 
     @srv.tool()
     async def direction_key_check(key: str, contrast: str | None = None, subset: str = "odd", layers: list[int] | str | None = None,
@@ -661,7 +753,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                                      q_mode: str | None = None, subset: str | None = None, pseudo: int | None = None,
                                      replies_a: str | list[str] | None = None, replies_b: str | list[str] | None = None,
                                      iv: str | list[str] | None = None, seed: int | None = None,
-                                     dont_touch_start: bool | None = None, check: bool = True) -> dict:
+                                     dont_touch_start: bool | None = None, check: bool = True,
+                                     same_reply: bool | None = None) -> dict:
         """鍵つきの書き込みを、対照集合 1 つから「方向 → 鍵 → key-check」まで 1 回のジョブで回す(CHANGE-07、job_status で結果。
         UI の鍵のタブの「方向から key-check まで」と同じ)。contrast は対照集合の表(name・user_prompts・positions・dont_touch・
         system_a など。<root>/contrasts/<name>.yaml に書いてから使う)か、configs/contrast/ の名前・configs/keyed/ のひな形の名前・パス。
@@ -672,7 +765,9 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         compact にしたもの)。check=False で回さない。layers は必須(引数か表の keyed.layers)。表の keyed(layers・target・q_mode・
         subset・pseudo・max_tokens・alpha)は渡していない引数の既定になる(alpha は結果の alpha_hint に返すだけ。レシピの α の目安)。
         結果: direction(name・reused・rebuilt)、key(direction_key の結果)、check(key-check の結果)、contrast_path、warnings。
-        判断は direction_key_check と同じ: check の held_out が true で、beats_pseudo の層だけを使う。"""
+        判断は direction_key_check と同じ: check の held_out が true で、beats_pseudo の層だけを使う。
+        same_reply=True で、方向を「同じ返事(A 側の返事)を A 側・B 側の条件の両方で読ませた差」で作る(既定は今までどおり。
+        表の keyed.same_reply でも指定できる。結果の direction.same_reply に記録)。"""
         from .jobs import _layers
         try:
             spec, path = None, None
@@ -695,7 +790,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                  "rebuild_direction": bool(rebuild_direction) or None, "response_tokens": response_tokens, "target": target,
                  "positions": positions, "positions_b": positions_b, "skip": skip, "max_tokens": max_tokens, "q_mode": q_mode,
                  "subset": subset, "pseudo": pseudo, "replies_a": replies_a, "replies_b": replies_b, "iv": iv, "seed": seed,
-                 "dont_touch_start": dont_touch_start, "check": None if check else False, "compact": True}
+                 "dont_touch_start": dont_touch_start, "check": None if check else False, "compact": True,
+                 "same_reply": same_reply}
             return jobs.start("direction_key_pipeline", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
