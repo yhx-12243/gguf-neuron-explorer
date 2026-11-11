@@ -96,6 +96,10 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    写入量。目标场景约为 1、不希望写入场景约为 0 吗）→ 用 steer / behave 阅读回复 → nw_export（LoRA。不烧录）。
    仅支持带门控的 MLP（SiLU 门控 × 输入、无偏置）的 dense 层（MoE 层及其他形式会返回 ARCH_UNSUPPORTED）。
    要改变语气，必须在整段回复中持续写入（只写前几个 token 不够）。强度范围较窄，请阅读回复后决定。
+   要一次完成，请用 fish_pipeline(contrast, layers, alpha)。强度可按分段设置（对 segments "0,1-3,4-" 使用 alpha [1, 1, 0.8]）。
+   在创建前，可用 nw_try(direction, contrast, layers, alpha) 查看直接加到层输出的回复，比较层和强度。
+   在 Qwen3.5-4B 的一个示例中，连续的 13 层（11～23）、强度 1 / 1 / 0.8 比分离的 3 层更好（符合人格的回复 27～29% → 53%）。
+   层号因模型而异。根据问题不同，会有 1～8% 的回复陷入重复（无法脱离同一语句）（docs/fish.md §8）。
 
 """
 
@@ -660,6 +664,69 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
+    def _fish_contrast(contrast) -> dict:
+        """FiSH のジョブの対照集合: 表(spec)、configs/contrast/ の名前・パス、configs/fish/ のひな形の名前。"""
+        if isinstance(contrast, dict):
+            return {"spec": {k: v for k, v in contrast.items() if k != "about"}}
+        try:
+            return {"contrast": str(_contrast_path(session, contrast, None, None, None, None))}
+        except GneError:
+            tpl = CONFIGS / "fish" / f"{str(contrast).removesuffix('.json')}.json"
+            if not tpl.exists():
+                raise
+            d = json.loads(tpl.read_text(encoding="utf-8"))
+            d.pop("about", None)
+            return {"spec": d}
+
+    @srv.tool()
+    async def fish_pipeline(contrast: dict[str, Any] | str, layers: list[int] | str, alpha: float | list[float] | str | None = None,
+                            segments: str | None = None, form: str | None = None, name: str | None = None,
+                            same_reply: bool | None = None, stack: bool | None = None, rekey: bool | None = None,
+                            pseudo: int | None = None, max_tokens: int | None = None, response_tokens: int | None = None,
+                            iv: str | list[str] | None = None, neurons: dict[str, list[int]] | None = None, top: int = 20) -> dict:
+        """用一次作业从头到尾创建 FiSH（用 job_status 查看结果。与 UI 的 FiSH 标签页“全部构建”相同）：方向 → 神经元表 →
+        键 → 单元 → 在应用这些单元的状态下重建键 → 是否符合公式 → 写入量。contrast 可以是对照集的表（包含 name、system_a、
+        user_prompts、dont_touch 以及 fish 设置），也可以是 configs/contrast/ 的名称或路径、configs/fish/ 的模板名称。
+        layers 为必填项，由使用者决定（列表或 "11-23"、"11,18,23"。因模型而异）。alpha 为强度，只写一个值时用于所有分段；
+        按分段设置时，请按分段顺序写 [1, 1, 0.8] 或 "1,1,0.8"（对应 segments "0,1-3,4-"）。form 为 cap（带上限的 2 个一组，默认）/
+        two / one。未传入的参数依次使用表中的 fish 设置、再使用默认值（segments "0,1-3,4-"、form cap、alpha 0.9，并启用 same_reply、stack、rekey）。
+        层越多，需要的神经元数量（层 × 分段 × 形式的个数）和创建时间越多（Qwen3.5-4B 的 13 层为 78 个，方向和键约需 16 分钟）。
+        结果：units（配方中单元的写法）、direction、usage、neurons、keys、rekeyed、verify（ok）、check（groups.scene 与
+        dont_touch:<名称> 各位置写入量）、stage_seconds。若要在创建前比较层和强度，请使用 nw_try。"""
+        from .jobs import _layers
+        try:
+            if not _layers(layers):
+                raise GneError("BAD_ARGS", "请在 layers 中指定层（例 [11, 18, 23] 或 \"11-23\"）")
+            p = {**_fish_contrast(contrast), "layers": layers, "alpha": alpha, "segments": segments, "form": form, "name": name,
+                 "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
+                 "response_tokens": response_tokens, "iv": iv, "neurons": neurons, "top": top}
+            return jobs.start("fish_pipeline", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def nw_try(direction: str, contrast: dict[str, Any] | str, layers: list[int] | str | None = None,
+                     alpha: float | list[float] | str | None = None, prompts: list[str] | None = None, n: int = 12,
+                     max_tokens: int = 120, match: str | None = None, temperature: float = 0.0, seed: int = 0,
+                     others: bool = True, baseline: bool = True, name: str | None = None, iv: str | list[str] | None = None) -> dict:
+        """提交在写入 FiSH 权重前试运行的作业（用 job_status 查看结果。gne nw try）。把带分段的方向 direction
+        （用 direction(positions="response", same_reply=True, segments="0,1-3,4-", stack_layers=…) 创建的方向）直接加到
+        layers 的层输出，而不经过神经元或键，以此生成回复（在回复位置的分段边界处切换 control vector）。
+        只添加目标场景问题（prompts，或对照集的前 n 个问题）的回复（场景由问题组决定，替代写入权重后的场景键）。
+        alpha 为分段强度（[1, 1, 0.8] 或 "1,1,0.8"。只写一个值时用于所有分段）。省略 layers 时，使用创建方向时的
+        叠加层。结果：scene（已添加的回复）、baseline（相同问题未添加的回复）、others（dont_touch 问题未添加的回复），
+        各自包含 counts（n、loop = 陷入重复的回复、empty、at_limit、tokens、match = 正则匹配）和 replies。改变层组和分段
+        强度后提交数次，阅读并比较回复，再进入 fish_pipeline。temperature > 0 时采样。
+        限制：可添加的层为 1 到最终层的前一层。目标场景逐个问题生成（切换按单条序列进行）。数量是自动统计的，
+        语气是否出现、是否贴合对方发言，需要阅读回复确认。"""
+        try:
+            p = {**_fish_contrast(contrast), "direction": direction, "layers": layers, "alpha": alpha, "prompts": prompts, "n": n,
+                 "max_tokens": max_tokens, "match": match, "temperature": temperature, "seed": seed, "others": others,
+                 "baseline": baseline, "name": name, "iv": iv}
+            return jobs.start("fish_try", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
     @srv.tool()
     async def nw_export(recipe: str | None = None, units: list[str] | None = None, name: str | None = None,
                         strip_meta: bool = False) -> dict:
@@ -815,10 +882,10 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         （marks[α] 中包含候选数、标记数、即使偶然也会被标记的数量 expected = 候选数 × 5%）。key_check 仅供参考，linear.ratio 是比例参考。
         candidates 每处（写入目标 × 层）一个：by_alpha[α] 中包含 reply（降幅）、mark、side_b（副作用）、ratio（降幅 ÷ 副作用，
         副作用下限 ratio_floor = 0.01）、unit，以及 all_marked（全部强度均显著）。将降幅、副作用、all_marked 3 项并排选择候选
-        （依据是 Qwen3.5-4B 语尾的 1 个案例。只按降幅选择，会挑到副作用也大 = 破坏回复的候选）。
+        （依据是 Qwen3.5-4B 语尾的 1 个案例。只按降幅选择，会挑到副作用也大 = 使回复陷入重复的候选）。
         如 notes[0] 所述，这是不生成文本的参考，用于排除与比较用键无法区分的候选。若标记数量与 expected 相近，
         仅凭标记无法与比较用键区分（不过，若在几个 α 上连续出现标记，且相对于效果 side.b（不希望写入位置的变化）较小的候选，
-        仍值得尝试。即使效果最大，若 side.b 与比较用键相当大，也可能只是破坏了回复）。是否有效请通过 direction_key_causal_verify
+        仍值得尝试。即使效果最大，若 side.b 与比较用键相当大，也可能只是使回复陷入了重复）。是否有效请通过 direction_key_causal_verify
         的生成来统计。contrast 可以是对照集合的表或路径、configs/keyed/ 中模板的名称、<root>/keyed/ 中的名称。"""
         from .jobs import _layers
         try:

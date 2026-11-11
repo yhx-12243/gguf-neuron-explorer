@@ -607,6 +607,12 @@ class Session:
         r = recipe if isinstance(recipe, Recipe) else self.recipe(path=self.recipe_path(recipe))
         return check(self, r, contrast, **kw)
 
+    def nw_try(self, direction: str, contrast: str | Path, **kw) -> dict:
+        """重みに入れる前に試す(gne nw try): 区切りつきの方向を、狙う場面の質問の返事の位置どおりに、層の出力へ直接足して
+        返事を作る(fish.try_step)。層・区切りごとの強さを、ニューロンと鍵を作る前に返事で比べる。"""
+        from .fish import try_step
+        return try_step(self, str(contrast), direction=str(direction), **kw)
+
     def query_lora(self, u) -> Path:
         """query 单元 → attn_q 的 rank-1 LoRA（在 <root>/heads/<model_id>/ 中创建并复用）。计算 u・v 需要捕获对照集。"""
         from .heads import query_vectors, write_query_lora

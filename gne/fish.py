@@ -8,7 +8,9 @@
    比較用の鍵との比べは、鍵に保存した作成時の例での値(甘い。作成に使った例なので。実際に足す量は check で見る)。
 4. ユニット: 層 × 区切りごとに 1 個(上限つきの形は 2 個組)。
 5. 確かめ: nwrite.verify(式どおりか)と nwrite.check(場面・位置ごとに実際に足した量)。
-層・強さは使う人が決める(ここでは選ばない)。
+層・強さは使う人が決める(ここでは選ばない)。強さは区切りごとに変えられる(alpha に "1,1,0.8" か [1, 1, 0.8]。1 つなら全区切りに同じ値)。
+重みに入れる前に試す(try_step): 区切りつきの方向を、狙う場面の質問の返事の位置どおりに、層の出力へ直接足して生成する
+(control vector を生成の途中で付け替える。ニューロンも鍵も使わない)。層・区切りごとの強さを、作る前に返事で比べるのに使う。
 """
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ def _layers(layers) -> list[int]:
     from .jobs import _layers as parse
     Ls = parse(layers)
     if not Ls:
-        raise GneError("BAD_ARGS", "请指定层（layers）（例 [11, 18, 23] 或 \"11,18,23\"）", "层由使用者决定")
+        raise GneError("BAD_ARGS", "请指定层（layers）（例 \"11-23\" 或 [11, 18, 23]）", "层由使用者决定")
     return sorted({int(L) for L in Ls})
 
 
@@ -59,6 +61,35 @@ def _segments(segments) -> list[str]:
     if not segs:
         raise GneError("BAD_ARGS", "没有位置区段", "请写成 0,1-3,4- 的形式")
     return segs
+
+
+def alphas_of(alpha, n_seg: int) -> list[float]:
+    """強さ → 区切りごとの強さのリスト。数 1 つ(0.9・"0.9"・[0.9])は全部の区切りに同じ値。区切りごとに変えるなら、区切りの順に
+    "1,1,0.8" か [1, 1, 0.8](数は区切りの数と同じにする)。"""
+    if alpha is None:
+        alpha = DEFAULTS["alpha"]
+    try:
+        if isinstance(alpha, str):
+            xs = [float(x) for x in alpha.replace("/", ",").replace(" ", ",").split(",") if x.strip()]
+        elif isinstance(alpha, (list, tuple)):
+            xs = [float(x) for x in alpha]
+        else:
+            xs = [float(alpha)]
+    except (TypeError, ValueError):
+        raise GneError("BAD_ARGS", f"无法读取强度 {alpha!r}", "请写 0.9，或按分段写成 1,1,0.8") from None
+    if not xs or not all(np.isfinite(x) for x in xs):
+        raise GneError("BAD_ARGS", f"无法读取强度 {alpha!r}", "请写 0.9，或按分段写成 1,1,0.8")
+    if len(xs) == 1:
+        return xs * int(n_seg)
+    if len(xs) != int(n_seg):
+        raise GneError("BAD_ARGS", f"强度有 {len(xs)} 个，与分段数 {n_seg} 不一致",
+                       "只写一个值会用于所有分段；若要按分段设置，请写入与分段数相同的值（例：分段 0,1-3,4- 对应 1,1,0.8）")
+    return xs
+
+
+def alpha_out(al: list[float]):
+    """結果に入れる強さ: 全部の区切りが同じ値なら数 1 つ、違えば区切りごとのリスト。"""
+    return al[0] if len(set(al)) == 1 else list(al)
 
 
 def resolve(session, contrast=None, spec: dict | None = None) -> tuple[str, dict, str]:
@@ -110,10 +141,12 @@ def default_neurons(usage: dict, n_seg: int, form: str) -> dict[int, list[int]]:
     return out
 
 
-def units(layers, n_seg: int, neurons: dict, form: str, direction: str, base: str, alpha: float = 0.9, whole: bool = False) -> list[str]:
+def units(layers, n_seg: int, neurons: dict, form: str, direction: str, base: str, alpha=0.9, whole: bool = False) -> list[str]:
     """層 × 区切りごとのユニット(書き方の文字列)。neurons は {層: [番号, …]}(層ごとに needed 個。区切り 0 から順に使う)。
+    alpha は強さ(数 1 つなら全部の区切りに同じ値。"1,1,0.8" か [1, 1, 0.8] なら区切りごと。alphas_of)。
     whole(書く位置が before:<正規表現> のとき): 方向は区切りに分けず、direction をそのまま使う。"""
     _form(form)
+    al = alphas_of(alpha, n_seg)
     names = key_names(base, n_seg, form)
     per = PER_SEGMENT[form]
     out = []
@@ -127,7 +160,7 @@ def units(layers, n_seg: int, neurons: dict, form: str, direction: str, base: st
             pk = names["position"][i]
             head = f"{L}:N{js[i * per]}" + (f"+N{js[i * per + 1]}" if form == "cap" else "")
             keys = f"#{names['scene']}&{pk}" if form == "two" else (f"#{pk}&{names['one']}" if form == "cap" else f"#{pk}")
-            out.append(f"{head}:nw:a{float(alpha):g}@{direction}{'' if whole else f'.seg{i}'}{keys}")
+            out.append(f"{head}:nw:a{al[i]:g}@{direction}{'' if whole else f'.seg{i}'}{keys}")
     return out
 
 
@@ -317,15 +350,17 @@ def behave_step(session, specs: list[str], contrast: str, *, name: str, prompts=
             "seconds": time.perf_counter() - t0}
 
 
-def pipeline(session, contrast: str, *, name: str, layers=None, segments=None, form: str = "cap", alpha: float = 0.9,
+def pipeline(session, contrast: str, *, name: str, layers=None, segments=None, form: str = "cap", alpha=0.9,
              same_reply: bool = True, stack: bool = True, compare: bool = True, pseudo: int = 4, max_tokens: int = 96,
              response_tokens: int = 96, iv=None, rekey: bool = True, neurons: dict | None = None, top: int = 20) -> dict:
     """方向 → ニューロンの表 → 鍵 → ユニット →(そのユニットを当てた状態で鍵を作り直す)→ 式どおりか → 足した量、を順に回す。
-    ニューロンは既定の候補(表の上から)を使う(neurons を渡せばそれ)。層と強さは渡されたものをそのまま使う。"""
+    ニューロンは既定の候補(表の上から)を使う(neurons を渡せばそれ)。層と強さは渡されたものをそのまま使う。
+    alpha は数 1 つ(全部の区切りに同じ値)か、区切りごとの "1,1,0.8"・[1, 1, 0.8]。"""
     t0 = time.perf_counter()
     Ls = _layers(layers)
     segs = _segments(segments)
     _form(form)
+    al = alphas_of(alpha, len(segs))            # 数が区切りと合わなければ、モデルを流す前に止める
     stage = {}
 
     def lap(k, t):
@@ -342,7 +377,7 @@ def pipeline(session, contrast: str, *, name: str, layers=None, segments=None, f
     t = time.perf_counter()
     keys = keys_step(session, contrast, base=name, layers=Ls, segments=segs, form=form, pseudo=pseudo, max_tokens=max_tokens, iv=iv)
     whole = before_mode(segs)
-    specs = units(Ls, len(segs), picked, form, name, name, alpha, whole)
+    specs = units(Ls, len(segs), picked, form, name, name, al, whole)
     lap("keys", t)
     keys2 = None
     notes = []
@@ -355,7 +390,7 @@ def pipeline(session, contrast: str, *, name: str, layers=None, segments=None, f
         base2 = f"{name}_r"
         keys2 = keys_step(session, contrast, base=base2, layers=Ls, segments=segs, form=form, pseudo=pseudo, max_tokens=max_tokens,
                           iv=iv_units(session, iv, specs))
-        specs = units(Ls, len(segs), picked, form, name, base2, alpha, whole)
+        specs = units(Ls, len(segs), picked, form, name, base2, al, whole)
         lap("rekey", t)
     t = time.perf_counter()
     ver = verify_step(session, specs, iv=iv)
@@ -363,7 +398,183 @@ def pipeline(session, contrast: str, *, name: str, layers=None, segments=None, f
     t = time.perf_counter()
     chk = check_step(session, specs, contrast, max_tokens=max_tokens, iv=iv, segments=segs)
     lap("check", t)
-    return {"name": name, "contrast_path": contrast, "layers": Ls, "segments": segs, "form": form, "alpha": float(alpha),
+    return {"name": name, "contrast_path": contrast, "layers": Ls, "segments": segs, "form": form, "alpha": alpha_out(al), "alphas": al,
             "direction": d, "usage": usage, "neurons": picked, "neurons_default": neurons is None, "keys": keys, "rekeyed": keys2,
             "key_base": f"{name}_r" if rekey else name, "units": specs, "unit_rows": unit_rows(session, specs),
             "verify": ver, "check": chk, "iv": keys["iv"], "notes": notes, "stage_seconds": stage, "seconds": time.perf_counter() - t0}
+
+
+# --- 重みに入れる前に試す ---------------------------------------------------------------------------------------
+
+def _counts(rows: list[dict], rx) -> dict:
+    """返事の数(gne behave と同じ数え方): 空・繰り返し(4 トークンの並びの種類が半分を切る)・長さの上限で切れた・平均の長さ・正規表現の一致。"""
+    c = {"n": len(rows), "empty": sum(not (r["text"] or "").strip() for r in rows), "loop": sum(bool(r["loop"]) for r in rows),
+         "at_limit": sum(r["finish"] not in ("eog", "stop", "eos") for r in rows),
+         "tokens": round(sum(r["n_tokens"] for r in rows) / max(len(rows), 1), 1)}
+    if rx is not None:
+        c["match"] = sum(bool(rx.search(r["text"] or "")) for r in rows)
+    return c
+
+
+def try_step(session, contrast: str, *, direction: str, layers=None, alpha=None, prompts=None, n: int = 12, max_tokens: int = 120,
+             match: str | None = None, others: bool = True, baseline: bool = True, temperature: float = 0.0, seed: int = 0,
+             iv=None, name: str | None = None) -> dict:
+    """重みに入れる前に試す: 区切りつきの方向(gne direction --segments で作った direction)を、ニューロンにも鍵にも入れずに、
+    層 layers の出力へ直接足して返事を作る(control vector を、返事の位置の区切りが変わるところで付け替える)。
+    - 足すのは狙う場面の質問(prompts を渡せばそれ、無ければ対照集合の質問の先頭 n 問)の返事だけ。場面は質問の群で決める
+      (重みに入れたときの場面の鍵の代わり)。位置 0(返事を書き始める直前 = 生成プロンプトの最後のトークン)から足し、質問の文には足さない。
+    - alpha は区切りごとの強さ(alphas_of。1 で、その区切りの方向をそのままの長さで足す)。layers を省くと、方向を作ったときの
+      重ねる層(stack_layers)。
+    - baseline: 同じ質問に何も足さずに答えさせた返事(足す側とまったく同じ作り方で 1 問ずつ作る。違いは足したベクトルの分だけ)。others: 書き込みたくない場面(dont_touch)の質問(n 問まで)に、何も足さずに
+      答えさせた返事(狙う場面にしか足さないので、何も足さない返事と同じ。並べて読むために出す)。
+    - temperature > 0 でサンプリング(質問ごとに seed をずらす)。iv は先に当てておく介入(全部の位置に当てる)。
+    - 返事と一緒に、機械的に数えられるもの(繰り返し・空・長さの上限で切れた数・正規表現の一致)を出す。
+    制約: 足せるのは層 1 〜 最終層の 1 つ手前(control vector の制約)。付け替えは 1 本の列ごとなので、狙う場面は 1 問ずつ生成する。
+    結果は <root>/behave/<model_id>/<name>_try.json にも残す。"""
+    import json
+    import re
+
+    from .behave import load_prompts, loop_like
+    from .direction import parse_segments
+    from .engine import KEEP, Sampling
+    from .evalx import _generate
+    from .keyed_build import intervention, read_key_spec
+    from .reverse import _conv
+    t0 = time.perf_counter()
+    e = session.engine
+    ds = session.direction_set(str(direction))
+    seg_text = list(ds.segments) or ["0-"]                  # 区切りの無い方向は、返事の全部の位置に同じベクトル
+    ranges = parse_segments(seg_text)
+    al = alphas_of(alpha, len(seg_text))
+    name = name or ds.name
+    if not re.fullmatch(r"[\w.\-]+", name):
+        raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含字母、数字、_、-、.")
+    stack = [int(L) for L in (ds.meta.get("stack_layers") or [])]
+    if layers is None or (isinstance(layers, str) and not layers.strip()):
+        if not stack:
+            raise GneError("BAD_ARGS", "请指定要添加的层（layers）（例 \"11-23\"）",
+                           "若方向是带着叠加层（--stack-layers）创建的，省略时会使用这些层")
+        Ls = sorted(stack)
+    else:
+        Ls = _layers(layers)
+    have = ds.seg[0] if ds.segments else ds.raw
+    for L in Ls:
+        if not 1 <= L <= e.n_layer - 2:
+            raise GneError("BAD_ARGS", f"不能添加到层 {L}（可添加范围为 1～{e.n_layer - 2}。层 0 和最终层无法通过 control vector 操作）")
+        if L not in have:
+            raise GneError("BAD_DIRECTION", f"方向 {ds.name} 中没有层 {L}")
+    notes = []
+    if not ds.segments:
+        notes.append(f"方向 {ds.name} 未按分段创建，因此已在整个回复的所有位置添加同一向量")
+    if stack and sorted(stack) != Ls:
+        notes.append(f"方向 {ds.name} 是按叠加写入层 {','.join(map(str, sorted(stack)))} 的前提创建的。若添加到不同的层组（{','.join(map(str, Ls))}），"
+                     "添加量会偏离该前提（确定层组后，用这些层重新创建方向会更准确）")
+    if isinstance(prompts, str):
+        prompts = [x.strip() for x in prompts.splitlines() if x.strip()]
+    own = bool(prompts)
+    qs = list(prompts) if own else list(load_prompts(contrast))[:int(n)]
+    ks = read_key_spec(Path(str(contrast)))
+    sys_b = ks.contrast.system_b
+    if match is None or not str(match).strip():
+        import yaml
+        raw = yaml.safe_load(Path(str(contrast)).read_text(encoding="utf-8")) or {}
+        match = ((raw.get("validate") or {}).get("match")) if isinstance(raw, dict) else None
+    rx = re.compile(match) if match else None
+    iv_vecs, iv_lora, _ = intervention(session, iv)
+    iv_vecs = {int(L): np.asarray(v, dtype=np.float32) for L, v in (iv_vecs or {}).items()}
+
+    def vec(i):
+        """区切り i のときに足すベクトル({層: ベクトル}。先に当てておく介入の分も入れる)。区切りの外(i が None)は介入の分だけ。"""
+        out = dict(iv_vecs)
+        if i is not None and al[i]:
+            src = ds.seg[i] if ds.segments else ds.raw
+            for L in Ls:
+                v = (al[i] * np.asarray(src[L], dtype=np.float64)).astype(np.float32)
+                out[L] = out[L] + v if L in out else v
+        return out or None
+
+    V = [vec(i) for i in range(len(seg_text))]
+    V_out = vec(None)
+
+    def seg_of(k: int):
+        for i, (lo, hi) in enumerate(ranges):
+            if k >= lo and (hi is None or k < hi):
+                return i
+        return None
+
+    at = lambda k: V_out if seg_of(k) is None else V[seg_of(k)]
+    sp0 = Sampling(temperature=float(temperature), seed=int(seed), presence_penalty=0.0, min_p=0.0) if temperature and temperature > 0 else None
+    dts = [q for dt in ks.dont_touch for q in dt.prompts][:int(n)] if others else []
+    total = len(qs) * (2 if baseline else 1) + len(dts)
+    done = 0
+
+    def tick(k: int, stage: str) -> None:
+        nonlocal done
+        done += k
+        if session.progress:
+            session.progress(min(done, total), total, stage)
+
+    def row(q, r_text, ids, finish):
+        return {"prompt": q if isinstance(q, str) else q[-1]["content"], "text": r_text, "loop": bool(loop_like(ids)), "finish": finish,
+                "n_tokens": len(ids)}
+
+    # 狙う場面: 1 問ずつ。質問の最後のトークン(位置 0)から足し、区切りが変わるところで付け替える。
+    # 「何も足さない返事」(add=False)も、まったく同じ作り方で作る(1 問ずつ、質問を同じ所で分けて読ませ、同じ関数で生成し、
+    # サンプリングなら同じ種)。まとめて生成すると、組の作り方で計算がわずかにずれて、僅差の所で選ぶトークンが入れ替わり、
+    # 何も足していなくても返事が途中から分かれる(GPU で起きた)。並べた 2 つの返事の違いを、足したベクトルの分だけにする。
+    import dataclasses
+    ctx = e.steer_ctx()
+
+    def one_by_one(add: bool, stage: str) -> list[dict]:
+        vec_at = at if add else (lambda k: V_out)
+        rows = []
+        e.set_lora(ctx, iv_lora)
+        try:
+            for i, q in enumerate(qs):
+                ids = e.tokenize_prompt(e.render_chat(_conv(sys_b, q), enable_thinking=False))
+                if len(ids) + int(max_tokens) > e.n_ctx:
+                    raise GneError("CONTEXT_FULL", f"问题 {i} 无法放入 n_ctx={e.n_ctx}")
+                e.set_cvec(ctx, V_out)
+                e.clear_memory(ctx)
+                e.prefill(ctx, [ids[:-1]])
+                e.set_cvec(ctx, vec_at(0))
+                pf = e.prefill(ctx, [[ids[-1]]], pos0=len(ids) - 1)
+
+                def sched(step, outs):
+                    # step 番目のトークンが決まった後、それを読ませる前に呼ばれる。読ませる位置 = 返事の位置 step + 1
+                    return KEEP if not add or seg_of(step) == seg_of(step + 1) else at(step + 1)
+                sp = None if sp0 is None else dataclasses.replace(sp0, seed=sp0.seed + 7919 * i)
+                r = e.generate_greedy(ctx, [ids], max_tokens=int(max_tokens), prefilled=pf, schedule=sched, sampling=sp)[0]
+                rows.append(row(q, r.text, r.token_ids, r.finish))
+                tick(1, stage)
+        finally:
+            e.set_cvec(ctx, None)
+            e.set_lora(ctx, None)
+        return rows
+
+    scene = one_by_one(True, "try: 目标场景")
+
+    def plain(questions, system, stage):
+        asked = [_conv(system, q) for q in questions] if system is not None else list(questions)
+        outs = _generate(session, [(c, int(max_tokens)) for c in asked], iv_vecs or None, iv_lora, "all", lambda k: tick(k, stage), sampling=sp0)
+        return [row(q, o["text"], o["token_ids"], o["finish"]) for q, o in zip(questions, outs, strict=True)]
+
+    out = {"scene": {"counts": _counts(scene, rx), "replies": scene}}
+    if baseline:
+        rows = one_by_one(False, "try: 未添加")
+        out["baseline"] = {"counts": _counts(rows, rx), "replies": rows}
+    if dts:
+        rows = plain(dts, None, "try: 不希望写入的场景")
+        out["others"] = {"counts": _counts(rows, rx), "replies": rows}
+    norms = [{"segment": i, "positions": seg_text[i], "alpha": al[i],
+              "norm": {int(L): float(al[i] * np.linalg.norm((ds.seg[i] if ds.segments else ds.raw)[L])) for L in Ls}} for i in range(len(seg_text))]
+    notes.append("仅添加到目标场景问题的回复中（场景由问题组决定）。写入权重后，场景由键决定，因此其他场景是否不写入需要通过“写入量”确认")
+    notes.append("这些数量是自动统计的（重复、空回复、正则匹配）。语气是否出现、是否贴合对方发言，需要阅读回复确认")
+    res = {**out, "direction": ds.name, "layers": Ls, "segments": seg_text, "alpha": alpha_out(al), "alphas": al, "added": norms,
+           "stack_layers": sorted(stack) or None, "match": match, "max_tokens": int(max_tokens), "temperature": float(temperature or 0.0),
+           "seed": int(seed), "own_prompts": own, "system_b": bool(sys_b), "iv": _iv_text(iv),
+           "notes": notes, "seconds": time.perf_counter() - t0}
+    path = session.store.root / "behave" / session.meta.model_id / f"{name}_try.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {**res, "path": str(path)}

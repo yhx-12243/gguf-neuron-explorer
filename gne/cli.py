@@ -1122,7 +1122,7 @@ def direction(c: Common, holder: dict,
               random_controls: int = typer.Option(16, "--random-controls", help="--select auto：每层同等大小的随机方向对照数量（0 为无对照）"),
               same_reply: bool = typer.Option(False, "--same-reply", help="--positions response：B 侧也读取 A 侧的回复（让两种条件读取同一回复所得之差，不包含读取文字不同带来的成分）。默认仍与以往相同，读取各自条件自己的回复"),
               segments: Optional[str] = typer.Option(None, "--segments", help="--positions response：同时按回复位置分段创建方向（例如 0,1-3,4-。位置 0 = 开始写回复之前）。第 i 段的方向可用 NAME.seg<i> 这个名称"),
-              stack_layers: Optional[str] = typer.Option(None, "--stack-layers", help="与 --same-reply 和 --segments 一起使用：让带分段的方向按写入这些层（例如 11,18,23）后叠加的前提取值（上层取补上下面各层后的剩余）。逐 token 读取，因此耗时较长"),
+              stack_layers: Optional[str] = typer.Option(None, "--stack-layers", help="与 --same-reply 和 --segments 一起使用：让带分段的方向按写入这些层（例如 11-23 或 11,18,23）后叠加的前提取值（上层取补上下面各层后的剩余）。逐 token 读取，因此耗时较长"),
               yes: bool = _YES):
     """从对照集创建并保存全层方向 r_L（mean_A − mean_B），再用 --select auto 选择效果较大的层（§6.17）。
     创建的方向可用 L:dir:NAME:dose 单元加入（gne steer / chat / eval / export-cvec）。
@@ -2294,7 +2294,7 @@ def key_causal_lines(d: dict, *, only_marked: bool = False, ratio_alpha: float |
                  "效果 ÷ 最小 |α| 时的效果，再除以 |α| 之比（1 = 成比例，方向× = 强度间符号不一致，— = 最小 |α| 时的效果在"
                  "95% 区间内）")
     lines.append("  选择参考：将概率降幅、副作用、是否在所有强度下显著这 3 项并排后自行选择。只按概率降幅选择时，可能会挑到"
-                 "通过破坏回复来降低概率的候选（副作用也接近比较用键）。可用 --sort ratio / effect / side 排序")
+                 "通过使回复陷入重复来降低概率的候选（副作用也接近比较用键）。可用 --sort ratio / effect / side 排序")
     for x in d.get("dropped") or []:
         lines.append(f"  {x['target']} L{x['layer']}: 已排除（{x['error']}）")
     lines += [f"注: {t}" for t in d["notes"][1:]]
@@ -2978,7 +2978,7 @@ def fieldtest_cmd(c: Common, holder: dict,
 
 @gne_command(nw_app, "neurons", "nw neurons")
 def nw_neurons(c: Common, holder: dict,
-               layers: str = typer.Option(..., "--layers", help="要测量的层(例 11,18,23)"),
+               layers: str = typer.Option(..., "--layers", help="要测量的层(例 11-23 或 11,18,23)"),
                top: int = typer.Option(20, "--top", help="每层显示的数量(按活跃度从小到大)"),
                sort: str = typer.Option("sum", "--sort", help="排序方式: sum(最大值的排名 + 平均值的排名，默认)/ max / mean"),
                max_tokens: int = typer.Option(96, "--max-tokens", help="生成普通问题回复的长度"),
@@ -2988,7 +2988,7 @@ def nw_neurons(c: Common, holder: dict,
     要覆盖的神经元可参考此表选择(把编号写进 nw 单元)。覆盖后，该神经元原本的作用会消失。"""
     Ls = parse_layers(layers)
     if not Ls:
-        raise GneError("BAD_ARGS", "请在 --layers 中指定层", "例 --layers 11,18,23")
+        raise GneError("BAD_ARGS", "请在 --layers 中指定层", "例 --layers 11-23")
     s = holder["session"] = c.session()
     d = s.nw_neurons(Ls, top=top, sort=sort, max_tokens=max_tokens, corpus_tokens=corpus_tokens, iv=_iv_arg(iv))
     lines = [f"平时的活跃度({d['n_prompts']} 个问题的回复 + 语料 {d['corpus_tokens']} 个 token、{d['seconds']:.0f} 秒)。排序方式: {d['sort']}"]
@@ -3006,7 +3006,7 @@ def nw_neurons(c: Common, holder: dict,
 @gne_command(nw_app, "key", "nw key")
 def nw_key(c: Common, holder: dict,
            contrast: Path = typer.Option(..., "--contrast", help="对照集(user_prompts = 目标场景的问题、dont_touch = 不希望其产生反应的问题组)"),
-           layers: str = typer.Option(..., "--layers", help="创建键的层(例 11,18,23)"),
+           layers: str = typer.Option(..., "--layers", help="创建键的层(例 11-23 或 11,18,23)"),
            role: str = typer.Option("scene", "--role", help="scene(对目标场景问题的回复全程都反应的键)/ one(在任意位置都几乎返回 1 的键。用于带上限的形式)"),
            name: Optional[str] = typer.Option(None, "--name", help="键的名称(默认 <对照集的 name>_<role>)"),
            subset: str = typer.Option("even", "--subset", help="使用的问题: even(默认)/ odd / all"),
@@ -3017,7 +3017,7 @@ def nw_key(c: Common, holder: dict,
     按回复位置分段反应的“位置键”用 gne direction key --target mlpin --positions pos:1-3 创建。"""
     Ls = parse_layers(layers)
     if not Ls:
-        raise GneError("BAD_ARGS", "请在 --layers 中指定层", "例 --layers 11,18,23")
+        raise GneError("BAD_ARGS", "请在 --layers 中指定层", "例 --layers 11-23")
     s = holder["session"] = c.session()
     d = s.direction_key(contrast, role=role, name=name, layers=Ls, subset=subset, max_tokens=max_tokens, pseudo=pseudo,
                         iv=_iv_arg(iv), seed=c.seed, progress=s.progress)
@@ -3078,6 +3078,48 @@ def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
                 cells.append(f"{b}: " + ("—" if a is None else f"{a['mean']:+.2f}({a['min']:+.2f}～{a['max']:+.2f})"))
             lines.append(f"  {u['unit']}\n    " + "  ".join(cells))
     lines += [f"注: {n}" for n in d["notes"]]
+    return d, "\n".join(lines), 0
+
+
+@gne_command(nw_app, "try", "nw try")
+def nw_try(c: Common, holder: dict,
+           direction: str = typer.Option(..., "--direction", help="带分段的方向名称（用 gne direction --positions response --segments 0,1-3,4- 创建）"),
+           contrast: Path = typer.Option(..., "--contrast", help="对照集（user_prompts = 目标场景的问题，dont_touch = 不希望写入的场景的问题）"),
+           layers: Optional[str] = typer.Option(None, "--layers", help="要添加到的层（例 11-23 或 11,18,23）。省略时使用创建方向时叠加的层（--stack-layers）"),
+           alpha: str = typer.Option("0.9", "--alpha", help="强度。只写一个值时用于所有分段；按分段设置则写 1,1,0.8（按分段顺序）"),
+           prompts: Optional[Path] = typer.Option(None, "--prompts", help="目标场景的问题文件（JSON / YAML 列表）。省略时使用对照集的前 -n 个问题"),
+           n: int = typer.Option(12, "-n", "--n", help="问题数（目标场景、不希望写入的场景各 n 个）"),
+           max_tokens: int = typer.Option(120, "--max-tokens", help="生成回复的长度"),
+           match: Optional[str] = typer.Option(None, "--match", help="用于统计匹配回复的正则表达式（省略时使用对照集的 validate.match）"),
+           temperature: float = typer.Option(0.0, "--temperature", help="大于 0 时采样（种子为 --seed，并按问题偏移）。默认 greedy"),
+           others: bool = typer.Option(True, "--others/--no-others", help="也让其回答不希望写入的场景的问题（不添加任何向量）"),
+           baseline: bool = typer.Option(True, "--baseline/--no-baseline", help="同时生成目标场景问题在未添加方向时的回复"),
+           name: Optional[str] = typer.Option(None, "--name", help="结果文件名（<root>/behave/<model_id>/<名称>_try.json。默认使用方向名称）"),
+           iv: Optional[list[str]] = typer.Option(None, "--iv", help="先应用此干预（配方名称或路径，或单元写法）再试运行")):
+    """在写入权重前试运行。将带分段的方向直接加到层输出，而不经过神经元或键，以此生成回复（在回复位置的分段边界处切换
+    control vector）。只对目标场景问题的回复添加方向（场景由问题组决定，替代写入权重时的场景键）。改变层和分段强度，比较回复以及
+    可机械统计的项目（重复、空回复、正则匹配）后，再进入 gne nw neurons 及后续步骤。可添加的层为 1 到最终层的前一层。"""
+    from .behave import load_prompts
+    s = holder["session"] = c.session()
+    d = s.nw_try(direction, contrast, layers=layers, alpha=alpha, prompts=load_prompts(prompts) if prompts else None, n=n,
+                 max_tokens=max_tokens, match=match, temperature=temperature, seed=c.seed, others=others, baseline=baseline,
+                 name=name, iv=_iv_arg(iv))
+    lines = [f"方向 {d['direction']}、层 {','.join(map(str, d['layers']))}、分段 {','.join(d['segments'])}，强度 {','.join(f'{a:g}' for a in d['alphas'])}"
+             f"（{'greedy' if not d['temperature'] else '温度 ' + format(d['temperature'], 'g') + ' · 种子 ' + str(d['seed'])}，{d['seconds']:.0f} 秒）"]
+    lab = {"scene": "目标场景（已添加）", "baseline": "目标场景（未添加）", "others": "不希望写入的场景（未添加）"}
+    for k in ("scene", "baseline", "others"):
+        if k not in d:
+            continue
+        x = d[k]["counts"]
+        lines.append(f"[{lab[k]}] {x['n']} 个问题：陷入重复的回复 {x['loop']}、空 {x['empty']}、达到长度上限被截断 {x['at_limit']}、平均 {x['tokens']} 个 token"
+                     + (f"、正则匹配 {x['match']}" if "match" in x else ""))
+    for k in ("scene", "others"):
+        if k not in d:
+            continue
+        lines.append(f"--- {lab[k]} ---")
+        for r in d[k]["replies"]:
+            lines.append(f"Q: {r['prompt']}\nA: {r['text']}" + ("  [重复]" if r["loop"] else ""))
+    lines += [f"注: {x}" for x in d["notes"]] + [f"结果: {d['path']}"]
     return d, "\n".join(lines), 0
 
 
