@@ -2721,7 +2721,7 @@ class Session:
             from .nwrite import build_role_key
             if str(kw.pop("target", "mlpin") or "mlpin") != "mlpin":
                 raise GneError("BAD_ARGS", "role scene / one 的键只能使用 target mlpin")
-            keep = ("layers", "name", "subset", "max_tokens", "pseudo", "iv", "seed", "q_energy", "progress")
+            keep = ("layers", "name", "subset", "max_tokens", "pseudo", "iv", "seed", "q_energy", "progress", "gen_cache")
             extra = sorted(k for k, v in kw.items() if k not in keep and v not in (None, False))
             if extra:
                 raise GneError("BAD_ARGS", f"role {role} 的键不能使用 {', '.join(extra)}")
@@ -2730,6 +2730,12 @@ class Session:
             raise GneError("BAD_ARGS", f"role 必须为 position / scene / one（{role!r}）")
         from .keyed_build import build_keys
         return build_keys(self, contrast, **kw)
+
+    def direction_keys(self, contrast: str | Path, entries, **kw) -> list[dict]:
+        """一次生成并读取回复，创建多把只有写入位置不同的键（keyed_build.build_keys_multi）。entries 为
+        [(键名, positions), …]。其他参数与 direction_key 相同。得到的键与逐把创建时相同。"""
+        from .keyed_build import build_keys_multi
+        return build_keys_multi(self, contrast, entries, **kw)
 
     def direction_key_experts(self, contrast: str | Path, **kw) -> dict:
         """expert:e の鍵の専門家を選ぶ: 鍵と同じ対照集合・位置で、書き込みたい位置・書き込みたくない位置で各専門家が選ばれた

@@ -3069,13 +3069,24 @@ def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
              replies: str = typer.Option("own", "--replies", help="own(读取应用配方后创建的回复，并保持配方应用状态 = 实际发生的情况)/ base(读取无干预的回复，但应用配方)"),
              max_tokens: int = typer.Option(96, "--max-tokens"),
              n_pos: int = typer.Option(8, "--positions", help="从位置 0 起逐位置输出到第几个(之后合并显示)"),
+             low: float = typer.Option(0.4, "--low", help="逐题数值：某区间写入量（目标量 = 1）低于此值的问题计为“几乎未写入”"),
+             over: float = typer.Option(1.2, "--over", help="逐题数值：某区间各位置全部单元写入量合计超过此值的问题计为“超过目标量”"),
+             top: int = typer.Option(5, "--top", help="按写入量从小到大显示多少个未充分写入的问题"),
+             name: Optional[str] = typer.Option(None, "--name", help="结果文件名（<root>/behave/<model_id>/<名称>_check.json，包含逐题记录）。省略时使用配方名"),
              iv: Optional[list[str]] = typer.Option(None, "--iv", help="在预先应用此干预(配方名称或路径，或单元的写法)的状态下测量")):
     """按位置类型输出键的反应和实际写入量(以 α·d 为 1)。在目标场景(对照集的问题)和不希望写入的场景
     (dont_touch 组)中，从回复位置 0(开始书写之前)起依次显示。检查是否存在写入量远大于 1 的位置、
-    在不希望写入的场景中偏离 0 的位置，以及为负(反向)的位置。"""
+    在不希望写入的场景中偏离 0 的位置，以及为负(反向)的位置。
+    平均值表之后会输出逐题数值摘要：按区间（单元负责的回复位置范围）显示几乎未写入的问题数、超过目标量的问题数，
+    以及未充分写入问题的排名（问题与回复开头）。平均值会掩盖部分问题完全未写入的情况。
+    逐题记录会进入 --json 和结果文件。"""
+    import re as _re
+    from .nwrite import question_lines
     s = holder["session"] = c.session()
     r = s.recipe(units=unit, path=recipe, default_direction=direction, default_key=key)
-    d = s.nw_check(r, contrast, subset=subset, max_tokens=max_tokens, replies=replies, n_pos=n_pos, iv=_iv_arg(iv))
+    save = name or (r.name if r.name and _re.fullmatch(r"[\w.\-]+", r.name) else "recipe")
+    d = s.nw_check(r, contrast, subset=subset, max_tokens=max_tokens, replies=replies, n_pos=n_pos, iv=_iv_arg(iv), low=low, over=over,
+                   top=top, save=save)
     lines = [f"对照集 {d['contrast']}(subset {d['subset']}、回复 {d['replies']}、{d['seconds']:.0f} 秒)。值为写入量的平均值(α·d 为 1。括号内为最小～最大)"]
     for g, x in d["groups"].items():
         lines.append(f"[{g}] {x['n']} 个问题、循环 {x['loops']}")
@@ -3085,7 +3096,8 @@ def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
                 a = p["amount"]
                 cells.append(f"{b}: " + ("—" if a is None else f"{a['mean']:+.2f}({a['min']:+.2f}～{a['max']:+.2f})"))
             lines.append(f"  {u['unit']}\n    " + "  ".join(cells))
-    lines += [f"注: {n}" for n in d["notes"]]
+    lines += question_lines(d)
+    lines += [f"注: {n}" for n in d["notes"]] + [f"结果（逐题记录）：{d['path']}"]
     return d, "\n".join(lines), 0
 
 
@@ -3136,6 +3148,8 @@ def nw_pipeline(c: Common, holder: dict,
                 contrast: Path = typer.Option(..., "--contrast", help="对照集（user_prompts = 目标场景的问题，dont_touch = 不希望写入的场景的问题）"),
                 layers: str = typer.Option(..., "--layers", help="写入层（例如 11-23 或 11,18,23。因模型而异。由使用者决定）"),
                 alpha: Optional[str] = typer.Option(None, "--alpha", help="强度（默认 0.9）。只写一个值时用于所有分段；按分段设置则写 1,1,0.8（按分段顺序）"),
+                cap: Optional[str] = typer.Option(None, "--cap", help="带上限形式的阈值 a-b（默认 0.4-0.8）。写一个值时应用于所有分段；按分段设置则写 0.4-0.8,0.3-0.7,0.3-0.7（按分段顺序）。键响应低于 a 时几乎不写入，高于 b 时封顶在目标量"),
+                direction: Optional[str] = typer.Option(None, "--direction", help="已有方向的名称。传入后直接使用该方向而不重建（分段、层或叠加层不匹配时报错）。省略则新建"),
                 segments: Optional[str] = typer.Option(None, "--segments", help="回复位置的分段（默认 0,1-3,4-），或 before:<正则表达式>"),
                 form: Optional[str] = typer.Option(None, "--form", help="形式：cap（带上限的配对，默认）/ two（两个键）/ one（一个键）"),
                 name: Optional[str] = typer.Option(None, "--name", help="方向与键的名称（默认为对照集的 name）"),
@@ -3153,18 +3167,22 @@ def nw_pipeline(c: Common, holder: dict,
     """一次性构建 FiSH（与 UI 的“全部构建”、作业 fish_pipeline 相同）：方向 → 神经元表 → 键 → 单元 → 在应用该单元的状态下重建键
     → 是否符合公式 → 写入量。层和强度使用传入的值（不会自动决定）。神经元按活跃度从低到高的表自上而下使用
     （若要重新选择，请查看 gne nw neurons 的表并编写配方）。输出为简短摘要（是否符合公式、单元和神经元数量、写入量、
-    配方保存位置）。加上 --save 后会写出配方，可直接传给 gne nw verify / check / export 的 --recipe。"""
+    逐题数值数量、配方保存位置）。加上 --save 后会写出配方，可直接传给 gne nw verify / check / export 的 --recipe。
+    使用 --direction NAME 可直接使用已有方向而不重建。使用 --cap 可按分段设置带上限形式的阈值。"""
     from . import fish
     from .jobs import _fish_pipeline
     if not parse_layers(layers):
         raise GneError("BAD_ARGS", "--layers 中请指定要写入的层", "例如 --layers 11-23")
     s = holder["session"] = c.session()
-    p = {"contrast": str(contrast), "layers": layers, "alpha": alpha, "segments": segments, "form": form, "name": name, "save": save,
+    p = {"contrast": str(contrast), "layers": layers, "alpha": alpha, "cap": cap, "direction": direction, "segments": segments,
+         "form": form, "name": name, "save": save,
          "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
          "response_tokens": response_tokens, "top": top, "iv": _iv_arg(iv)}
     p = {k: v for k, v in p.items() if v is not None}
     if save is not None:
         fish.recipe_file(s, save)                    # 保存先が読めなければ、見積もりの前に止める
+    if cap is not None:                              # しきい値が読めなければ、見積もりの前に止める
+        fish.caps_of(cap, len(fish._segments(segments)), form or fish.DEFAULTS["form"])
     _gate(s, "fish_pipeline", p, yes, None)
     d = _fish_pipeline(s, **p)
     out = d if full else {**d["summary"], "units": d["units"], "contrast_path": d["contrast_path"]}

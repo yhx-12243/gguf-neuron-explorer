@@ -100,6 +100,11 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    在创建前，可用 nw_try(direction, contrast, layers, alpha) 查看直接加到层输出的回复，比较层和强度。
    在 Qwen3.5-4B 的一个示例中，连续的 13 层（11～23）、强度 1 / 1 / 0.8 比分离的 3 层更好（符合人格的回复 27～29% → 53%）。
    层号因模型而异。根据问题不同，会有 1～8% 的回复陷入重复（无法脱离同一语句）（docs/fish.md §8）。
+   建键问题从一开始就多准备一些，可减少遗漏（目标场景问题建议 100 个以上。不希望改变的场景也要一起增加）。当回复有多种开头方式
+   （例如以引号开头）时，用较少问题构建的键会漏掉其中一部分。增加问题只在存在未充分写入的问题时才有效（若已经写得充分，
+   增加问题也不会增强语气。docs/fish.md §3）。nw_check 的各位置数值是平均值，会掩盖部分问题完全未写入的情况，因此也要查看
+   逐题数值（by_question 的 low、question_summary.worst 中的问题与回复开头）。fish_pipeline 可通过 direction 复用已有方向
+   （不重建），通过 cap 按分段调整带上限形式的阈值。
 
 """
 
@@ -656,18 +661,26 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def nw_check(contrast: str, units: list[str] | None = None, recipe: str | None = None, subset: str = "odd",
-                       replies: str = "own", max_tokens: int = 96, n_pos: int = 8, iv: str | list[str] | None = None) -> dict:
+                       replies: str = "own", max_tokens: int = 96, n_pos: int = 8, iv: str | list[str] | None = None,
+                       low: float = 0.4, over: float = 1.2, top: int = 5, save: str | None = None) -> dict:
         """提交测量 nw 配方在不同位置类型下的键响应与实际写入量的作业（以 α·d 为 1，用 job_status 查看结果）。
         对对照集合的问题（目标场景 = groups.scene）和 dont_touch 组（不希望写入的场景），按回复位置 0（开始写回复之前）～
         n_pos−1 及之后，为每个单元给出 amount、rho_gate、rho_up 的平均、最小、最大。replies="own" 表示应用配方
         生成回复并保持应用状态读取（实际发生的情况。重复数量见 groups.<名称>.loops），"base" 表示读取无干预回复。
-        关注点：目标场景中写入量明显偏离 1 的位置、不希望写入场景中远离 0 的位置、负值（反向）位置。"""
+        关注点：目标场景中写入量明显偏离 1 的位置、不希望写入场景中远离 0 的位置、负值（反向）位置。
+        平均值会掩盖部分问题完全未写入的情况，因此也返回逐题数值。区间 = 单元负责的回复位置范围（位置键的 pos:<范围>）。
+        groups.<名称>.questions 是逐题记录（prompt、reply_start = 回复开头、segments.<区间> 的 amount = 该区间写入量
+        （目标量 = 1）、total = 全部单元合计、rho = 键响应）。groups.<名称>.by_question 是各区间计数（目标场景中
+        low = amount 低于 low 的问题、over = total 超过 over 的问题；不希望写入的场景中 leak = 误写入的问题）。
+        question_summary.worst 是几乎未写入问题中按写入量排序的前 top 个。若这些问题集中在某种回复开头方式
+        （例如以引号开头），请增加建键问题。传入 save（名称）还会写入 <root>/behave/<model_id>/<名称>_check.json。"""
         try:
             if bool(recipe) == bool(units):
                 raise GneError("BAD_ARGS", "请通过 recipe（已保存配方的名称）或 units 之一传入")
             r = str(session.recipe_path(recipe)) if recipe else session.recipe(units=units)
             return jobs.start("nw_check", {"recipe": r, "contrast": str(_contrast_path(session, contrast, None, None, None, None)),
                                            "subset": subset, "replies": replies, "max_tokens": max_tokens, "n_pos": n_pos,
+                                           "low": low, "over": over, "top": top, **({"save": save} if save else {}),
                                            **({"iv": iv} if iv is not None else {})}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -692,7 +705,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                             same_reply: bool | None = None, stack: bool | None = None, rekey: bool | None = None,
                             pseudo: int | None = None, max_tokens: int | None = None, response_tokens: int | None = None,
                             iv: str | list[str] | None = None, neurons: dict[str, list[int]] | None = None, top: int = 20,
-                            save: str | None = None, summary: bool = False) -> dict:
+                            save: str | None = None, summary: bool = False, direction: str | None = None,
+                            cap: str | list[str] | None = None) -> dict:
         """用一次作业从头到尾创建 FiSH（用 job_status 查看结果。与 UI 的 FiSH 标签页“全部构建”相同）：方向 → 神经元表 →
         键 → 单元 → 在应用这些单元的状态下重建键 → 是否符合公式 → 写入量。contrast 可以是对照集的表（包含 name、system_a、
         user_prompts、dont_touch 以及 fish 设置），也可以是 configs/contrast/ 的名称或路径、configs/fish/ 的模板名称。
@@ -705,7 +719,13 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         传入 save（名称或以 .yaml 结尾的路径）后，会将生成的单元写入配方文件（名称时为 <root>/recipes/<名称>.yaml。结果的
         recipe_path。可将该名称传给 nw_verify、nw_check、nw_export 的 recipe）。省略则不写。
         结果可能有数十万字（神经元表、键表、写入量明细）。summary=True 时改为只返回简短摘要：ok（是否符合公式）、
-        n_units、n_neurons、recipe_path、check（场景组 × 各位置的写入量平均值、最小值、最大值）、units（单元写法）。"""
+        n_units、n_neurons、recipe_path、check（场景组 × 各位置的写入量平均值、最小值、最大值）、by_question（各区间
+        几乎未写入、超过目标量的问题数）、questions（几乎未写入问题排名）、units（单元写法）。
+        传入 direction（已有方向名称）时会直接使用而不重建（分段、层或叠加层不匹配则 BAD_DIRECTION）。
+        cap 是带上限形式的阈值 "a-b"（默认 0.4-0.8。键响应低于 a 时几乎不写入，高于 b 时封顶在目标量）。写一个值应用到
+        所有分段；按分段写 ["0.4-0.8", "0.3-0.7", "0.3-0.7"] 或 "0.4-0.8,0.3-0.7,0.3-0.7"。
+        键只生成一次回复并读取，用一次读取创建所有分段。建键问题在目标场景和不希望改变的场景中都应多准备一些
+        （目标场景建议 100 个以上）。"""
         from .jobs import _layers
         try:
             if not _layers(layers):
@@ -713,7 +733,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             p = {**_fish_contrast(contrast), "layers": layers, "alpha": alpha, "segments": segments, "form": form, "name": name,
                  "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
                  "response_tokens": response_tokens, "iv": iv, "neurons": neurons, "top": top, "save": save,
-                 "summary": True if summary else None}
+                 "direction": direction, "cap": cap, "summary": True if summary else None}
             return jobs.start("fish_pipeline", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)

@@ -506,9 +506,15 @@ def _fish_cost(session, sp: Speed, kind: str, p: dict) -> dict:
         # 32 問・120 トークン・3 層で方向 244 秒のうち約 170 秒、40 問・96 トークン・13 層で方向 906 秒のうち約 800 秒)
         dir_s = 2 * sp.gen(n_a, rt) + 2 * n_a * read + ((len(Ls) - 1) * n_a * rt * 2 * sp.step(1) / 1000 if get("stack") else 0.0) \
             + (sp.gen(n_a, rt) + 2 * n_a * read if p.get("compare", True) else 0.0)
-        # 鍵: 鍵 1 本ごとに全部の質問の返事を作って読む分と、層ごとに鍵と比較用の鍵を計算する分(層の数と質問の数に比例)。
-        # 係数は Qwen3.5-4B Q8_0 の 2 つの実測に合わせた(44 問・3 層・4 本で 96 秒、76 問・13 層・4 本で 271 秒)
-        keys_s = 1.4 * n_keys * (sp.gen(n_all, mt) + n_all * read) + n_keys * len(Ls) * 0.035 * n_all
+        if kind == "fish_pipeline" and p.get("direction"):     # すでにある方向を使う: 方向は作らない
+            dir_s = 0.0
+        # 鍵: 返事を作るのは 1 回(全部の鍵で同じ返事を使う)。読むのは、区切りごとの位置の鍵をまとめて 1 回と、形に要る鍵
+        # (場面の鍵・ほぼ 1 を返す鍵)で 1 回。ほかに、層ごとに鍵と比較用の鍵を計算する分(鍵の数・層の数・質問の数・n_embd に比例)。
+        # 計算の係数は RTX 3080 の実測に合わせた(156 問・13 層・4 本で、Qwen3.5-4B Q8_0(n_embd 2560)79 秒・81 秒、27B の IQ2_XS
+        # (n_embd 5120)232 秒。76 問・13 層・4 本で 4B 39 秒・43 秒)。鍵 1 本ごとに返事を作っていたときの係数(1.4 と 0.035)のままだと、
+        # 実際の 2〜4 倍に出た
+        n_reads = 1 + (1 if form in ("two", "cap") else 0)
+        keys_s = sp.gen(n_all, mt) + n_reads * n_all * read + n_keys * len(Ls) * n_all * 0.0035 * (session.meta.n_embd / 2560)
         check_s = sp.gen(n_all, mt) + n_all * read
         neur_s = sp.gen(44, 96) + 88 * read
         if kind == "fish_behave":
