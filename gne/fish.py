@@ -352,15 +352,20 @@ def behave_step(session, specs: list[str], contrast: str, *, name: str, prompts=
 
 def pipeline(session, contrast: str, *, name: str, layers=None, segments=None, form: str = "cap", alpha=0.9,
              same_reply: bool = True, stack: bool = True, compare: bool = True, pseudo: int = 4, max_tokens: int = 96,
-             response_tokens: int = 96, iv=None, rekey: bool = True, neurons: dict | None = None, top: int = 20) -> dict:
-    """方向 → ニューロンの表 → 鍵 → ユニット →(そのユニットを当てた状態で鍵を作り直す)→ 式どおりか → 足した量、を順に回す。
-    ニューロンは既定の候補(表の上から)を使う(neurons を渡せばそれ)。層と強さは渡されたものをそのまま使う。
-    alpha は数 1 つ(全部の区切りに同じ値)か、区切りごとの "1,1,0.8"・[1, 1, 0.8]。"""
+             response_tokens: int = 96, iv=None, rekey: bool = True, neurons: dict | None = None, top: int = 20,
+             save: str | Path | None = None) -> dict:
+    """依次执行：方向 → 神经元表 → 键 → 单元 →（在应用该单元的状态下重建键）→ 是否符合公式 → 写入量。
+    神经元使用默认候选（从表的上方开始）（若传入 neurons 则使用它）。层和强度使用传入的值。
+    alpha 可以是一个数（所有分段使用相同值），也可以是按分段的 "1,1,0.8" 或 [1, 1, 0.8]。
+    传入 save 后，会将生成的单元写入配方文件（save_recipe。以 .yaml / .yml 结尾时使用该路径，否则作为名称写入
+    <root>/recipes/<名称>.yaml）。结果中的 recipe_path 可直接传给 gne nw verify --recipe 等。省略则不写（与以往相同）。
+    结果很大（神经元表、键表、写入量明细），若要简短查看，请使用结果的 summary（与 summary() 相同）或 summary_text()。"""
     t0 = time.perf_counter()
     Ls = _layers(layers)
     segs = _segments(segments)
     _form(form)
     al = alphas_of(alpha, len(segs))            # 数が区切りと合わなければ、モデルを流す前に止める
+    save_to = None if save is None or not str(save).strip() else recipe_file(session, save)   # 名前が悪ければ、モデルを流す前に止める
     stage = {}
 
     def lap(k, t):
@@ -398,10 +403,84 @@ def pipeline(session, contrast: str, *, name: str, layers=None, segments=None, f
     t = time.perf_counter()
     chk = check_step(session, specs, contrast, max_tokens=max_tokens, iv=iv, segments=segs)
     lap("check", t)
-    return {"name": name, "contrast_path": contrast, "layers": Ls, "segments": segs, "form": form, "alpha": alpha_out(al), "alphas": al,
-            "direction": d, "usage": usage, "neurons": picked, "neurons_default": neurons is None, "keys": keys, "rekeyed": keys2,
-            "key_base": f"{name}_r" if rekey else name, "units": specs, "unit_rows": unit_rows(session, specs),
-            "verify": ver, "check": chk, "iv": keys["iv"], "notes": notes, "stage_seconds": stage, "seconds": time.perf_counter() - t0}
+    res = {"name": name, "contrast_path": contrast, "layers": Ls, "segments": segs, "form": form, "alpha": alpha_out(al), "alphas": al,
+           "direction": d, "usage": usage, "neurons": picked, "neurons_default": neurons is None, "keys": keys, "rekeyed": keys2,
+           "key_base": f"{name}_r" if rekey else name, "units": specs, "unit_rows": unit_rows(session, specs),
+           "verify": ver, "check": chk, "iv": keys["iv"], "notes": notes, "stage_seconds": stage}
+    if save_to is not None:
+        res["recipe_path"] = save_recipe(session, specs, save_to)
+        if iv is not None:
+            notes.append("保存的配方只包含 FiSH 单元（不会包含事先应用的干预 iv。使用时请一并应用）")
+    res["seconds"] = time.perf_counter() - t0
+    res["summary"] = summary(res)
+    return res
+
+
+def recipe_file(session, save) -> Path:
+    """配方保存位置：以 .yaml / .yml 结尾时使用该路径，否则作为名称写入 <root>/recipes/<名称>.yaml。"""
+    import re
+    p = Path(str(save)).expanduser()
+    if p.suffix in (".yaml", ".yml"):
+        if not re.fullmatch(r"[\w.\-]+", p.stem):
+            raise GneError("BAD_ARGS", f"配方文件名 {p.name!r} 只能包含字母、数字、_、-、.")
+        return p
+    if not re.fullmatch(r"[\w.\-]+", str(save)):
+        raise GneError("BAD_ARGS", f"无法解析配方保存位置 {str(save)!r}",
+                       "请传入名称（字母、数字、_、-、.。会写入 <root>/recipes/<名称>.yaml）或以 .yaml 结尾的路径")
+    return session.store.recipes_dir() / f"{save}.yaml"
+
+
+def save_recipe(session, specs: list[str], path: Path) -> str:
+    """将单元写法列表写入配方文件（名称使用文件名。可直接传给 gne nw verify / check / export 的 --recipe）。
+    若存在同名文件则覆盖（与 recipe_save 相同）。"""
+    path = Path(path)
+    r = session.recipe(units=[str(x) for x in specs], name=path.stem)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    r.save(path)
+    return str(path)
+
+
+def summary(d: dict) -> dict:
+    """pipeline 结果的简短摘要：是否符合公式、单元与神经元数量、保存位置、写入量（场景组 × 每个位置中，单元平均值的
+    平均值，以及最小值和最大值）。结果本身可能有数十万字，因此显示和传递时请使用此摘要。"""
+    rows = d.get("unit_rows") or []
+    groups = {}
+    for g, x in ((d.get("check") or {}).get("groups") or {}).items():
+        pos: dict = {}
+        for u in x.get("units") or []:
+            for b, p in (u.get("positions") or {}).items():
+                a = (p or {}).get("amount")
+                if a:
+                    pos.setdefault(b, []).append(a)
+        groups[g] = {"n": x.get("n"), "loops": x.get("loops"),
+                     "amount": {b: {"mean": round(sum(a["mean"] for a in v) / len(v), 3), "min": round(min(a["min"] for a in v), 3),
+                                    "max": round(max(a["max"] for a in v), 3)} for b, v in pos.items()}}
+    ver = d.get("verify") or {}
+    return {"name": d.get("name"), "ok": bool(ver.get("ok")), "layers": list(d.get("layers") or []), "segments": list(d.get("segments") or []),
+            "form": d.get("form"), "alpha": d.get("alpha"), "n_units": len(d.get("units") or []),
+            "n_neurons": sum(1 + (1 if r.get("pair") is not None else 0) for r in rows),
+            "direction": d.get("name"), "key_base": d.get("key_base"), "rekeyed": d.get("rekeyed") is not None,
+            "recipe_path": d.get("recipe_path"), "check": groups, "notes": list(d.get("notes") or []),
+            "stage_seconds": {k: round(float(v), 1) for k, v in (d.get("stage_seconds") or {}).items()},
+            "seconds": None if d.get("seconds") is None else round(float(d["seconds"]), 1)}
+
+
+def summary_text(d: dict) -> str:
+    """将摘要（summary 的结果或 pipeline 结果本身）整理成数行文本。"""
+    s = d if "n_units" in d else (d.get("summary") or summary(d))
+    al = s["alpha"]
+    lines = [f"{s['name']}: 层 {','.join(map(str, s['layers']))}、分段 {','.join(s['segments'])}、形式 {s['form']}、强度 "
+             + (",".join(f"{a:g}" for a in al) if isinstance(al, list) else f"{al:g}")
+             + (f"（{s['seconds']:.0f} 秒）" if s.get("seconds") is not None else ""),
+             f"单元 {s['n_units']} 个、覆盖神经元 {s['n_neurons']} 个、键 {s['key_base']}_*"
+             + ("（在应用配方状态下重建）" if s.get("rekeyed") else ""),
+             "是否符合公式：" + ("通过" if s["ok"] else "未通过（请用 gne nw verify 查看各层误差）")]
+    for g, x in s["check"].items():
+        cells = "  ".join(f"{b}: {a['mean']:+.2f}({a['min']:+.2f}〜{a['max']:+.2f})" for b, a in x["amount"].items())
+        lines.append(f"写入量 [{g}] {x['n']} 个问题，重复 {x['loops']}: {cells}")
+    lines.append(f"配方：{s['recipe_path']}" if s.get("recipe_path") else "未保存配方（向 save 传入名称或 .yaml 路径即可写入）")
+    lines += [f"注记：{n}" for n in s["notes"]]
+    return "\n".join(lines)
 
 
 # --- 重みに入れる前に試す ---------------------------------------------------------------------------------------
@@ -419,18 +498,20 @@ def _counts(rows: list[dict], rx) -> dict:
 def try_step(session, contrast: str, *, direction: str, layers=None, alpha=None, prompts=None, n: int = 12, max_tokens: int = 120,
              match: str | None = None, others: bool = True, baseline: bool = True, temperature: float = 0.0, seed: int = 0,
              iv=None, name: str | None = None) -> dict:
-    """重みに入れる前に試す: 区切りつきの方向(gne direction --segments で作った direction)を、ニューロンにも鍵にも入れずに、
-    層 layers の出力へ直接足して返事を作る(control vector を、返事の位置の区切りが変わるところで付け替える)。
-    - 足すのは狙う場面の質問(prompts を渡せばそれ、無ければ対照集合の質問の先頭 n 問)の返事だけ。場面は質問の群で決める
-      (重みに入れたときの場面の鍵の代わり)。位置 0(返事を書き始める直前 = 生成プロンプトの最後のトークン)から足し、質問の文には足さない。
-    - alpha は区切りごとの強さ(alphas_of。1 で、その区切りの方向をそのままの長さで足す)。layers を省くと、方向を作ったときの
-      重ねる層(stack_layers)。
-    - baseline: 同じ質問に何も足さずに答えさせた返事(足す側とまったく同じ作り方で 1 問ずつ作る。違いは足したベクトルの分だけ)。others: 書き込みたくない場面(dont_touch)の質問(n 問まで)に、何も足さずに
-      答えさせた返事(狙う場面にしか足さないので、何も足さない返事と同じ。並べて読むために出す)。
-    - temperature > 0 でサンプリング(質問ごとに seed をずらす)。iv は先に当てておく介入(全部の位置に当てる)。
-    - 返事と一緒に、機械的に数えられるもの(繰り返し・空・長さの上限で切れた数・正規表現の一致)を出す。
-    制約: 足せるのは層 1 〜 最終層の 1 つ手前(control vector の制約)。付け替えは 1 本の列ごとなので、狙う場面は 1 問ずつ生成する。
-    結果は <root>/behave/<model_id>/<name>_try.json にも残す。"""
+    """在写入权重前试运行：不经过神经元或键，将带分段的方向（用 gne direction --segments 创建的方向）直接加到
+    层 layers 的输出，以此生成回复（在回复位置的分段边界处切换 control vector）。
+    - 只加到目标场景问题（传入 prompts 时使用它，否则使用对照集的前 n 个问题）的回复中。场景由问题组决定
+      （替代写入权重时的场景键）。从位置 0（开始写回复之前 = 生成提示词的最后一个 token）开始添加，不添加到问题文本中。
+    - alpha 是每个分段的强度（alphas_of。为 1 时按该分段方向的原始长度添加）。省略 layers 时，使用创建方向时的
+      叠加层（stack_layers）。
+    - baseline：对相同问题不添加任何内容而生成的回复（逐题生成，构建方式与添加侧完全相同。差异仅在于添加的向量）。others：对不希望写入的场景
+      （dont_touch）问题（最多 n 个）不添加任何内容而生成的回复（因为只添加到目标场景，所以与无添加回复相同。为便于并排阅读而输出）。
+    - temperature > 0 时采样（每题偏移 seed）。iv 是事先应用的干预（应用到所有位置）。
+    - 同时输出可机械统计的内容（重复、空回复、达到长度上限被截断的数量、正则匹配）。
+    限制：可添加的层为 1 到最后一层的前一层（control vector 的限制）。切换按单条序列进行，因此目标场景逐个问题生成。
+    结果也会保存到 <root>/behave/<model_id>/<name>_try.json。省略 name 时使用「<方向名>_<由设置生成的 6 个字符>」，
+    层、强度、问题、长度、温度、种子、事先应用的干预等不同就会写到不同文件（同一设置下重新运行则使用同一文件）。传入 name 时
+    使用 <name>_try.json；若存在同名文件则覆盖，并通过注记（notes）通知。"""
     import json
     import re
 
@@ -446,6 +527,7 @@ def try_step(session, contrast: str, *, direction: str, layers=None, alpha=None,
     seg_text = list(ds.segments) or ["0-"]                  # 区切りの無い方向は、返事の全部の位置に同じベクトル
     ranges = parse_segments(seg_text)
     al = alphas_of(alpha, len(seg_text))
+    named = bool(name)
     name = name or ds.name
     if not re.fullmatch(r"[\w.\-]+", name):
         raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含字母、数字、_、-、.")
@@ -574,7 +656,16 @@ def try_step(session, contrast: str, *, direction: str, layers=None, alpha=None,
            "stack_layers": sorted(stack) or None, "match": match, "max_tokens": int(max_tokens), "temperature": float(temperature or 0.0),
            "seed": int(seed), "own_prompts": own, "system_b": bool(sys_b), "iv": _iv_text(iv),
            "notes": notes, "seconds": time.perf_counter() - t0}
+    if not named:                                  # 为了让设置不同时使用不同名称，根据设置生成短标记
+        import hashlib
+        key = {"layers": Ls, "alphas": al, "questions": [q if isinstance(q, str) else json.dumps(q, ensure_ascii=False) for q in qs],
+               "others": dts, "baseline": bool(baseline), "max_tokens": int(max_tokens), "temperature": float(temperature or 0.0),
+               "seed": int(seed), "match": match, "iv": _iv_text(iv), "system_b": sys_b}
+        name = f"{name}_{hashlib.sha256(json.dumps(key, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:6]}"
     path = session.store.root / "behave" / session.meta.model_id / f"{name}_try.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        notes.append(f"已覆盖之前的结果 {path.name}" + ("（同名。若要保留，请修改 name）" if named else "（同一设置下重新运行）"))
+    res["name"] = name
     path.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
     return {**res, "path": str(path)}

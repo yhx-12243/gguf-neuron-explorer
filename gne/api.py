@@ -579,12 +579,14 @@ class Session:
             tmp.replace(path)
         return path
 
-    def nw_export(self, recipe: Recipe | str | Path, out: str | Path, *, strip_meta: bool = False) -> dict:
-        """レシピの nw のユニットを LoRA アダプタ GGUF に書き出す(llama.cpp の --lora で当てる)。焼き込みは無い。"""
+    def nw_export(self, recipe: Recipe | str | Path, out: str | Path, *, strip_meta: bool = False, name: str | None = None) -> dict:
+        """将配方的 nw 单元写入 LoRA 适配器 GGUF（用 llama.cpp 的 --lora 应用）。不烧录。
+        strip_meta（供他人使用的版本）：不写入 gne 的记录以及可识别原始模型的值（标识符、名称字段中的原始模型名和配方名）。
+        name 是文件的名称字段（general.name。省略时通常为「<原始模型名> nw <配方名>」，strip_meta 时为 "adapter"）。"""
         from .nwrite import export_nw_lora
         r = recipe if isinstance(recipe, Recipe) else self.recipe(path=self.recipe_path(recipe))
         others = sorted({u.mode for u in r.units if u.mode != "nw"})
-        rep = export_nw_lora(self.weights, r, out, self._key_of, self.direction_set, strip_meta=strip_meta)
+        rep = export_nw_lora(self.weights, r, out, self._key_of, self.direction_set, strip_meta=strip_meta, name=name)
         if others or r.ablate is not None:
             self.warn(f"此文件只包含 nw 单元（配方的其他干预 {'、'.join(others + (['ablate'] if r.ablate else []))} 不会写入。"
                       "若要和 proj、keyed、gain 合并为一个 LoRA，请使用 gne headproj export）")
@@ -669,7 +671,8 @@ class Session:
 
     def gain(self, recipe: Recipe | list[str], out: str | Path, *, bake: bool = False, requant: str = "auto",
              via_f16: bool = False, imatrix: str | None = None, llama_quantize: str | None = None,
-             strip_meta: bool = False, into: str | Path | None = None, lora_f16: bool = False) -> dict:
+             strip_meta: bool = False, into: str | Path | None = None, lora_f16: bool = False,
+             name: str | None = None) -> dict:
         """gain ユニットを LoRA アダプタ GGUF(既定)か、W_up(ヘッドは W_O)を書き換えた GGUF(bake)に書き出す(§6.16、CHANGE-04 D)。
         ヘッドの方向成分の射影(proj、CHANGE-06)と鍵つきの書き込み(keyed、CHANGE-07)も同じ LoRA / 焼き込みに入れる
         (同じテンソルは A・B を連結。記録は gne.headproj と gne.keyed)。keyed を焼き込むときの requant の既定(auto)は
@@ -678,6 +681,8 @@ class Session:
         量子化し直しで編集が埋もれたら警告する(_warn_requant)。
         strip_meta なら gne の記録(gne.* のメタデータ・レシピ・名前の印・横の .headproj.json)を残さない(人に渡す版)。
         書いたあと、メタデータに手元のパスらしい文字列が残っていないかも確かめる(local_path_keys)。
+        LoRA では、strip_meta のとき名前の欄(general.name)を "adapter" にして、元のモデルの名前も入れない。name で名前の欄を
+        決められる(LoRA だけ。strip_meta なしでも使える。焼き込みは元のモデルのメタデータをそのまま写すので対象外)。
         into を渡すと、そのモデル(同じ構造の別の型、例えば量子化していない F16 / BF16)の重みに書く。方向はこのモデルで作った
         ものを使い、書き換える行列は焼き込む先のものから作る(keyed の ΔW = α d κᵀ は W に依らないので、このモデルで作る)。
         GPU は使わない。"""
@@ -685,6 +690,10 @@ class Session:
         from .headproj import merge_tensors
         recipe = self._as_recipe(recipe)
         self._no_nw(recipe, bake=bake)                   # nw は焼き込めない(LoRA には入る)
+        if name is not None and bake:
+            raise GneError("BAD_ARGS", "名称字段指定（name）只能用于 LoRA 导出（烧录会原样复制原始模型的元数据）")
+        if name is not None and not str(name).strip():
+            raise GneError("BAD_ARGS", "名称（name）为空")
         W = self.weights if into is None else self._target_weights(into)
         if recipe.add_units:
             self.warn("add 单元不会进入 gain 导出（可通过 gne export-cvec 导出为 control vector）")
@@ -759,7 +768,7 @@ class Session:
                     rep["requant"] = "auto"
             else:
                 rep = export_gain_lora(W, recipe, out, extra=extra, extra_meta=extra_meta, extra_kv=extra_kv,
-                                       strip_meta=strip_meta, f16=lora_f16)
+                                       strip_meta=strip_meta, f16=lora_f16, name=name)
                 if ptens:                                # proj だけの階数(keyed と同じテンソルに連結しても proj の分)
                     rep["proj_rank"] = {n.split(".")[1]: int(B.shape[-1]) for n, (_, B) in ptens.items()}
                 else:
@@ -1418,7 +1427,8 @@ class Session:
         positions="response" 时从回复 token 创建（用 A / B 的 system 生成到 response_tokens 的回复再计算）。
         same_reply(positions response だけ): B 側も A 側の返事を読む(同じ返事を両方の条件で読ませた差。読んでいる語の違いから来る
         成分が入らない)。segments("0,1-3,4-"): 返事の位置で分けた方向も作る(名前 NAME.seg<i> で 1 本の方向として使える)。
-        stack_layers: 区切りつきの方向を、これらの層に重ねて書く前提の値にする(direction.response_directions)。"""
+        stack_layers: 区切りつきの方向を、これらの層に重ねて書く前提の値にする(direction.response_directions)。
+        リストか、"11-23"・"11,18,23"・"11,14-16" のような文字列(ほかの layers と同じ読み方)。"""
         from .direction import (DirectionSet, candidate_layers, layer_table, load_contrast, response_directions,
                                 save_directions, save_select, select_layer)
         from .evalx import Judge
@@ -1430,8 +1440,13 @@ class Session:
         name = name or cs.name
         if not re.fullmatch(r"[\w.\-]+", name):
             raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含字母、数字、_、-、.")
-        if isinstance(stack_layers, str):
-            stack_layers = [int(x) for x in re.split(r"[,\s]+", stack_layers.strip()) if x]
+        if isinstance(stack_layers, str) and not stack_layers.strip():
+            stack_layers = None
+        if stack_layers is not None:                    # --layers などと同じ読み方("11-23"・"11,18,23"・混ぜた書き方・リスト)
+            from .jobs import _layers
+            if isinstance(stack_layers, str) and stack_layers.strip() == "all":
+                raise GneError("BAD_ARGS", "stack_layers 不能使用 all", "请像 11-23 或 11,18,23 这样指定要叠加写入的层")
+            stack_layers = _layers(stack_layers)
         if (same_reply or segments or stack_layers) and positions != "response":
             raise GneError("BAD_ARGS", "same_reply、segments、stack_layers 只能在 positions 为 response 时使用",
                            "gne direction --contrast C --positions response --same-reply")
@@ -2653,15 +2668,18 @@ class Session:
     def headproj_export(self, recipe: Recipe | list[str], out: str | Path, *, bake: bool = False, requant: str | None = None,
                         via_f16: bool = False, imatrix: str | None = None, llama_quantize: str | None = None,
                         verify: bool = False, contrast: str | Path | None = None, strip_meta: bool = False,
-                        into: str | Path | None = None, lora_f16: bool = False) -> dict:
+                        into: str | Path | None = None, lora_f16: bool = False, name: str | None = None) -> dict:
         """CHANGE-06 E: proj のユニット(と gain)を LoRA(既定)か、残差に書き込む重み行列だけ量子化し直した GGUF に書き出す
         (gne gain と同じ経路)。鍵つきの書き込み(keyed、CHANGE-07)だけのレシピと、proj・keyed(・gain)を混ぜたレシピも受ける。
         requant を省くと q8_0、keyed を含むなら auto(テンソルごと: 元が Q8_0 なら Q8_0 のまま、それ以外は F16。Q8_0 のままでは
         rank 1 の小さな編集の 1 割以上が刻みに埋もれるテンソルだけ F16。gain.auto_qtype・KEYED_KEEP_MIN、レビュー P13、
         verification.md F132・F139)。keyed を含まないレシピの auto は q8_0。
-        verify なら焼き込み版と LoRA 版を V26 の 4 項目で比べる(keyed だけなら keyed の方向で測る)。"""
+        verify なら焼き込み版と LoRA 版を V26 の 4 項目で比べる(keyed だけなら keyed の方向で測る)。
+        name は LoRA の名前の欄(general.name。省くと「<元のモデルの名前> gain <レシピの名前>」、strip_meta では "adapter")。"""
         recipe = self._as_recipe(recipe)
         self._no_nw(recipe, bake=bake)                   # nw は焼き込めない(LoRA には入る)
+        if name is not None and bake:
+            raise GneError("BAD_ARGS", "名称字段指定（name）只能用于 LoRA 导出（烧录会原样复制原始模型的元数据）")
         if not recipe.proj_units and not recipe.gain_units and not recipe.keyed_units and not recipe.nw_units:
             raise GneError("BAD_RECIPE", "没有 proj 单元（例 --unit 33:H16:s6@NAME，带键写入为 19:ffn:keyed:a1@NAME#KEY）")
         if requant is None:
@@ -2686,7 +2704,8 @@ class Session:
                 self._warn_expert_size(d)
         else:
             d = self.gain(recipe, out, bake=bake, requant="q8_0" if via_f16 else requant, via_f16=via_f16,
-                          imatrix=imatrix, llama_quantize=llama_quantize, strip_meta=strip_meta, into=into, lora_f16=lora_f16)
+                          imatrix=imatrix, llama_quantize=llama_quantize, strip_meta=strip_meta, into=into, lora_f16=lora_f16,
+                          name=name)
         if verify:
             if not bake:
                 raise GneError("BAD_ARGS", "--verify 需要与 --bake 一起使用（比较烧录版与 LoRA 版）")

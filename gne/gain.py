@@ -135,14 +135,21 @@ def lora_tensors(weights, by_layer: dict[int, list[tuple[int, float]]]) -> dict[
 
 def export_gain_lora(weights, recipe: Recipe, path: str | Path, *,
                      extra: dict[str, tuple[np.ndarray, np.ndarray]] | None = None, extra_meta: dict | None = None,
-                     extra_kv: dict[str, str] | None = None, strip_meta: bool = False, f16: bool = False) -> dict:
+                     extra_kv: dict[str, str] | None = None, strip_meta: bool = False, f16: bool = False,
+                     name: str | None = None) -> dict:
     """gain ユニット(ニューロンの ffn_up とヘッドの W_O)を LoRA アダプタ GGUF に書く。extra は同じファイルに入れる
     残差に書き込む重み行列の LoRA(ヘッドの方向成分の射影 CHANGE-06、鍵つきの書き込み CHANGE-07 の ffn_down・attn_output・
     ffn_down_shexp・ffn_down_exps。同じテンソルのヘッドの gain とは A・B を連結して 1 つにする)。
     extra_meta は gne.headproj の記録(従来どおり)、extra_kv はそのほかの gne.* の記録(名前 → JSON の文字列、例 gne.keyed)。
-    proj_rank は extra_meta(proj)を渡したときだけ extra から数える(proj と keyed を混ぜたときは呼ぶ側が数える)。"""
+    proj_rank は extra_meta(proj)を渡したときだけ extra から数える(proj と keyed を混ぜたときは呼ぶ側が数える)。
+    name 是文件的名称字段（general.name）。省略时为「<原始模型名> gain <配方名>」。
+    strip_meta（供他人使用的版本）不写入 gne.* 的记录（配方、注意力头、强度、原始模型标识符），名称字段使用 name（省略时为
+    "adapter"），并且不写入原始模型名和配方名（与 gne nw export 相同）。"""
     cast = (lambda x: np.asarray(x, dtype=np.float16)) if f16 else (lambda x: x)   # LoRA を F16 で書く(大きさが半分)
     from .headproj import merge_tensors
+    from .nwrite import NEUTRAL_NAME
+    if name is not None and not str(name).strip():
+        raise GneError("BAD_ARGS", "名称（name）为空")
     by_layer = gain_by_layer(recipe.units)
     heads = head_gain_by_layer(recipe.units)
     experts = expert_gain_by_layer(recipe.units)
@@ -165,10 +172,10 @@ def export_gain_lora(weights, recipe: Recipe, path: str | Path, *,
     w = GGUFWriter(str(path), arch=m.arch)
     w.add_type("adapter")
     w.add_string("adapter.type", "lora")
-    if strip_meta:                                               # 人に渡す版: gne の記録(レシピ・ヘッド・強さ)を残さない
-        w.add_name(f"{m.name} adapter")
-    else:
-        w.add_name(f"{m.name} gain" + (f" {recipe.name}" if recipe.name else ""))
+    label = str(name).strip() if name is not None else (
+        NEUTRAL_NAME if strip_meta else f"{m.name} gain" + (f" {recipe.name}" if recipe.name else ""))
+    w.add_name(label)
+    if not strip_meta:                                           # 人に渡す版は gne の記録(レシピ・ヘッド・強さ・識別子)を残さない
         w.add_key_value("gne.recipe", json.dumps(recipe.to_dict(), ensure_ascii=False), GGUFValueType.STRING)
         w.add_key_value("gne.source_model_id", m.model_id, GGUFValueType.STRING)
         if extra_meta is not None:
@@ -191,7 +198,8 @@ def export_gain_lora(weights, recipe: Recipe, path: str | Path, *,
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    out = {"path": str(path), "layers": {str(L): [[n, k] for n, k in nk] for L, nk in by_layer.items()},
+    out = {"path": str(path), "general_name": label,
+           "layers": {str(L): [[n, k] for n, k in nk] for L, nk in by_layer.items()},
            "rank": {str(L): len(nk) for L, nk in by_layer.items()}, "bytes": Path(path).stat().st_size}
     if heads:
         out["heads"] = {str(L): [[h, k] for h, k in hk] for L, hk in heads.items()}

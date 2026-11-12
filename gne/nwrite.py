@@ -203,16 +203,26 @@ def cache_hash(tens: dict) -> str:
     return h.hexdigest()[:16]
 
 
-def export_nw_lora(weights, recipe, path: str | Path, key_of, dir_of, *, strip_meta: bool = False) -> dict:
-    """レシピの nw のユニットを LoRA アダプタ GGUF に書く(倍率 1 で当てる)。"""
+NEUTRAL_NAME = "adapter"                       # strip_meta で名前を指定しないときの general.name
+
+
+def export_nw_lora(weights, recipe, path: str | Path, key_of, dir_of, *, strip_meta: bool = False, name: str | None = None) -> dict:
+    """将配方的 nw 单元写入 LoRA 适配器 GGUF（以倍率 1 应用）。
+    name 是文件的名称字段（general.name）。省略时为「<原始模型名> nw <配方名>」。
+    strip_meta（供他人使用的版本）除 gne 的记录（gne.nw）外，也不写入可识别原始模型的值：不写入原始模型标识符
+    （gne.source_model_id），名称字段使用 name（省略时为 "adapter"），并且不写入原始模型名和配方名。"""
     from .ablate import write_lora_tensors
     rows = nw_plan(weights, recipe, key_of, dir_of)
     if not rows:
         raise GneError("BAD_RECIPE", "没有 nw 单元（例 --unit 11:N2045:nw:a1@NAME#KEY）")
     tens = nw_tensors(weights, rows)
     kv = None if strip_meta else {"gne.nw": json.dumps(nw_meta(rows), ensure_ascii=False)}
-    rep = write_lora_tensors(weights, tens, path, name=f"{weights.meta.name} nw" + (f" {recipe.name}" if recipe.name else ""), kv=kv)
-    return {**rep, "nw": nw_meta(rows)["units"]}
+    if name is not None and not str(name).strip():
+        raise GneError("BAD_ARGS", "名称（name）为空")
+    label = str(name).strip() if name is not None else (
+        NEUTRAL_NAME if strip_meta else f"{weights.meta.name} nw" + (f" {recipe.name}" if recipe.name else ""))
+    rep = write_lora_tensors(weights, tens, path, name=label, kv=kv, source_id=not strip_meta)
+    return {**rep, "general_name": label, "strip_meta": bool(strip_meta), "nw": nw_meta(rows)["units"]}
 
 
 # --- ふだんの働き(上書きするニューロンを選ぶ材料)---------------------------------------------------------------

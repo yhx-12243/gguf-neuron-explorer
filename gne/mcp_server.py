@@ -220,11 +220,11 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         positions="response" 时用 A / B 的 system 生成回复，并用回复 token 测量（添加人格时通常更有效）。
         按层运行 random_controls 个同量级随机方向作为对照，只选择效果超过对照 p95 的层
         （行中的 ctrl_effect_p95・null_pct，所选层的 selected_null_pct。0 表示无对照）。
-        方向の作り方(positions="response" のとき。結果の method に記録): same_reply=False(既定)は今までどおり、A 側・B 側が
-        それぞれ自分の返事を読んだ差。same_reply=True は、同じ返事(A 側の返事)を A 側の条件と B 側の条件の両方で読ませた差
-        (条件の違いだけの成分。読んでいる語の違いから来る成分が入らない)。segments="0,1-3,4-" で返事の位置で分けた方向も作る
-        (位置 0 = 返事を書き始める直前。区切り i は "NAME.seg<i>" という名前でユニットに書ける)。stack_layers="11,18,23" は、
-        区切りつきの方向をその層に重ねて書く前提の値にする(上の層は、下の層に足した後の残り。時間がかかる)。"""
+        方向创建方式（positions="response" 时。记录在结果的 method 中）：same_reply=False（默认）与以往相同，A 侧和 B 侧
+        分别读取自己的回复所得之差。same_reply=True 是让 A 侧和 B 侧的两种条件都读取同一回复（A 侧的回复）所得之差
+        （仅包含条件差异的成分，不包含读取词语不同带来的成分）。segments="0,1-3,4-" 还会创建按回复位置分段的方向
+        （位置 0 = 开始写回复之前。第 i 段可用名称 "NAME.seg<i>" 写入单元）。stack_layers="11-23"（范围）、"11,18,23"、[11, 18, 23]
+        会将带分段的方向设为叠加写入这些层的前提值（上层使用写入下层后的剩余部分。耗时）。"""
         try:
             params = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
                       "select": select, "mode": mode, "layers": layers, "dose": dose, "positions": positions,
@@ -516,7 +516,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def headproj_export(recipe: str, bake: bool = False, requant: str | None = None, verify: bool = True,
-                              strip_meta: bool = False, into: str | None = None) -> dict:
+                              strip_meta: bool = False, into: str | None = None, adapter_name: str | None = None) -> dict:
         """保存したレシピの proj のユニット(ヘッドの方向成分の射影、と gain・keyed)を書き出す(CHANGE-06 E)。既定は LoRA アダプタ
         GGUF(同じ層・同じ方向は階数 1 に畳む。数百 KB)。bake=True なら残差に書き込む重み行列だけ量子化し直した GGUF をジョブで作り
         (requant の既定は q8_0。keyed を含むなら auto: 元が Q8_0 のテンソルは Q8_0 のまま、それ以外は f16。Q8_0 のまま
@@ -525,20 +525,26 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         層・側ごとに例ごとの差の最大(max_abs_diff)を合格の線(threshold)と比べる。線は許容誤差(射影の値の標準偏差の 1 割、resolution)で、
         最後の層(last_layer)だけ許容誤差 + 計算方法の違いだけで出る誤差(noise.max_abs_diff = 書き込みがほぼ 0 の LoRA と
         LoRA なしの射影の値の差の最大。Q8_0 では LoRA を当てるだけで最後の層の射影の値が動くため)。
-        strip_meta=True なら gne の記録(gne.* のメタデータ・レシピ・名前の印・横の .headproj.json)を残さない(人に渡す版)。
+        strip_meta=True 时不保留 gne 的记录（gne.* 元数据、配方、名称标记、旁边的 .headproj.json）（供他人使用的版本）。对 LoRA 也不写入
+        可识别原始模型的值（标识符、名称字段中的原始模型名和配方名），名称字段为 "adapter"。
+        adapter_name 是 LoRA 的名称字段（general.name。省略时为「<原始模型名> gain <配方名>」。bake 中不能使用）。
         結果の local_path_keys は、メタデータに手元のパスらしい文字列が残っているキー。into は焼き込む先の別の GGUF
         (同じ構造の量子化していない F16 / BF16 など。方向はこのモデルのものを使う。requant="keep" で元の型のまま、verify はできない)。"""
         return await _export(recipe, None, None, None, None, bake=bake, requant=requant, verify=verify,
-                             strip_meta=strip_meta, into=into)
+                             strip_meta=strip_meta, into=into, adapter_name=adapter_name)
 
     async def _export(recipe, units, name, key, direction, *, bake, requant, verify, strip_meta, into,
-                      lora_f16: bool = False) -> dict:
+                      lora_f16: bool = False, adapter_name: str | None = None) -> dict:
         """headproj_export・keyed_export の中身(jobs._headproj_export。ファイル名の既定は Session.default_export_path)。
         焼き込みはジョブ、LoRA はその場で書く。"""
         from .jobs import _headproj_export
         p = {"recipe": recipe, "units": units, "name": name if name else (_recipe_stem(recipe) if recipe else None),
              "key": key, "direction": direction}
         p = {k: v for k, v in p.items() if v is not None}
+        if adapter_name is not None:
+            if bake:
+                return _err(GneError("BAD_ARGS", "adapter_name（名称字段）只能用于 LoRA 导出"))
+            p["adapter_name"] = adapter_name
         if bake:
             try:
                 q = {**p, "bake": True, "requant": requant, "verify": verify and not into, "strip_meta": strip_meta}
@@ -553,7 +559,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     async def keyed_export(recipe: str | None = None, units: list[str] | None = None, name: str | None = None,
                            key: str | None = None, direction: str | None = None, bake: bool = False,
                            requant: str | None = None, verify: bool = False, strip_meta: bool = False,
-                           into: str | None = None, lora_f16: bool = False) -> dict:
+                           into: str | None = None, lora_f16: bool = False, adapter_name: str | None = None) -> dict:
         """鍵つきの書き込み(keyed、CHANGE-07)を書き出す(headproj_export の keyed 向けの別名。proj・gain が混ざっていても同じ
         ファイルに入る)。recipe は保存したレシピの名前、または units(例 ["19:ffn:keyed:a1@zundamon_endings#zundamon_endings"])と
         name。key・direction は #KEY・@NAME を省いたユニットの鍵と方向。既定は LoRA アダプタ GGUF(層・鍵ごとに階数 1、llama.cpp の
@@ -564,11 +570,13 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         0.9 を下回ったら警告。requant_error_max は編集と無関係な丸めのゆらぎも数えるので、小さな編集では大きく出る)。MoE の専門家のテンソル(ffn_down_exps、expert:e)も同じ規則で、
         Q8_0 のままなら編集しない専門家はバイトのまま、f16 だとテンソル全体が F16 になる(結果の expert_bytes_added が増えた大きさ)。
         verify=True で焼き込み版と LoRA 版を比べる(V33。判定は headproj_export の verify と同じで、最後の層の射影の値の合格の線
-        threshold は許容誤差 + 計算方法の違いだけで出る誤差 noise.max_abs_diff)。"""
+        threshold は許容誤差 + 計算方法の違いだけで出る誤差 noise.max_abs_diff)。
+        strip_meta=True（供他人使用的版本）的 LoRA 不写入 gne 的记录和可识别原始模型的值（标识符、名称字段中的原始模型名和配方名），
+        名称字段为 "adapter"。adapter_name 是 LoRA 的名称字段（general.name。name 是配方名称）。"""
         if bool(recipe) == bool(units):
             return _err(GneError("BAD_ARGS", "请传入 recipe（已保存配方的名称）或 units 之一"))
         return await _export(recipe, units, name, key, direction, bake=bake, requant=requant, verify=verify,
-                             strip_meta=strip_meta, into=into, lora_f16=lora_f16)
+                             strip_meta=strip_meta, into=into, lora_f16=lora_f16, adapter_name=adapter_name)
 
     @srv.tool()
     async def direction_key(contrast: str, layers: list[int] | str, name: str | None = None, positions: str | None = None,
@@ -683,7 +691,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                             segments: str | None = None, form: str | None = None, name: str | None = None,
                             same_reply: bool | None = None, stack: bool | None = None, rekey: bool | None = None,
                             pseudo: int | None = None, max_tokens: int | None = None, response_tokens: int | None = None,
-                            iv: str | list[str] | None = None, neurons: dict[str, list[int]] | None = None, top: int = 20) -> dict:
+                            iv: str | list[str] | None = None, neurons: dict[str, list[int]] | None = None, top: int = 20,
+                            save: str | None = None, summary: bool = False) -> dict:
         """用一次作业从头到尾创建 FiSH（用 job_status 查看结果。与 UI 的 FiSH 标签页“全部构建”相同）：方向 → 神经元表 →
         键 → 单元 → 在应用这些单元的状态下重建键 → 是否符合公式 → 写入量。contrast 可以是对照集的表（包含 name、system_a、
         user_prompts、dont_touch 以及 fish 设置），也可以是 configs/contrast/ 的名称或路径、configs/fish/ 的模板名称。
@@ -692,14 +701,19 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         two / one。未传入的参数依次使用表中的 fish 设置、再使用默认值（segments "0,1-3,4-"、form cap、alpha 0.9，并启用 same_reply、stack、rekey）。
         层越多，需要的神经元数量（层 × 分段 × 形式的个数）和创建时间越多（Qwen3.5-4B 的 13 层为 78 个，方向和键约需 16 分钟）。
         结果：units（配方中单元的写法）、direction、usage、neurons、keys、rekeyed、verify（ok）、check（groups.scene 与
-        dont_touch:<名称> 各位置写入量）、stage_seconds。若要在创建前比较层和强度，请使用 nw_try。"""
+        dont_touch:<名称> 各位置写入量）、stage_seconds。若要在创建前比较层和强度，请使用 nw_try。
+        传入 save（名称或以 .yaml 结尾的路径）后，会将生成的单元写入配方文件（名称时为 <root>/recipes/<名称>.yaml。结果的
+        recipe_path。可将该名称传给 nw_verify、nw_check、nw_export 的 recipe）。省略则不写。
+        结果可能有数十万字（神经元表、键表、写入量明细）。summary=True 时改为只返回简短摘要：ok（是否符合公式）、
+        n_units、n_neurons、recipe_path、check（场景组 × 各位置的写入量平均值、最小值、最大值）、units（单元写法）。"""
         from .jobs import _layers
         try:
             if not _layers(layers):
                 raise GneError("BAD_ARGS", "请在 layers 中指定层（例 [11, 18, 23] 或 \"11-23\"）")
             p = {**_fish_contrast(contrast), "layers": layers, "alpha": alpha, "segments": segments, "form": form, "name": name,
                  "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
-                 "response_tokens": response_tokens, "iv": iv, "neurons": neurons, "top": top}
+                 "response_tokens": response_tokens, "iv": iv, "neurons": neurons, "top": top, "save": save,
+                 "summary": True if summary else None}
             return jobs.start("fish_pipeline", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -717,6 +731,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         叠加层。结果：scene（已添加的回复）、baseline（相同问题未添加的回复）、others（dont_touch 问题未添加的回复），
         各自包含 counts（n、loop = 陷入重复的回复、empty、at_limit、tokens、match = 正则匹配）和 replies。改变层组和分段
         强度后提交数次，阅读并比较回复，再进入 fish_pipeline。temperature > 0 时采样。
+        结果也会保存到 <root>/behave/<model_id>/<name>_try.json。省略 name 时使用「<方向名>_<由设置生成的 6 个字符>」，
+        设置（层、强度、问题、长度、温度、种子等）不同就会写到不同文件。传入 name 时使用该名称，并覆盖同名旧结果（通过 notes 通知）。
         限制：可添加的层为 1 到最终层的前一层。目标场景逐个问题生成（切换按单条序列进行）。数量是自动统计的，
         语气是否出现、是否贴合对方发言，需要阅读回复确认。"""
         try:
@@ -729,12 +745,15 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def nw_export(recipe: str | None = None, units: list[str] | None = None, name: str | None = None,
-                        strip_meta: bool = False) -> dict:
+                        strip_meta: bool = False, adapter_name: str | None = None) -> dict:
         """将 nw 单元导出为 LoRA 适配器 GGUF（<root>/export/<名称>-nw.lora.gguf）。通过 llama.cpp 的 --lora 应用（倍率 1）。
         替换 ffn_gate、ffn_up、ffn_down，每个神经元对应 3 个秩 1 张量。不烧录（Q8_0 的 ffn_down 中
         32 个权重共享 1 个缩放，仅将 1 列替换为方向会产生超过 90% 的误差）。配方的其他干预（keyed、gain 等）
         不会进入此文件。若要和 proj（CHiPS）、keyed、gain 合并为 1 个 LoRA，请使用 headproj_export / keyed_export
-        （nw 单元也会写入同一文件。bake=True 会报错）。"""
+        （nw 单元也会写入同一文件。bake=True 会报错）。
+        strip_meta=True（供他人使用的版本）不写入 gne 的记录（gne.nw）和可识别原始模型的值（原始模型标识符、名称字段中的原始模型名
+        和配方名）。adapter_name 是文件的名称字段（general.name。省略时通常为「<原始模型名> nw
+        <配方名>」，strip_meta 时为 "adapter"）。name 是传入 units 时的配方名称（用于输出文件名）。"""
         try:
             if bool(recipe) == bool(units):
                 raise GneError("BAD_ARGS", "请通过 recipe（已保存配方的名称）或 units 之一传入")
@@ -742,7 +761,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             out = session.store.root / "export" / f"{r.name or 'recipe'}-nw.lora.gguf"
         except Exception as e:  # noqa: BLE001
             return _err(e)
-        return await call(session.nw_export, r, out, strip_meta=strip_meta)
+        return await call(session.nw_export, r, out, strip_meta=strip_meta, name=adapter_name)
 
     @srv.tool()
     async def direction_key_check(key: str, contrast: str | None = None, subset: str = "odd", layers: list[int] | str | None = None,

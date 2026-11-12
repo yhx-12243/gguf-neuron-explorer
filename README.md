@@ -281,7 +281,7 @@ The result is an ordinary recipe with units such as `16:H8:s6@evil`. Heads of on
 
 Baking does not use the GPU (it reads and rewrites the file piece by piece), so it works for models too large for the GPU: you can analyze with a quantized model and bake into an unquantized GGUF (F16 / BF16) of the same model (`--into`, "bake into" in the UI). The directions come from the analyzed model, the rewritten matrices from the target, and the type stays as it was (`--requant keep`). The strengths were measured on the quantized model, so expect small differences, and there is no check against the LoRA. Quantizing the baked F16 / BF16 afterwards with llama-quantize also avoids having only the rewritten tensors in a different type; a LoRA can be downloaded right away.
 
-gne records the recipe (layers, heads, strengths) in the exported file as `gne.*` metadata; for files you give to others, use "leave out gne's records" (`--strip-meta`), which also checks afterwards that no local paths remain in the metadata (when requantizing with an imatrix, llama-quantize may record the path of the text the imatrix was made from). Without the records, a LoRA's tensors still show the layers, heads and direction as they are, and a baked file compared with the original model still shows what was changed and how.
+gne records the recipe (layers, heads, strengths) in the exported file as `gne.*` metadata; for files you give to others, use "leave out gne's records" (`--strip-meta`), which also checks afterwards that no local paths remain in the metadata (when requantizing with an imatrix, llama-quantize may record the path of the text the imatrix was made from). In a LoRA written this way the name field (`general.name`) is `adapter` (set it with `--name`), so neither the base model's name nor its identifier appears in the metadata; a baked file is the model itself and keeps the model's own metadata. Without the records, a LoRA's tensors still show the layers, heads and direction as they are, and a baked file compared with the original model still shows what was changed and how.
 
 Before relying on a recipe, check it against controls.
 
@@ -359,6 +359,8 @@ The rank-1 conditional edit `ΔW = α d kᵀ / (μᵀk)` with `k = μ − QQᵀ�
 
 The method described here is called **FiSH** (Formula-instantiated Scene-gated Hidden units): existing MLP neurons (hidden units) are rewritten, without training, with weights computed from a formula, so that they write a direction only in a chosen scene. Neurons are rewritten, not added. The commands and the unit mode keep the plain name `nw`.
 
+The write-up is [FiSH: rewriting a few idle neurons so a model changes its tone in one scene only](https://balaena01.github.io/fish-steering/), with measurements on a 4B and a 27B model, every reply, the readers' labels and the LoRA files.
+
 A keyed write adds a linear edit, so it writes a little wherever its key responds a little, and writes backwards where the response is negative. An `nw` unit instead overwrites one MLP neuron that normally does very little, without any training: its gate row becomes `s·κ`, its input row becomes a key, and its output column becomes the direction. Because the gate closes, small responses are squashed and negative ones write almost nothing. That is the one-key form. There are two more forms. Two keys can be multiplied (one key in the gate row and another in the input row, so the neuron writes only where both respond, for example "this kind of scene" and "this position in the reply"). And two neurons can be paired so that the amount written is capped: this is the default form, and it is the form behind all the 100-question results below. In the capped pair, the gate rows hold a single key for "this scene AND this segment of the reply", minus a small multiple (a for one neuron, b for the other) of a key that returns about 1 at every position, and the input rows hold that about-1 key. The difference of the two neurons writes almost nothing while the key response is small and levels off at a fixed amount once it is large: a switch with a threshold and a cap, opened by a key that looks at the scene and the reply position. The two-key form was only tried in small checks of about 12 questions, not in the 100-question evaluation.
 
 ```bash
@@ -370,7 +372,10 @@ gne nw key --contrast C --layers 11-23 --role scene    # key that stays on for t
 gne nw verify --unit 11:N2045:nw:a1@NAME.seg1#k_scene\&k_p1   # does the LoRA do what the formula says?
 gne nw check  --recipe R --contrast C                  # key responses and amounts written, by position and kind of scene
 gne nw export --recipe R -o R-nw.lora.gguf             # LoRA only (no baking); with proj/keyed units, gne headproj export puts them in one file
+gne nw pipeline --contrast C --layers 11-23 --alpha 1,1,0.8 --save R.yaml   # or all of the building steps in one go; --save writes the recipe for the commands above
 ```
+
+`gne nw pipeline` prints a short summary (whether the LoRA follows the formula, how many units and neurons, the amounts written, where the recipe went); like `gne nw verify`, it exits with 1 when the formula check does not pass, and the recipe is still written. `gne nw try` keeps each result in its own file when the settings differ; use `--name` to choose the file name. `gne nw export --strip-meta` leaves out gne's records and anything that names the source model (the name field becomes `adapter`, or what you pass as `--name`).
 
 Units look like `L:Nn:nw:aα@DIR#KEY` (one key), `…#GATEKEY&INPUTKEY` (two keys) and `L:Nn+Nm:nw:aα@DIR#KEY&ONEKEY` (a capped pair). They work in recipes, `gne steer`, `gne behave`, chat and the OpenAI-compatible API like any other unit. This only supports dense gated MLPs (SiLU gate × input, no bias: llama, qwen2, qwen3, qwen35); other shapes and MoE layers give a clear error. Baking is not offered: in Q8_0, replacing one column of `ffn_down` loses over 90% of the edit.
 
@@ -540,6 +545,7 @@ The documentation is in Japanese:
 - [docs/agent_playbook.md](docs/agent_playbook.md): how to read the results.
 - [docs/setup.md](docs/setup.md): CUDA / ROCm under WSL, one environment per GPU, and workers.
 - [CHiPS: a few heads between knowing and answering](https://balaena01.github.io/chips-steering/): the write-up, with measurements and data.
+- [FiSH: rewriting a few idle neurons so a model changes its tone in one scene only](https://balaena01.github.io/fish-steering/): the write-up, with measurements and data.
 - [docs/qwen4exp.md](docs/qwen4exp.md): Qwen3.8-Flash-Next (`qwen4exp`): split GGUF files, four residual streams, and what works without control vectors.
 - [docs/head-component-steering.md](docs/head-component-steering.md): CHiPS, which changes only the component of a few causally chosen attention heads along a direction (`mode: proj`, `gne direction score`, `gne heads causal`, `gne heads allocate`, `gne eval --compare-methods`), and how it relates to full ablation.
 - [docs/keyed-write.md](docs/keyed-write.md): keyed write, a rank-1 write that acts only when the key, built from a contrast set, responds to the input of a weight matrix that writes to the residual stream (`mode: keyed`, `gne direction key`, `gne direction key-check`), with worked examples on sentence endings, how it relates to CHiPS, and how to find where a key works (`gne direction key-causal`).

@@ -247,13 +247,17 @@ def _table(rows: list[tuple[str, str]]) -> str:
 
 
 def parse_layers(spec: Optional[str]) -> Optional[list[int]]:
-    """"all" / "10-16" / "1,5,9-12" → 层列表（all 为 None）。"""
-    if spec is None or spec == "all":
+    """"all" / "10-16" / "1,5,9-12" → 层列表（all 为 None）。数字之间可以用空格代替逗号("11 18 23")。
+    所有以字符串接收层指定之处（--layers、--stack-layers，以及作业、MCP、UI 的 layers / stack_layers）都通过此函数解析。"""
+    if spec is None or spec.strip() == "all":
         return None
     out: list[int] = []
-    for part in spec.split(","):
+    parts = [x for x in re.sub(r"(?<=\d)\s+(?=\d)", ",", spec.strip()).split(",") if x.strip()]
+    if not parts:
+        raise GneError("BAD_ARGS", f"无法解析层指定 {spec!r}", "all / 10-16 / 1,5,9-12")
+    for part in parts:
         m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", part)
-        if not m:
+        if not m or (m.group(2) is not None and int(m.group(2)) < int(m.group(1))):
             raise GneError("BAD_ARGS", f"无法解析层指定 {spec!r}", "all / 10-16 / 1,5,9-12")
         a, b = int(m.group(1)), int(m.group(2) or m.group(1))
         out.extend(range(a, b + 1))
@@ -711,15 +715,16 @@ def gain(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
         "F32、F16、BF16 时保持该类型。专家张量 ffn_down_exps 保持原类型，不编辑的专家保持字节不变。K-quant、IQ 的专家为 q8_0) ")),
          key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 的 keyed 单元的键(由 gne direction key 创建)"),
          direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 的 proj、keyed 单元的方向"),
-         strip_meta: bool = typer.Option(False, "--strip-meta", help="不保留 gne 记录（gne.* 元数据、配方、名称标记）（供分发的版本）")):
+         strip_meta: bool = typer.Option(False, "--strip-meta", help="供他人使用的版本：不保留 gne 的记录（gne.* 元数据、配方、名称标记）。对 LoRA 也不写入可识别原始模型的值（原始模型标识符、名称字段中的原始模型名和配方名），名称字段由 --name 指定（省略时为 adapter）"),
+         name: Optional[str] = typer.Option(None, "--name", help="LoRA 的名称字段（general.name）。省略时为「<原始模型名> gain <配方名>」，使用 --strip-meta 时为 adapter。不能与 --bake 同用")):
     """将 gain 单元（如 L:N:x2，把输出放大 k 倍；注意力头为 L:Hh:xk）导出为 LoRA 适配器 GGUF 或改写 GGUF（§6.16）。
-    ヘッドの方向成分の射影(proj)と鍵つきの書き込み(keyed、CHANGE-07)も同じ LoRA・焼き込みに入る。"""
+    头部方向分量的投影（proj）和键控写入（keyed、CHANGE-07）也会进入同一 LoRA / 烧录。"""
     if in_path and c.model and in_path.resolve() != c.model.resolve():
         raise GneError("BAD_ARGS", "--in 与 --model 指向不同文件")
     s = holder["session"] = c.session(in_path)
     r = s.recipe(units=unit, path=recipe, scale=scale, default_key=key, default_direction=direction)
     out = out or s.default_export_path(r, bake=bake, kind="gain")
-    d = s.gain(r, out, bake=bake, requant=requant, strip_meta=strip_meta)
+    d = s.gain(r, out, bake=bake, requant=requant, strip_meta=strip_meta, name=name)
     if bake:
         text = f"{d['path']}({d['bytes'] / 1e6:.1f} MB)、改写: " + ", ".join(_mod_text(m) for m in d["modified"])
         if d.get("method") == "patch":
@@ -1122,7 +1127,7 @@ def direction(c: Common, holder: dict,
               random_controls: int = typer.Option(16, "--random-controls", help="--select auto：每层同等大小的随机方向对照数量（0 为无对照）"),
               same_reply: bool = typer.Option(False, "--same-reply", help="--positions response：B 侧也读取 A 侧的回复（让两种条件读取同一回复所得之差，不包含读取文字不同带来的成分）。默认仍与以往相同，读取各自条件自己的回复"),
               segments: Optional[str] = typer.Option(None, "--segments", help="--positions response：同时按回复位置分段创建方向（例如 0,1-3,4-。位置 0 = 开始写回复之前）。第 i 段的方向可用 NAME.seg<i> 这个名称"),
-              stack_layers: Optional[str] = typer.Option(None, "--stack-layers", help="与 --same-reply 和 --segments 一起使用：让带分段的方向按写入这些层（例如 11-23 或 11,18,23）后叠加的前提取值（上层取补上下面各层后的剩余）。逐 token 读取，因此耗时较长"),
+              stack_layers: Optional[str] = typer.Option(None, "--stack-layers", help="与 --same-reply 和 --segments 一起使用：将带分段的方向设为写入这些层（例如 11-23 或 11,18,23，也可混写为 11,14-16）的前提值（上层使用下层写入后的剩余部分）。因为它逐个 token 读取，所以耗时（与层数 − 1 成正比，会计入估算）"),
               yes: bool = _YES):
     """从对照集创建并保存全层方向 r_L（mean_A − mean_B），再用 --select auto 选择效果较大的层（§6.17）。
     创建的方向可用 L:dir:NAME:dose 单元加入（gne steer / chat / eval / export-cvec）。
@@ -1142,7 +1147,8 @@ def direction(c: Common, holder: dict,
     s = holder["session"] = c.session()
     _gate(s, "direction", {"contrast": str(contrast), "positions": positions, "select": select, "mode": mode,
                            "layers": layers, "max_tokens": max_tokens, "response_tokens": response_tokens,
-                           "random_controls": random_controls}, yes, None)
+                           "random_controls": random_controls, "same_reply": same_reply, "segments": segments,
+                           "stack_layers": stack_layers}, yes, None)
     d = s.direction(contrast=contrast, name=name, positions=positions, select=select, mode=mode, layers=layers,
                     dose=dose, max_tokens=max_tokens, kl_max=kl_max, min_distinct=min_distinct, per_layer=per_layer,
                     judge_model=judge_model, judge_target=judge_target, response_tokens=response_tokens,
@@ -2651,11 +2657,12 @@ def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, u
                     direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 的 proj / keyed 单元的方向"),
                     direction_layer: Optional[str] = typer.Option(None, "--direction-layer", help="own（注意力头所在层方向）/ base（基准层方向）"),
                     lora_f16: bool = typer.Option(False, "--lora-f16", help="以 F16 写入 LoRA(大小减半。精度足够)"),
-                    strip_meta: bool = typer.Option(False, "--strip-meta", help="不保留 gne 记录（gne.* 元数据、配方、名称标记、旁边的 .headproj.json）（供分发的版本）")):
-    """proj のユニット(L:Hh:sS@NAME、レシピの mode: proj)を LoRA アダプタ GGUF か焼き込み GGUF に書き出す(CHANGE-06 E、gne gain の別名)。
-    同じ層・同じ方向のヘッドは階数 1 の LoRA に畳む。スケールパッチ(CHANGE-05 D)では表せないので、焼き込みは書き換える
-    テンソルだけ量子化し直す。鍵つきの書き込み(keyed、L:ffn:keyed:aα@NAME#KEY、CHANGE-07)も受ける(層・鍵ごとに階数 1。
-    配るなら LoRA が第一候補。焼き込みの既定は auto: 元が Q8_0 のテンソルは Q8_0 のまま、それ以外は f16)。"""
+                    strip_meta: bool = typer.Option(False, "--strip-meta", help="供他人使用的版本：不保留 gne 的记录（gne.* 元数据、配方、名称标记、旁边的 .headproj.json）。对 LoRA 也不写入可识别原始模型的值（原始模型标识符、名称字段中的原始模型名和配方名），名称字段由 --name 指定（省略时为 adapter）"),
+                    name: Optional[str] = typer.Option(None, "--name", help="LoRA 的名称字段（general.name）。省略时为「<原始模型名> gain <配方名>」，使用 --strip-meta 时为 adapter。不能与 --bake 同用")):
+    """将 proj 单元（L:Hh:sS@NAME、配方 mode: proj）导出为 LoRA 适配器 GGUF 或烧录 GGUF（CHANGE-06 E，gne gain 的别名）。
+    同一层、同一方向的注意力头会合并为秩 1 LoRA。缩放补丁（CHANGE-05 D）无法表示，因此烧录时只重新量化被改写的
+    张量。也接受键控写入（keyed、L:ffn:keyed:aα@NAME#KEY、CHANGE-07）（按层、键为秩 1）。
+    分发时优先使用 LoRA。烧录默认 auto：原本为 Q8_0 的张量保持 Q8_0，其余为 f16。"""
     if in_path and c.model and in_path.resolve() != c.model.resolve():
         raise GneError("BAD_ARGS", "--in 与 --model 指向不同文件")
     s = holder["session"] = c.session(in_path)
@@ -2663,9 +2670,10 @@ def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, u
     out = out or s.default_export_path(r, bake=bake, kind="headproj")
     d = s.headproj_export(r, out, bake=bake, requant=requant, via_f16=via_f16, imatrix=str(imatrix) if imatrix else None,
                           llama_quantize=llama_quantize, verify=verify, contrast=contrast, strip_meta=strip_meta, into=into,
-                          lora_f16=lora_f16)
+                          lora_f16=lora_f16, name=name)
     lines = [f"{d['path']}（{d['bytes'] / 1e6:.2f} MB，{'烧录' if bake else 'LoRA'}"
-             + ("，无 gne 记录" if d.get("strip_meta") else "") + "）"]
+             + (f"，名称字段 {d['general_name']!r}" if d.get("general_name") else "")
+             + ("，不包含 gne 记录、原始模型名或标识符" if d.get("strip_meta") else "") + "）"]
     if d.get("local_path_keys"):
         lines.append("注意：元数据中仍残留疑似本地路径的字符串：" + ", ".join(d["local_path_keys"]))
     for L, x in (d.get("proj_layers") or {}).items():
@@ -3094,7 +3102,7 @@ def nw_try(c: Common, holder: dict,
            temperature: float = typer.Option(0.0, "--temperature", help="大于 0 时采样（种子为 --seed，并按问题偏移）。默认 greedy"),
            others: bool = typer.Option(True, "--others/--no-others", help="也让其回答不希望写入的场景的问题（不添加任何向量）"),
            baseline: bool = typer.Option(True, "--baseline/--no-baseline", help="同时生成目标场景问题在未添加方向时的回复"),
-           name: Optional[str] = typer.Option(None, "--name", help="结果文件名（<root>/behave/<model_id>/<名称>_try.json。默认使用方向名称）"),
+           name: Optional[str] = typer.Option(None, "--name", help="结果文件名（<root>/behave/<model_id>/<名称>_try.json）。省略时使用「方向名_由设置生成的 6 个字符」；层、强度、问题、长度、温度、种子等不同就会写到不同文件。指定后会使用该名称，并覆盖同名旧结果（会显示注记）。想比较的结果请用 --name 区分"),
            iv: Optional[list[str]] = typer.Option(None, "--iv", help="先应用此干预（配方名称或路径，或单元写法）再试运行")):
     """在写入权重前试运行。将带分段的方向直接加到层输出，而不经过神经元或键，以此生成回复（在回复位置的分段边界处切换
     control vector）。只对目标场景问题的回复添加方向（场景由问题组决定，替代写入权重时的场景键）。改变层和分段强度，比较回复以及
@@ -3123,13 +3131,54 @@ def nw_try(c: Common, holder: dict,
     return d, "\n".join(lines), 0
 
 
+@gne_command(nw_app, "pipeline", "nw pipeline")
+def nw_pipeline(c: Common, holder: dict,
+                contrast: Path = typer.Option(..., "--contrast", help="对照集（user_prompts = 目标场景的问题，dont_touch = 不希望写入的场景的问题）"),
+                layers: str = typer.Option(..., "--layers", help="写入层（例如 11-23 或 11,18,23。因模型而异。由使用者决定）"),
+                alpha: Optional[str] = typer.Option(None, "--alpha", help="强度（默认 0.9）。只写一个值时用于所有分段；按分段设置则写 1,1,0.8（按分段顺序）"),
+                segments: Optional[str] = typer.Option(None, "--segments", help="回复位置的分段（默认 0,1-3,4-），或 before:<正则表达式>"),
+                form: Optional[str] = typer.Option(None, "--form", help="形式：cap（带上限的配对，默认）/ two（两个键）/ one（一个键）"),
+                name: Optional[str] = typer.Option(None, "--name", help="方向与键的名称（默认为对照集的 name）"),
+                save: Optional[str] = typer.Option(None, "--save", help="将生成的单元写入配方文件（以 .yaml 结尾的路径，或名称 = <root>/recipes/<名称>.yaml）。可直接传给 gne nw verify --recipe。省略则不写"),
+                same_reply: Optional[bool] = typer.Option(None, "--same-reply/--no-same-reply", help="用两侧读取同一回复的差异来创建方向（默认创建）"),
+                stack: Optional[bool] = typer.Option(None, "--stack/--no-stack", help="让上层方向使用写入下层后的剩余部分（默认使用。耗时随层数增加）"),
+                rekey: Optional[bool] = typer.Option(None, "--rekey/--no-rekey", help="在应用生成的单元的状态下重建键（默认重建）"),
+                pseudo: Optional[int] = typer.Option(None, "--pseudo", help="比较用键的数量（默认 4）"),
+                max_tokens: Optional[int] = typer.Option(None, "--max-tokens", help="用键与写入量生成回复的长度（默认 96）"),
+                response_tokens: Optional[int] = typer.Option(None, "--response-tokens", help="用方向生成回复的长度（默认 96）"),
+                top: int = typer.Option(20, "--top", help="神经元表中每层显示的数量"),
+                iv: Optional[list[str]] = typer.Option(None, "--iv", help="先应用此干预（配方名称或路径，或单元写法）再创建"),
+                full: bool = typer.Option(False, "--full", help="使用 --json 时输出完整结果而非摘要（神经元表、键表、写入量明细。可能有数十万字）"),
+                yes: bool = _YES):
+    """一次性构建 FiSH（与 UI 的“全部构建”、作业 fish_pipeline 相同）：方向 → 神经元表 → 键 → 单元 → 在应用该单元的状态下重建键
+    → 是否符合公式 → 写入量。层和强度使用传入的值（不会自动决定）。神经元按活跃度从低到高的表自上而下使用
+    （若要重新选择，请查看 gne nw neurons 的表并编写配方）。输出为简短摘要（是否符合公式、单元和神经元数量、写入量、
+    配方保存位置）。加上 --save 后会写出配方，可直接传给 gne nw verify / check / export 的 --recipe。"""
+    from . import fish
+    from .jobs import _fish_pipeline
+    if not parse_layers(layers):
+        raise GneError("BAD_ARGS", "--layers 中请指定要写入的层", "例如 --layers 11-23")
+    s = holder["session"] = c.session()
+    p = {"contrast": str(contrast), "layers": layers, "alpha": alpha, "segments": segments, "form": form, "name": name, "save": save,
+         "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
+         "response_tokens": response_tokens, "top": top, "iv": _iv_arg(iv)}
+    p = {k: v for k, v in p.items() if v is not None}
+    if save is not None:
+        fish.recipe_file(s, save)                    # 保存先が読めなければ、見積もりの前に止める
+    _gate(s, "fish_pipeline", p, yes, None)
+    d = _fish_pipeline(s, **p)
+    out = d if full else {**d["summary"], "units": d["units"], "contrast_path": d["contrast_path"]}
+    return out, fish.summary_text(d), 0 if d["summary"]["ok"] else 1
+
+
 @gne_command(nw_app, "export", "nw export")
 def nw_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optional[list[str]] = _UNIT,
               out: Optional[Path] = typer.Option(None, "--out", "-o", help="输出(默认 <root>/export/<配方名>-nw.lora.gguf)"),
               direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 时单元的默认方向"),
               key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 时单元的默认键"),
               bake: bool = typer.Option(False, "--bake", help="烧录(不支持。会返回明确错误)"),
-              strip_meta: bool = typer.Option(False, "--strip-meta", help="不保留 gne 的记录(用于交给别人的版本)")):
+              strip_meta: bool = typer.Option(False, "--strip-meta", help="供他人使用的版本：不写入 gne 的记录（gne.nw）和可识别原始模型的值（原始模型标识符、名称字段中的原始模型名和配方名）。名称字段由 --name 指定（省略时为 adapter）"),
+              name: Optional[str] = typer.Option(None, "--name", help="文件的名称字段（general.name）。省略时为「<原始模型名> nw <配方名>」，使用 --strip-meta 时为 adapter")):
     """把 nw 单元导出为 LoRA 适配器 GGUF(用 llama.cpp 的 --lora 应用)。通过替换 ffn_gate、ffn_up、ffn_down，
     每个神经元对应 3 个秩 1 张量。不提供烧录(Q8_0 的 ffn_down 中 32 个权重共享一个倍率，
     只把 1 列替换成方向时误差会超过九成)。"""
@@ -3139,9 +3188,10 @@ def nw_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: O
         s._no_nw(r, bake=True)
         raise GneError("BAD_ARGS", "计算生成的神经元(nw)不能烧录", "请导出为 LoRA 适配器(不加 --bake)")
     out = out or (s.store.root / "export" / f"{r.name or 'recipe'}-nw.lora.gguf")
-    d = s.nw_export(r, out, strip_meta=strip_meta)
+    d = s.nw_export(r, out, strip_meta=strip_meta, name=name)
     d.pop("warnings", None)
-    lines = [f"{d['path']}({d['bytes'] / 1e6:.2f} MB、LoRA)"]
+    lines = [f"{d['path']}({d['bytes'] / 1e6:.2f} MB、LoRA、名称字段 {d['general_name']!r}"
+             + ("，不包含 gne 记录、原始模型名或标识符" if d.get("strip_meta") else "") + ")"]
     for x in d["nw"]:
         lines.append(f"  L{x['layer']} N{','.join(map(str, x['neurons']))}: {x['form']}、s {x['s']:g}、α {x['alpha']:+g}、方向 {x['direction']}、键 {x['key']}"
                      + (f" & {x['key2']}" if x["key2"] else "") + f"、在键有反应的位置 |α|‖d‖ = {x['norm']:.2f}")

@@ -136,13 +136,15 @@ def _eval(s, recipe: str | None = None, units: list[str] | None = None, dose_uni
 
 def _headproj_export(s, recipe: str | None = None, out: str | None = None, *, units: list[str] | None = None,
                      name: str | None = None, direction_layer: str | None = None, file_stem: str | None = None,
-                     overwrite: bool = True, key: str | None = None, direction: str | None = None, **p) -> dict:
+                     overwrite: bool = True, key: str | None = None, direction: str | None = None,
+                     adapter_name: str | None = None, **p) -> dict:
     """ヘッドの proj・鍵つきの書き込み(keyed、CHANGE-07)と gain(LoRA に入るユニット)を LoRA アダプタか焼き込み GGUF に
     書き出す。recipe(保存したレシピの名前かパス)か units(UI のレシピのユニットの書き方)。key・direction は #KEY・@NAME を
     省いたユニットの鍵と方向。out を省くと Session.default_export_path(<root>/export/<名前>.lora.gguf、焼き込みは
     <名前>-headproj.gguf、keyed だけなら <名前>-keyed.lora.gguf / -keyed.gguf)。file_stem を渡すとファイル名はそれ(LoRA は
     <file_stem>.lora.gguf、焼き込みは <file_stem>.gguf)。overwrite=False なら、同じ名前のファイルがあれば書かずに
-    FILE_EXISTS を返す(UI は確かめてから上書きする)。LoRA は小さいので、UI から落とせる URL も返す。"""
+    FILE_EXISTS を返す(UI は確かめてから上書きする)。LoRA は小さいので、UI から落とせる URL も返す。
+    adapter_name は LoRA の名前の欄(general.name。name はレシピの名前なので別の引数。空の文字列は省いたのと同じ)。"""
     import re
     from pathlib import Path
     from .steer import GneError
@@ -169,6 +171,8 @@ def _headproj_export(s, recipe: str | None = None, out: str | None = None, *, un
         path = s.default_export_path(r, bake=bake, kind="headproj", name=nm)
     if not overwrite and path.exists():
         raise GneError("FILE_EXISTS", f"{path.name} 已存在", "请覆盖或使用其他名称")
+    if adapter_name is not None and str(adapter_name).strip():
+        p["name"] = str(adapter_name).strip()
     d = s.headproj_export(r, path, **p)
     d["file"] = Path(d["path"]).name
     if not bake and Path(d["path"]).parent.resolve() == s.store.export_dir().resolve():
@@ -178,12 +182,20 @@ def _headproj_export(s, recipe: str | None = None, out: str | None = None, *, un
 
 
 def _layers(x) -> list[int] | None:
-    """層の指定(リスト・"8,14,20"・"10-16")→ 層のリスト。"""
-    if x is None or isinstance(x, (list, tuple)):
-        return None if x is None else [int(L) for L in x]
+    """層の指定(リスト・"8,14,20"・"10-16"・混ぜた "8,10-12")→ 層のリスト。リストの中の文字列("11-23")も同じ読み方で開く。"""
+    from .cli import parse_layers
+    if x is None:
+        return None
+    if isinstance(x, (list, tuple)):
+        out: list[int] = []
+        for L in x:
+            if isinstance(L, str):
+                out.extend(parse_layers(L) or [])
+            else:
+                out.append(int(L))
+        return out
     if isinstance(x, int):
         return [x]
-    from .cli import parse_layers
     return parse_layers(str(x))
 
 
@@ -319,15 +331,18 @@ def _fish_try(s, contrast=None, spec: dict | None = None, direction: str | None 
     return {**fish.try_step(s, path, direction=direction or q.get("name") or cname, **q), "contrast_path": path}
 
 
-def _fish_pipeline(s, contrast=None, spec: dict | None = None, **p) -> dict:
+def _fish_pipeline(s, contrast=None, spec: dict | None = None, summary: bool = False, **p) -> dict:
     """FiSH を最初から最後まで(方向 → ニューロンの表 → 鍵 → ユニット → 当てた状態で鍵を作り直す → 式どおりか → 足した量)。
     層(layers)は必須("11-23" のような範囲でもよい)。ニューロンは既定の候補(表の上から)か neurons({層: [番号…]})。強さ alpha は
-    渡した値をそのまま使う(数 1 つなら全部の区切りに同じ値、"1,1,0.8" か [1, 1, 0.8] なら区切りごと)。"""
+    渡した値をそのまま使う(数 1 つなら全部の区切りに同じ値、"1,1,0.8" か [1, 1, 0.8] なら区切りごと)。
+    save(名前か .yaml のパス)を渡すと、できたユニットをレシピのファイルに書く(結果の recipe_path)。summary=True なら、結果の
+    代わりに短い要約(fish.summary: 式どおりか・ユニットとニューロンの数・保存先・足した量)と、ユニットの書き方のリストだけを返す。"""
     from . import fish
     path, q, cname = _fish_args(s, contrast, spec, p, fish.SETTINGS)
     if isinstance(q.get("neurons"), dict):
         q["neurons"] = {int(k): v for k, v in q["neurons"].items()}
-    return fish.pipeline(s, path, name=q.pop("name", None) or cname, **q)
+    d = fish.pipeline(s, path, name=q.pop("name", None) or cname, **q)
+    return {**d["summary"], "units": d["units"], "contrast_path": d["contrast_path"]} if summary else d
 
 
 def compact_key_causal(d: dict) -> dict:

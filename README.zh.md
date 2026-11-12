@@ -281,7 +281,7 @@ gne steer -m M --unit 12:E37:N511:x2 -p "..." --compare
 
 烧录不使用 GPU（它逐块读取和重写文件），因此也适用于 GPU 放不下的大模型：可以用量化模型分析，再烧录到同一模型的未量化 GGUF（F16 / BF16）（`--into`，UI 中的“烧录目标”）。方向来自分析模型，重写矩阵来自目标模型，类型保持不变（`--requant keep`）。强度是在量化模型上测得的，因此会有少量差异，也无法与 LoRA 版校验。之后再用 llama-quantize 量化烧录后的 F16 / BF16，也可避免只有重写张量处于不同类型；LoRA 可以立即下载。
 
-gne 会将配方（层、注意力头、强度）作为 `gne.*` 元数据记录在导出文件中；若文件要交给别人，请使用“不包含 gne 的记录”（`--strip-meta`），它还会检查元数据中是否残留本地路径（使用 imatrix 重新量化时，llama-quantize 可能记录生成 imatrix 所用文本的路径）。即使没有记录，LoRA 张量仍会直接显示层、注意力头和方向，烧录文件与原模型比较也仍能看出改了什么、如何改。
+gne 会将配方（层、注意力头、强度）作为 `gne.*` 元数据记录在导出文件中；若文件要交给别人，请使用“不包含 gne 的记录”（`--strip-meta`），它还会检查元数据中是否残留本地路径（使用 imatrix 重新量化时，llama-quantize 可能记录生成 imatrix 所用文本的路径）。以这种方式写出的 LoRA，其名称字段（`general.name`）为 `adapter`（可用 `--name` 设置），因此元数据中不会出现原始模型名或标识符；烧录文件就是模型本身，会保留模型原有的元数据。即使没有记录，LoRA 张量仍会直接显示层、注意力头和方向，烧录文件与原模型比较也仍能看出改了什么、如何改。
 
 依赖某个配方前，请对照控制进行检查。
 
@@ -359,6 +359,8 @@ gne headproj export --recipe R                        # 每层、每个键的 ra
 
 这里描述的方法称为 **FiSH**（Formula-instantiated Scene-gated Hidden units）：无需训练，用公式计算出的权重改写现有 MLP 神经元（隐藏单元），使其只在选定场景中写入方向。神经元会被改写，而不是新增。命令和单元模式仍使用普通名称 `nw`。
 
+文章见 [FiSH：改写少数闲置神经元，让模型只在特定场景改变语气](https://balaena01.github.io/fish-steering/)，包含 4B 和 27B 模型上的测量、全部回复、阅读者的分类以及 LoRA 文件。
+
 键控写入会加入线性编辑，因此只要键有少许反应，它就会写入少许；反应为负时则会反向写入。`nw` 单元则无需训练，直接覆盖一个平时几乎不工作的 MLP 神经元：门控行变为 `s·κ`，输入行变为键，输出列变为方向。由于门控会关闭，小反应会被压扁，负反应几乎不会写入。这是单键形式。另外还有两种形式。两个键可以相乘（一个键放在门控行，另一个放在输入行，因此神经元只在两者都有反应的位置写入，例如“这种场景”和“回复中的这个位置”）。也可以将两个神经元配对，使写入量封顶：这是带上限的配对，也是默认形式，下文所有 100 题结果都来自这种形式。在带上限的配对中，门控行放入一个把“这种场景 AND 回复的这个分段”合在一起的键，再分别减去一个在每个位置都约等于 1 的键的较小倍数（一个神经元减 a 倍，另一个减 b 倍）；输入行则放入这个约等于 1 的键。两个神经元之差在键反应小时几乎不写入，在反应大时则稳定在固定量：这是一个带阈值和上限的开关，由同时考察场景和回复位置的键打开。双键形式只在约 12 题的小规模检查中试过，没有用于 100 题评估。
 
 ```bash
@@ -370,7 +372,10 @@ gne nw key --contrast C --layers 11-23 --role scene    # 在这种场景的整�
 gne nw verify --unit 11:N2045:nw:a1@NAME.seg1#k_scene\&k_p1   # LoRA 是否按公式工作？
 gne nw check  --recipe R --contrast C                  # 按位置和场景种类显示键的反应与实际写入量
 gne nw export --recipe R -o R-nw.lora.gguf             # 仅导出 LoRA（不烧录）；含 proj/keyed 单元时，gne headproj export 会把它们放进同一个文件
+gne nw pipeline --contrast C --layers 11-23 --alpha 1,1,0.8 --save R.yaml   # 或一次运行全部构建步骤；--save 会写出上述命令可用的配方
 ```
+
+`gne nw pipeline` 会输出简短摘要（LoRA 是否符合公式、单元和神经元数量、写入量、配方保存位置）；与 `gne nw verify` 一样，公式检查未通过时以 1 退出，且配方仍会写出。`gne nw try` 在设置不同时会把每次结果保存到各自文件；可用 `--name` 指定文件名。`gne nw export --strip-meta` 会去掉 gne 的记录以及任何指明原始模型的内容（名称字段变为 `adapter`，或使用你传给 `--name` 的值）。
 
 单元形如 `L:Nn:nw:aα@DIR#KEY`（1 个键）、`…#GATEKEY&INPUTKEY`（2 个键）和 `L:Nn+Nm:nw:aα@DIR#KEY&ONEKEY`（带上限的配对）。它们与其他单元一样可用于配方、`gne steer`、`gne behave`、聊天以及兼容 OpenAI 的 API。这里只支持带门控的 dense MLP（SiLU 门控 × 输入，无偏置：llama、qwen2、qwen3、qwen35）；其他形状和 MoE 层会给出明确错误。不提供烧录：在 Q8_0 中替换 `ffn_down` 的一列会损失超过九成的修改。
 
@@ -538,6 +543,7 @@ python -m pytest -q
 - [docs/agent_playbook.md](docs/agent_playbook.md)：如何解读结果。
 - [docs/setup.md](docs/setup.md)：WSL 下的 CUDA / ROCm、每个 GPU 一个环境，以及 worker。
 - [CHiPS：知道与回答之间的少数注意力头](https://balaena01.github.io/chips-steering/)：文章，包含测量结果与数据。
+- [FiSH：改写少数闲置神经元，让模型只在特定场景改变语气](https://balaena01.github.io/fish-steering/)：文章，包含测量结果与数据。
 - [docs/qwen4exp.md](docs/qwen4exp.md)：Qwen3.8-Flash-Next（`qwen4exp`）：分割 GGUF 文件、四条残差流，以及在不使用 control vector 时哪些功能可用。
 - [docs/head-component-steering.md](docs/head-component-steering.md)：CHiPS，只改变少数由因果选出的注意力头中沿方向的分量（`mode: proj`、`gne direction score`、`gne heads causal`、`gne heads allocate`、`gne eval --compare-methods`），以及它与全层消融的关系。
 - [docs/keyed-write.md](docs/keyed-write.md)：键控写入。只有当从对照集构建的键对写入残差流的权重矩阵输入产生反应时，才进行秩 1 写入（`mode: keyed`、`gne direction key`、`gne direction key-check`），包含句子结尾的完整示例、它与 CHiPS 的关系，以及如何寻找键有效的位置（`gne direction key-causal`）。
