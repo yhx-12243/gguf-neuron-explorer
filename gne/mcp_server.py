@@ -105,6 +105,10 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    增加问题也不会增强语气。docs/fish.md §3）。nw_check 的各位置数值是平均值，会掩盖部分问题完全未写入的情况，因此也要查看
    逐题数值（by_question 的 low、question_summary.worst 中的问题与回复开头）。fish_pipeline 可通过 direction 复用已有方向
    （不重建），通过 cap 按分段调整带上限形式的阈值。
+   叠加层创建方向（stack_layers、fish_pipeline 的方向阶段）会按层数重读回复。direction 与 fish_pipeline 的
+   stack_fast=True 可改用快速读取（大型模型上约快 10 倍），但方向会略有变化（cos 不低于 0.999），尚未测量
+   该读取方式下的语气与正确答案。比较层与强度的探索可用快速读取，制作要分发的成品时使用默认读取。使用哪种
+   读取方式创建的方向会记录在方向文件（stack_read）和结果（stack_fast、direction_stack_fast）中。
 
 """
 
@@ -216,7 +220,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     async def direction(contrast: str, name: str | None = None, select: str | None = None, mode: str = "ablate",
                         layers: str | None = None, dose: float = 1.0, positions: str = "last",
                         random_controls: int = 16, same_reply: bool = False, segments: str | None = None,
-                        stack_layers: str | list[int] | None = None, response_tokens: int = 96) -> dict:
+                        stack_layers: str | list[int] | None = None, response_tokens: int = 96,
+                        stack_fast: bool = False) -> dict:
         """从对照集（configs/contrast/ 的名称或路径。system_a / system_b / user_prompts，选层使用 validate.match）
         创建并保存所有层方向 r_L = mean_A − mean_B（生成提示词的最后一个 token）（§6.17）。
         select="auto" 时按候选层测量效果并用任务选层（结果用 job_status 查看）。mode="add" 检查在第 L 层
@@ -229,12 +234,16 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         分别读取自己的回复所得之差。same_reply=True 是让 A 侧和 B 侧的两种条件都读取同一回复（A 侧的回复）所得之差
         （仅包含条件差异的成分，不包含读取词语不同带来的成分）。segments="0,1-3,4-" 还会创建按回复位置分段的方向
         （位置 0 = 开始写回复之前。第 i 段可用名称 "NAME.seg<i>" 写入单元）。stack_layers="11-23"（范围）、"11,18,23"、[11, 18, 23]
-        会将带分段的方向设为叠加写入这些层的前提值（上层使用写入下层后的剩余部分。耗时）。"""
+        会将带分段的方向设为叠加写入这些层的前提值（上层使用写入下层后的剩余部分。耗时）。
+        stack_fast=True（与 stack_layers 一起使用。默认 False）会把重读改为快速读取（对连续分段的范围一次读取）。
+        大型模型上创建方向会快得多（RTX 3080、27B、13 层、40 个问题从约 40 分钟降到 3 分半），但方向会略有变化
+        （与默认读取的方向 cos 不低于 0.999，长度相差 1～3%。尚未测量该方向下的语气与正确答案）。适合比较层与强度的探索，
+        制作要分发的成品时保持默认。结果的 stack_fast 和方向文件的 stack_read: fast 中会保留记录。"""
         try:
             params = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
                       "select": select, "mode": mode, "layers": layers, "dose": dose, "positions": positions,
                       "random_controls": random_controls, "same_reply": same_reply, "segments": segments,
-                      "stack_layers": stack_layers, "response_tokens": response_tokens}
+                      "stack_layers": stack_layers, "response_tokens": response_tokens, "stack_fast": stack_fast}
         except Exception as e:  # noqa: BLE001
             return _err(e)
         if select == "auto":
@@ -706,14 +715,14 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                             pseudo: int | None = None, max_tokens: int | None = None, response_tokens: int | None = None,
                             iv: str | list[str] | None = None, neurons: dict[str, list[int]] | None = None, top: int = 20,
                             save: str | None = None, summary: bool = False, direction: str | None = None,
-                            cap: str | list[str] | None = None) -> dict:
+                            cap: str | list[str] | None = None, stack_fast: bool | None = None) -> dict:
         """用一次作业从头到尾创建 FiSH（用 job_status 查看结果。与 UI 的 FiSH 标签页“全部构建”相同）：方向 → 神经元表 →
         键 → 单元 → 在应用这些单元的状态下重建键 → 是否符合公式 → 写入量。contrast 可以是对照集的表（包含 name、system_a、
         user_prompts、dont_touch 以及 fish 设置），也可以是 configs/contrast/ 的名称或路径、configs/fish/ 的模板名称。
         layers 为必填项，由使用者决定（列表或 "11-23"、"11,18,23"。因模型而异）。alpha 为强度，只写一个值时用于所有分段；
         按分段设置时，请按分段顺序写 [1, 1, 0.8] 或 "1,1,0.8"（对应 segments "0,1-3,4-"）。form 为 cap（带上限的 2 个一组，默认）/
         two / one。未传入的参数依次使用表中的 fish 设置、再使用默认值（segments "0,1-3,4-"、form cap、alpha 0.9，并启用 same_reply、stack、rekey）。
-        层越多，需要的神经元数量（层 × 分段 × 形式的个数）和创建时间越多（Qwen3.5-4B 的 13 层为 78 个，方向和键约需 16 分钟）。
+        层越多，所需神经元数量（层 × 分段 × 形式个数）与创建时间越多（Qwen3.5-4B 的 13 层为 78 个；40 个问题下，方向约 3 分钟，键与验证约 2～3 分钟）。
         结果：units（配方中单元的写法）、direction、usage、neurons、keys、rekeyed、verify（ok）、check（groups.scene 与
         dont_touch:<名称> 各位置写入量）、stage_seconds。若要在创建前比较层和强度，请使用 nw_try。
         传入 save（名称或以 .yaml 结尾的路径）后，会将生成的单元写入配方文件（名称时为 <root>/recipes/<名称>.yaml。结果的
@@ -724,6 +733,11 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         传入 direction（已有方向名称）时会直接使用而不重建（分段、层或叠加层不匹配则 BAD_DIRECTION）。
         cap 是带上限形式的阈值 "a-b"（默认 0.4-0.8。键响应低于 a 时几乎不写入，高于 b 时封顶在目标量）。写一个值应用到
         所有分段；按分段写 ["0.4-0.8", "0.3-0.7", "0.3-0.7"] 或 "0.4-0.8,0.3-0.7,0.3-0.7"。
+        stack_fast=True（默认关闭。也可在表中的 fish.stack_fast 设置）会把创建方向阶段的逐层重读改为快速读取（对连续分段
+        的范围一次读取）。大型模型上创建方向会快得多，但方向会略有变化（与默认读取的方向 cos 不低于 0.999。尚未测量该方向下的
+        语气与正确答案）。适合比较层与强度的探索；制作要分发的成品时保持默认。其他阶段不受影响。与 direction 一起传入时不会生效，
+        notes 中会给出提示。结果/摘要的 direction_stack_fast 会显示使用了哪种读取方式创建的方向（使用已有方向时也会从方向文件
+        的记录中得出）。
         键只生成一次回复并读取，用一次读取创建所有分段。建键问题在目标场景和不希望改变的场景中都应多准备一些
         （目标场景建议 100 个以上）。"""
         from .jobs import _layers
@@ -733,7 +747,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             p = {**_fish_contrast(contrast), "layers": layers, "alpha": alpha, "segments": segments, "form": form, "name": name,
                  "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
                  "response_tokens": response_tokens, "iv": iv, "neurons": neurons, "top": top, "save": save,
-                 "direction": direction, "cap": cap, "summary": True if summary else None}
+                 "direction": direction, "cap": cap, "stack_fast": stack_fast, "summary": True if summary else None}
             return jobs.start("fish_pipeline", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)

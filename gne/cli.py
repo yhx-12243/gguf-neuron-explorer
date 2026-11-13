@@ -1127,7 +1127,8 @@ def direction(c: Common, holder: dict,
               random_controls: int = typer.Option(16, "--random-controls", help="--select auto：每层同等大小的随机方向对照数量（0 为无对照）"),
               same_reply: bool = typer.Option(False, "--same-reply", help="--positions response：B 侧也读取 A 侧的回复（让两种条件读取同一回复所得之差，不包含读取文字不同带来的成分）。默认仍与以往相同，读取各自条件自己的回复"),
               segments: Optional[str] = typer.Option(None, "--segments", help="--positions response：同时按回复位置分段创建方向（例如 0,1-3,4-。位置 0 = 开始写回复之前）。第 i 段的方向可用 NAME.seg<i> 这个名称"),
-              stack_layers: Optional[str] = typer.Option(None, "--stack-layers", help="与 --same-reply 和 --segments 一起使用：将带分段的方向设为写入这些层（例如 11-23 或 11,18,23，也可混写为 11,14-16）的前提值（上层使用下层写入后的剩余部分）。因为它逐个 token 读取，所以耗时（与层数 − 1 成正比，会计入估算）"),
+              stack_layers: Optional[str] = typer.Option(None, "--stack-layers", help="与 --same-reply 和 --segments 一起使用：将带分段的方向设为写入这些层（例如 11-23 或 11,18,23，也可混写为 11,14-16）的前提值（上层使用写入下层后的剩余部分）。因为要逐层重读回复，所以耗时较长（与层数 − 1 成正比，会计入估算）"),
+              stack_fast: bool = typer.Option(False, "--stack-fast", help="与 --stack-layers 一起使用：逐层重读时，对连续分段的范围一次读取（更快。在 27B IQ2_XS 上约快 11 倍）。上层方向与默认读取略有不同（cos 不低于 0.9996），用其创建的 LoRA 回复也不会完全相同。默认读取只在结果不变的范围合并读取"),
               yes: bool = _YES):
     """从对照集创建并保存全层方向 r_L（mean_A − mean_B），再用 --select auto 选择效果较大的层（§6.17）。
     创建的方向可用 L:dir:NAME:dose 单元加入（gne steer / chat / eval / export-cvec）。
@@ -1148,16 +1149,19 @@ def direction(c: Common, holder: dict,
     _gate(s, "direction", {"contrast": str(contrast), "positions": positions, "select": select, "mode": mode,
                            "layers": layers, "max_tokens": max_tokens, "response_tokens": response_tokens,
                            "random_controls": random_controls, "same_reply": same_reply, "segments": segments,
-                           "stack_layers": stack_layers}, yes, None)
+                           "stack_layers": stack_layers, "stack_fast": stack_fast}, yes, None)
     d = s.direction(contrast=contrast, name=name, positions=positions, select=select, mode=mode, layers=layers,
                     dose=dose, max_tokens=max_tokens, kl_max=kl_max, min_distinct=min_distinct, per_layer=per_layer,
                     judge_model=judge_model, judge_target=judge_target, response_tokens=response_tokens,
-                    random_controls=random_controls, same_reply=same_reply, segments=segments, stack_layers=stack_layers)
+                    random_controls=random_controls, same_reply=same_reply, segments=segments, stack_layers=stack_layers,
+                    stack_fast=stack_fast)
     lines = [f"{d['path']}（A/B 各 {d['n_prompts']} 个会话、行数 {d['n_rows']}、位置 {d['positions']}、{d['seconds']:.0f} 秒）",
              "创建方式：" + ("让 A 侧、B 侧两种条件都读取同一回复（A 侧的回复）所得之差（--same-reply）" if d.get("same_reply")
                          else "读取各自条件自己的文字所得之差（以往的创建方式）"),
              *([("带分段的方向：" + "、".join(f"{x['name']}（位置 {x['positions']}）" for x in d["segments"])
-                 + (f"。层 {','.join(map(str, d['stack_layers']))} 是补上下面各层后的剩余" if d.get("stack_layers") else ""))]
+                 + (f"。层 {','.join(map(str, d['stack_layers']))} 是补上下面各层后的剩余" if d.get("stack_layers") else "")
+                 + ("（快速读取 --stack-fast。与使用默认读取创建的方向略有不同。适合探索）" if d.get("stack_fast")
+                    else ("（默认读取）" if len(d.get("stack_layers") or []) > 1 else "")))]
                if d.get("segments") else []),
              "各层 ‖平均差‖/ρ（换算为 rel dose 的幅度）及与上一层的 cos："]
     lines.append("  " + " ".join(f"L{r['layer']}:{r['rel']:.2f}" if r["rel"] is not None else f"L{r['layer']}:—"
@@ -1389,7 +1393,8 @@ def _gate(s, kind: str, params: dict, yes: bool, budget: Optional[str]) -> dict:
         raise e.error from e
     if est is not None and est.get("seconds"):
         b = est.get("budget")
-        sys.stderr.write(f"估算：{fmt_seconds(est['seconds'])}" + (f"（已按预算缩小：{b}）" if b else "") + "\n")
+        first = "（逐层重读按逐个读取的情况估算。首次估算会偏长）" if (est.get("detail") or {}).get("stack_first") else ""
+        sys.stderr.write(f"估算：{fmt_seconds(est['seconds'])}" + (f"（已按预算缩小：{b}）" if b else "") + first + "\n")
     return p
 
 
@@ -3156,6 +3161,7 @@ def nw_pipeline(c: Common, holder: dict,
                 save: Optional[str] = typer.Option(None, "--save", help="将生成的单元写入配方文件（以 .yaml 结尾的路径，或名称 = <root>/recipes/<名称>.yaml）。可直接传给 gne nw verify --recipe。省略则不写"),
                 same_reply: Optional[bool] = typer.Option(None, "--same-reply/--no-same-reply", help="用两侧读取同一回复的差异来创建方向（默认创建）"),
                 stack: Optional[bool] = typer.Option(None, "--stack/--no-stack", help="让上层方向使用写入下层后的剩余部分（默认使用。耗时随层数增加）"),
+                stack_fast: Optional[bool] = typer.Option(None, "--stack-fast/--no-stack-fast", help="在创建方向的阶段，把逐层重读改为快速读取（对连续分段的范围一次读取。默认关闭）。大型模型上创建方向会快得多，但方向会略有变化（与默认读取创建的方向 cos 不低于 0.999）。适合比较层与强度的探索；制作要分发的成品时不要开启。与 --direction 一起传入时不会生效（会给出提示）"),
                 rekey: Optional[bool] = typer.Option(None, "--rekey/--no-rekey", help="在应用生成的单元的状态下重建键（默认重建）"),
                 pseudo: Optional[int] = typer.Option(None, "--pseudo", help="比较用键的数量（默认 4）"),
                 max_tokens: Optional[int] = typer.Option(None, "--max-tokens", help="用键与写入量生成回复的长度（默认 96）"),
@@ -3168,7 +3174,8 @@ def nw_pipeline(c: Common, holder: dict,
     → 是否符合公式 → 写入量。层和强度使用传入的值（不会自动决定）。神经元按活跃度从低到高的表自上而下使用
     （若要重新选择，请查看 gne nw neurons 的表并编写配方）。输出为简短摘要（是否符合公式、单元和神经元数量、写入量、
     逐题数值数量、配方保存位置）。加上 --save 后会写出配方，可直接传给 gne nw verify / check / export 的 --recipe。
-    使用 --direction NAME 可直接使用已有方向而不重建。使用 --cap 可按分段设置带上限形式的阈值。"""
+    使用 --direction NAME 可直接使用已有方向而不重建。使用 --cap 可按分段设置带上限形式的阈值。
+    --stack-fast 只把创建方向的阶段改为快速读取（适合探索。方向会略有变化。摘要会显示使用了哪种读取方式创建的方向）。"""
     from . import fish
     from .jobs import _fish_pipeline
     if not parse_layers(layers):
@@ -3176,8 +3183,8 @@ def nw_pipeline(c: Common, holder: dict,
     s = holder["session"] = c.session()
     p = {"contrast": str(contrast), "layers": layers, "alpha": alpha, "cap": cap, "direction": direction, "segments": segments,
          "form": form, "name": name, "save": save,
-         "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
-         "response_tokens": response_tokens, "top": top, "iv": _iv_arg(iv)}
+         "same_reply": same_reply, "stack": stack, "stack_fast": stack_fast, "rekey": rekey, "pseudo": pseudo,
+         "max_tokens": max_tokens, "response_tokens": response_tokens, "top": top, "iv": _iv_arg(iv)}
     p = {k: v for k, v in p.items() if v is not None}
     if save is not None:
         fish.recipe_file(s, save)                    # 保存先が読めなければ、見積もりの前に止める

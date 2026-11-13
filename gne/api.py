@@ -1421,14 +1421,17 @@ class Session:
                   dose: float = 0.5, max_tokens: int = 64, kl_max: float = 0.1, min_distinct: float = 0.8,
                   per_layer: bool = False, judge_model: str | Path | None = None, judge_target: str | None = None,
                   response_tokens: int = 96, random_controls: int = 16, same_reply: bool = False,
-                  segments: str | list | None = None, stack_layers: str | list[int] | None = None) -> dict:
+                  segments: str | list | None = None, stack_layers: str | list[int] | None = None,
+                  stack_fast: bool = False) -> dict:
         """根据对照集创建并保存所有层方向 r_L；select="auto" 时选择效果较大的层（数字则手动指定）。
         random_controls > 0 时，在层选择中加入同量级的随机方向对照，只选择超过对照 p95 的层（CHANGE-03 A）。
         positions="response" 时从回复 token 创建（用 A / B 的 system 生成到 response_tokens 的回复再计算）。
         same_reply(positions response だけ): B 側も A 側の返事を読む(同じ返事を両方の条件で読ませた差。読んでいる語の違いから来る
         成分が入らない)。segments("0,1-3,4-"): 返事の位置で分けた方向も作る(名前 NAME.seg<i> で 1 本の方向として使える)。
         stack_layers: 区切りつきの方向を、これらの層に重ねて書く前提の値にする(direction.response_directions)。
-        リストか、"11-23"・"11,18,23"・"11,14-16" のような文字列(ほかの layers と同じ読み方)。"""
+        リストか、"11-23"・"11,18,23"・"11,14-16" のような文字列(ほかの layers と同じ読み方)。
+        stack_fast: stack_layers の読み直しを速い読み方にする(区切りが続く範囲ごとに 1 回で読む)。上の層の方向が、既定の読み方と
+        わずかに違うことがある(direction.response_directions)。"""
         from .direction import (DirectionSet, candidate_layers, layer_table, load_contrast, response_directions,
                                 save_directions, save_select, select_layer)
         from .evalx import Judge
@@ -1447,12 +1450,14 @@ class Session:
             if isinstance(stack_layers, str) and stack_layers.strip() == "all":
                 raise GneError("BAD_ARGS", "stack_layers 不能使用 all", "请像 11-23 或 11,18,23 这样指定要叠加写入的层")
             stack_layers = _layers(stack_layers)
+        if stack_fast and not stack_layers:
+            raise GneError("BAD_ARGS", "stack_fast 只能与 stack_layers 一起使用", "gne direction … --stack-layers 11-23 --stack-fast")
         if (same_reply or segments or stack_layers) and positions != "response":
             raise GneError("BAD_ARGS", "same_reply、segments、stack_layers 只能在 positions 为 response 时使用",
                            "gne direction --contrast C --positions response --same-reply")
         if positions == "response":
             cr = response_directions(self, cs, max_tokens=response_tokens, progress=self.progress, same_reply=same_reply,
-                                     segments=segments, stack_layers=stack_layers)
+                                     segments=segments, stack_layers=stack_layers, stack_fast=stack_fast)
         else:
             from .reverse import side_interventions
             cr = contrastive_directions(self.engine, cs, positions=positions, with_act=False, progress=self.progress,
@@ -1489,6 +1494,8 @@ class Session:
             how["segments"] = [{"index": i, "positions": sg, "name": f"{name}.seg{i}",
                                 "rows": {"A": cr.seg_rows["A"][i], "B": cr.seg_rows["B"][i]}} for i, sg in enumerate(ds.segments)]
             how["stack_layers"] = list(getattr(cr, "stack_layers", []) or [])
+            if getattr(cr, "stack_fast", False):
+                how["stack_fast"] = True
         return {"name": name, "path": str(path), "contrast": str(contrast), "contrast_sha": cs.sha, "positions": positions, **how,
                 **({"sides": cs.describe()} if (cs.has_recipes or cs.separate_prompts or cs.system_a is None
                                                 or cs.system_b is None) else {}),

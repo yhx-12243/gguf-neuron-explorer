@@ -1830,7 +1830,7 @@ export const EN = {
   "この層と強さを上の欄に入れる": "Use these layers and strengths above",
   "層を入れてください(0〜{m} の数をカンマ区切りか、11-23 のような範囲で)。層はモデルで違うので、使う人が決めます": "Enter the layers (numbers 0–{m}, comma-separated or a range such as 11-23). Layers differ by model, so you choose them",
   "{l} 層で合わせて {m} 個のニューロンを書き換える": "{l} {l|layer|layers}: {m} neurons rewritten in total",
-  "層が多いと作成に時間がかかります(Qwen3.5-4B の 13 層で 20〜30 分ほど)。見積もりは「まとめて作る」を押すと出ます": "Many layers take long to build (about 20–30 minutes for 13 layers on Qwen3.5-4B). The estimate appears when you press Build everything",
+  "層が多いと作成に時間がかかります(Qwen3.5-4B の 13 層で 5〜6 分ほど)。見積もりは「まとめて作る」を押すと出ます": "Many layers take long to build (about 5–6 minutes for 13 layers on Qwen3.5-4B). The estimate appears when you press Build everything",
   "強さを、区切りごとに全部入れてください(例 1 / 1 / 0.8)": "Enter a strength for every segment (e.g. 1 / 1 / 0.8)",
   "先に方向を作ってください(2. か「まとめて作る」)": "Build the direction first (step 2 or Build everything)",
   "足す層を入れてください(1〜{m}。層 0 と最終層には足せません)": "Enter the layers to add to (1–{m}; layer 0 and the last layer cannot be used)",
@@ -1879,4 +1879,11 @@ export const EN = {
   "鍵の反応": "Key response",
   "返事の出だし": "Start of the reply",
   "書けていない質問が、返事の書き出し方(かぎかっこで始まる、など)でまとまっていたら、鍵を作る質問を増やします(狙う場面の質問は 100 問以上を勧めます)": "If the questions with almost nothing written share a way of starting the reply (for example, an opening quotation mark), add more questions for building the keys (100 or more target-scene questions are recommended)",
+  // FiSH のタブ: 速い読み方(方向づくりで、層ごとの読み直しを区切りごとにまとめて読む)
+  "速い読み方(区切りごとにまとめて読む。探索向け。方向がわずかに変わる)": "Fast reading (one read per segment; for exploring; the direction changes slightly)",
+  "速い読み方(区切りごとにまとめて読む)。大きいモデルで方向づくりがずっと速くなるが、方向がわずかに変わる(今までの方向との cos 0.999 以上)。層や強さを比べる探索向け。配るものを作るときは切のまま。この読み方の方向での口調・正答は測っていない。効くのは方向を作る段だけで、「すでにある方向を使う」に名前を入れたときは効かない": "Fast reading (one read per segment). Building the direction gets much faster on large models, but the direction changes slightly (cosine of 0.999 or more with the default direction). Meant for exploring layers and strengths. Keep it off when you build something to distribute. Tone and correct answers with such a direction have not been measured. It only affects the direction step, and has no effect when a name is entered in \"Use an existing direction\"",
+  "(初回は長めに出ます。層ごとの読み直しを、いちばん遅い場合で数えています)": "(the first estimate on a model runs long: re-reading per layer is counted for the slowest case)",
+  "速い読み方で作った方向(探索向け。配るものは既定の読み方で作り直す)": "Direction built with fast reading (for exploring; rebuild with the default reading before distributing)",
+  "既定の読み方で作った方向": "Direction built with the default reading",
+  "すでにあるものを使った": "reused an existing one",
 };

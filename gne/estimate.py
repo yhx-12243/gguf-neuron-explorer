@@ -147,17 +147,14 @@ def estimate(session, kind: str, params: dict) -> dict:
             # 返事を作る回数: 今までの作り方は A 側と B 側、same_reply は A 側だけ(B 側は A 側の返事を読むだけで、生成しない)
             rt = int(p.get("response_tokens", 96))
             sec += (1 if p.get("same_reply") else 2) * sp.gen(len(cs.user_prompts), rt)
-            # 層を重ねる(stack_layers)とき: いちばん下の層を除く層ごとに、A 側の全部の質問の返事を 1 本ずつ・1 トークンずつ
-            # 読み直す(direction._stack_segments。位置ごとに control vector を付け替えるので、まとめて読めない)。
-            # 回数 = (層の数 − 1) × A 側の質問の数 × (返事の長さ + 1)。1 回は生成の 1 step の 2 倍ほど
-            # (捕捉つきの 1 トークンの評価。Qwen3.5-4B Q8_0 の実測: 40 問・13 層で約 800 秒、32 問・120 トークン・3 層で約 170 秒)。
-            # 返事が EOG で早く終われば短い。
+            # 層を重ねる(stack_layers)とき: いちばん下の層を除く層ごとに、A 側の全部の質問の返事を 1 本ずつ読み直す(_stack_seconds)
             n_stack = _n_stack_layers(p.get("stack_layers"), m.n_layer)
             if n_stack > 1 and p.get("same_reply") and p.get("segments"):
-                evals = (n_stack - 1) * len(cs.prompts("A")) * (rt + 1)
-                stack_s = evals * 2 * sp.step(1) / 1000
+                ck, first = _stack_chunk_guess(session, p.get("stack_fast"))
+                stack_s, evals = _stack_seconds(sp, n_stack, len(cs.prompts("A")), p.get("segments"), rt, ck)
                 sec += stack_s
-                detail = {"stack_layers": n_stack, "stack_evals": evals, "stack_seconds": round(stack_s, 1)}
+                detail = {"stack_layers": n_stack, "stack_evals": evals, "stack_seconds": round(stack_s, 1),
+                          "stack_chunk": ck or "run", "stack_first": first}
         if p.get("select") == "auto":
             layers = p.get("layers")
             n_l = len(candidate_layers(m.n_layer, layers if isinstance(layers, str) else None))
@@ -344,6 +341,41 @@ def estimate(session, kind: str, params: dict) -> dict:
             "needs_confirm": bool(sec is not None and sec > CONFIRM_S)}
 
 
+# 層を重ねるときの読み取り(捕捉つき)の時間を、生成の 1 step の何倍かで表したもの。RTX 3080 の実測: 数トークンまでの読み取り 1 回は
+# Qwen3.5-4B Q8_0 で約 11 ms(1.2 倍)、27B の IQ2_XS で約 63 ms(2.5 倍。VRAM がほぼ埋まる)。control vector を付け替えた直後の
+# 読み取りは、4B でさらに約 24 ms。短く見積もらないように、読み取りは 27B に近い 2 倍で数える(4B では長めに出る)
+STACK_READ_STEPS = 2.0
+STACK_SWAP_STEPS = 2.7
+
+
+def _stack_seconds(sp: Speed, n_stack: int, n_a: int, segments, rt: int, chunk: int | None = 1) -> tuple[float, int]:
+    """層を重ねる分(direction._stack_segments)の秒数と、読み取りの回数。いちばん下の層を除く層ごとに、A 側の全部の質問の返事を
+    1 本ずつ読み直す。1 本の読み取りは、質問の部分で 1 回と、返事の位置(返事の長さ + 1 個。+1 は返事を書き始める直前の位置)を
+    同じ区切りが続く範囲ごとに chunk 個までまとめた回数。control vector の付け替えは区切りが変わるときだけ(区切り 0,1-3,4- なら
+    3 回)。chunk は、まとめても値が変わらない数を本番が最初に確かめて決める(モデルとバックエンドで 1〜8)。走らせる前には
+    分からないので、1(1 つずつ。いちばん遅い場合)で数える。このセッションで前に層を重ねたことがあれば、そのときの数を使う。
+    返事の長さは上限(response_tokens)で数えるので、返事が EOG で早く終われば短い。"""
+    from .direction import parse_segments, segment_runs
+    try:
+        segs = parse_segments(segments)
+        runs, swaps = len(segment_runs(segs, int(rt) + 1, chunk)), len(segment_runs(segs, int(rt) + 1))
+    except Exception:  # noqa: BLE001  読めない区切りは本番がエラーを返す
+        runs, swaps = -(-(int(rt) + 1) // max(1, int(chunk or 1))), 1
+    evals = (n_stack - 1) * n_a * (runs + 1)
+    per = sp.setprefill + (runs * STACK_READ_STEPS + swaps * STACK_SWAP_STEPS) * sp.step(1)
+    return (n_stack - 1) * n_a * per / 1000, evals
+
+
+def _stack_chunk_guess(session, fast) -> tuple[int | None, bool]:
+    """層を重ねる読み直しで、1 回にまとめる位置の数の見込みと、「1 つずつ読む場合で数えたか」(初回)。
+    速い読み方(stack_fast)は範囲を丸ごと 1 回(None)。既定の読み方は、このセッションで前に確かめた数があればそれ、無ければ 1
+    (いちばん遅い場合。まとめて読めるモデルでは実際より長く出る。Qwen3.5-4B の Q8_0 で約 5 倍。短く見積もらないための選択)。"""
+    if fast:
+        return None, False
+    ck = getattr(session, "_stack_chunk", None)
+    return (int(ck), False) if ck else (1, True)
+
+
 def _n_stack_layers(stack, n_layer: int) -> int:
     """方向の stack_layers(リストか "11-23"・"11,18,23")の層の数。読めなければ 0(見積もりでは止めない。本番がエラーを返す)。"""
     if stack is None or (isinstance(stack, str) and not stack.strip()):
@@ -501,10 +533,13 @@ def _fish_cost(session, sp: Speed, kind: str, p: dict) -> dict:
         n_seg = len(fish._segments(get("segments")))
         form = get("form")
         n_keys = n_seg + (1 if form in ("two", "cap") else 0)
-        # 下の層に書いた後の残りを使うときは、いちばん下の層を除く層ごとに、返事を 1 本ずつ・1 トークンずつ流し直す
-        # (質問の数 × 返事の長さ × (層の数 − 1) 回の 1 本の評価で、1 回は生成の 1 step の 2 倍ほど。Qwen3.5-4B Q8_0 の実測:
-        # 32 問・120 トークン・3 層で方向 244 秒のうち約 170 秒、40 問・96 トークン・13 層で方向 906 秒のうち約 800 秒)
-        dir_s = 2 * sp.gen(n_a, rt) + 2 * n_a * read + ((len(Ls) - 1) * n_a * rt * 2 * sp.step(1) / 1000 if get("stack") else 0.0) \
+        # 下の層に書いた後の残りを使うときは、いちばん下の層を除く層ごとに、返事を 1 本ずつ読み直す(_stack_seconds)
+        # 速い読み方(stack_fast)なら、区切りが続く範囲ごとに 1 回で数える
+        stacked = bool(get("stack") and len(Ls) > 1 and not fish.before_mode(get("segments")))
+        ck, first = _stack_chunk_guess(session, get("stack_fast"))
+        stack_s = _stack_seconds(sp, len(Ls), n_a, get("segments"), rt, ck)[0] if stacked else 0.0
+        first = bool(first and stacked and kind in ("fish_direction", "fish_pipeline") and not (kind == "fish_pipeline" and p.get("direction")))
+        dir_s = 2 * sp.gen(n_a, rt) + 2 * n_a * read + stack_s \
             + (sp.gen(n_a, rt) + 2 * n_a * read if p.get("compare", True) else 0.0)
         if kind == "fish_pipeline" and p.get("direction"):     # すでにある方向を使う: 方向は作らない
             dir_s = 0.0
@@ -531,14 +566,14 @@ def _fish_cost(session, sp: Speed, kind: str, p: dict) -> dict:
             tk = int(p.get("max_tokens") or 120)
             return {"questions": n_s + n_o, "seconds": n_s * (2 if p.get("baseline", True) else 1) * sp.gen(1, tk) + sp.gen(n_o, tk)}
         if kind == "fish_direction":
-            return {"questions": n_a, "seconds": dir_s}
+            return {"questions": n_a, "seconds": dir_s, "stack_seconds": stack_s, "stack_first": first}
         if kind == "fish_keys":
             return {"keys": n_keys, "questions": n_all, "seconds": keys_s}
         if kind == "fish_check":
             return {"questions": n_all, "seconds": check_s}
         total = dir_s + neur_s + keys_s * (2 if p.get("rekey", True) else 1) + check_s + len(Ls) * (4 * read + 1.0)
         return {"questions": n_all, "keys": n_keys, "direction_seconds": dir_s, "keys_seconds": keys_s, "check_seconds": check_s,
-                "seconds": total}
+                "stack_first": first, "seconds": total}
     except Exception:  # noqa: BLE001  対照集合が読めなくても見積もりで止めない(本番がエラーを返す)
         return {"seconds": 60.0, "guess": True}
 

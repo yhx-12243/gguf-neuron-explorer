@@ -20,7 +20,7 @@ import yaml
 from typer.testing import CliRunner
 
 from gne import nwrite as NW
-from gne.direction import DirectionSet, parse_segments, segment_of, segment_text
+from gne.direction import DirectionSet, parse_segments, segment_of, segment_runs, segment_text
 from gne.keyed_build import parse_positions, select_positions, start_positions
 from gne.steer import GneError, Recipe, parse_unit
 
@@ -131,9 +131,9 @@ def test_help_lists_new_commands():
     r = CliRunner().invoke(app, ["nw", "--help"])
     assert r.exit_code == 0 and all(x in r.output for x in ("neurons", "key", "verify", "check", "try", "pipeline", "export"))
     r = CliRunner().invoke(app, ["direction", "--help"])
-    assert "--same-reply" in r.output and "--segments" in r.output and "--stack-layers" in r.output
+    assert "--same-reply" in r.output and "--segments" in r.output and "--stack-layers" in r.output and "--stack-fast" in r.output
     r = CliRunner().invoke(app, ["nw", "pipeline", "--help"])
-    assert r.exit_code == 0 and "--save" in r.output and "--layers" in r.output
+    assert r.exit_code == 0 and "--save" in r.output and "--layers" in r.output and "--stack-fast" in r.output
     r = CliRunner().invoke(app, ["nw", "export", "--help"])
     assert "--strip-meta" in r.output and "--name" in r.output
 
@@ -205,12 +205,42 @@ def test_pipeline_summary_and_recipe_file(tmp_path):
     assert "目标场景中没有几乎未写入的问题" in "\n".join(NW.question_lines({"question_summary": {**d2["check"]["question_summary"], "worst": [], "n_low": 0},
                                                                     "groups": d2["check"]["groups"]}))
     assert sm["questions"] is None and sm["cap"] is None and sm["direction"] == "tt" and "逐题数值" not in text      # 前の形の結果もそのまま要約できる
+    # どちらの読み方で作った方向か: 速い読み方(stack_fast)で作った方向は、作ったときも、使い回したときも要約に出る
+    assert sm["direction_stack_fast"] is False and sm2["direction_stack_fast"] is False and "快速读取" not in text + t2
+    for extra, word in (({}, "方向 tt（使用快速读取创建的方向）"), ({"direction_name": "old_dir", "direction_reused": True},
+                                                          "方向 old_dir（使用了已有方向）（使用快速读取创建的方向）")):
+        d3 = {**d, **extra, "direction_stack_fast": True}
+        assert fish.summary(d3)["direction_stack_fast"] is True and word in fish.summary_text(d3) and fish.summary_text(fish.summary(d3)) == fish.summary_text(d3)
+    assert "stack_fast" in fish.SETTINGS and fish.DEFAULTS["stack_fast"] is False                  # 既定は切。表の fish にも書ける
     s = SimpleNamespace(store=SimpleNamespace(recipes_dir=lambda: tmp_path / "recipes"))
     assert fish.recipe_file(s, "tt_nw") == tmp_path / "recipes" / "tt_nw.yaml"
     assert fish.recipe_file(s, str(tmp_path / "x" / "tt_nw.yaml")) == tmp_path / "x" / "tt_nw.yaml"
     for bad in ("a b", "dir/name", str(tmp_path / "a b.yaml")):
         with pytest.raises(GneError):
             fish.recipe_file(s, bad)
+
+
+def test_segment_runs():
+    """層を重ねるときの読み取りのまとめ方: 同じ区切りが続く返事の位置を 1 つの範囲にし、chunk 個までに切る。"""
+    segs = parse_segments("0,1-3,4-")
+    assert segment_runs(segs, 10) == [(0, 1, 0), (1, 4, 1), (4, 10, 2)]
+    assert segment_runs(segs, 10, 4) == [(0, 1, 0), (1, 4, 1), (4, 8, 2), (8, 10, 2)]
+    assert segment_runs(segs, 10, 1) == [(k, k + 1, segment_of(segs, k)) for k in range(10)]        # 1 つずつ(元の読み方)
+    assert segment_runs(segs, 3) == [(0, 1, 0), (1, 3, 1)] and segment_runs(segs, 1) == [(0, 1, 0)]  # 返事が区切りの境目より短い
+    assert segment_runs(segs, 4, 8) == [(0, 1, 0), (1, 4, 1)] and segment_runs(segs, 5, 8) == [(0, 1, 0), (1, 4, 1), (4, 5, 2)]
+    assert segment_runs(parse_segments("0-"), 7) == [(0, 7, 0)] and segment_runs(parse_segments("0-"), 7, 3) == [(0, 3, 0), (3, 6, 0), (6, 7, 0)]
+    # どの区切りにも入らない位置(None)も読む(KV キャッシュに要る)。隣り合う None は 1 つの範囲
+    assert segment_runs(parse_segments("2-3"), 7) == [(0, 2, None), (2, 4, 0), (4, 7, None)]
+    assert segment_runs(parse_segments("0,3,5-6"), 9, 2) == [(0, 1, 0), (1, 3, None), (3, 4, 1), (4, 5, None), (5, 7, 2), (7, 9, None)]
+    assert segment_runs(segs, 0) == []
+    for spec in ("0,1-3,4-", "0-", "2-3", "0,3,5-6", "1-", "0,1,2,3-10,11-"):
+        sg = parse_segments(spec)
+        for n in (1, 2, 5, 12, 40):
+            for chunk in (None, 1, 3, 8):
+                runs = segment_runs(sg, n, chunk)
+                assert [k for a, b, _ in runs for k in range(a, b)] == list(range(n))                # 抜けも重なりも無く、順に
+                assert all(segment_of(sg, k) == i for a, b, i in runs for k in range(a, b))         # 1 つの範囲は 1 つの区切り
+                assert chunk is None or all(b - a <= chunk for a, b, _ in runs)
 
 
 # --- モデルあり ----------------------------------------------------------------------------------------
@@ -274,33 +304,209 @@ def test_direction_same_reply_and_segments(built):
             s.direction(contrast=built["contrast"], name="nw_bad", **kw)
 
 
+def _stack_args(s, contrast, monkeypatch, **kw):
+    """層を重ねる計算(direction._stack_segments)に渡る値を 1 回分とっておく(返事・A 側の平均・重ねる前の方向)。"""
+    import copy
+
+    from gne import direction as D
+    rec, orig = {}, D._stack_segments
+
+    def spy(session, cs, replies, segs, stack, mean_a, seg_dirs, progress, **k2):
+        rec.update(cs=cs, replies=copy.deepcopy(replies), segs=segs, stack=list(stack), mean_a=copy.deepcopy(mean_a),
+                   seg0=copy.deepcopy(seg_dirs), kw=k2)
+        used = orig(session, cs, replies, segs, stack, mean_a, seg_dirs, progress, **k2)
+        rec["out"] = copy.deepcopy(seg_dirs)
+        return used
+    monkeypatch.setattr(D, "_stack_segments", spy)
+    s.direction(contrast=contrast, positions="response", same_reply=True, **kw)
+    monkeypatch.setattr(D, "_stack_segments", orig)
+    return rec
+
+
+def _stack_run(s, rec, spec, replies, chunk):
+    """区切り spec・返事 replies で層を重ねる計算をやり直す(区切りの数が違うときは、とっておいたベクトルを順に使い回す)。"""
+    from gne import direction as D
+    segs = parse_segments(spec)
+    n0 = len(rec["segs"])
+    seg = {i: dict(rec["seg0"][i % n0]) for i in range(len(segs))}
+    mean_a = {L: [v[i % n0] for i in range(len(segs))] for L, v in rec["mean_a"].items()}
+    used = D._stack_segments(s, rec["cs"], replies, segs, rec["stack"], mean_a, seg, None, chunk=chunk)
+    assert used == chunk or (chunk == "auto" and 1 <= used <= D.STACK_CHUNK_MAX), (chunk, used)
+    rec["used"] = used
+    return {(i, L): seg[i][L].astype(np.float64) for i in range(len(segs)) for L in rec["stack"]}
+
+
+def _stack_diff(a: dict, b: dict) -> tuple[float, float]:
+    """(相対誤差の最大 = 差の長さ ÷ 長さ、cos の最小)。"""
+    rel = max(float(np.linalg.norm(a[k] - b[k]) / max(np.linalg.norm(b[k]), 1e-30)) for k in a)
+    cos = min(float(a[k] @ b[k] / max(np.linalg.norm(a[k]) * np.linalg.norm(b[k]), 1e-30)) for k in a)
+    return rel, cos
+
+
+# 層を重ねるときの読み取りは、返事の位置をまとめて読む。llama.cpp は 1 回に読むトークンの数で計算方法を変えるので、まとめると層の
+# 出力がわずかに変わる組み合わせがある(control vector を足さなくても同じ大きさで変わる。docs/verification.md §22.18)。
+# - 既定(chunk="auto")は、1 つずつ読んだときと出力が完全に同じになる数だけまとめる。できる方向は、どのモデル・バックエンドでも、
+#   1 つずつ読む元の読み方(chunk=1)と配列が完全に同じ。
+# - まとめる数を決め打ちにしたとき(chunk=数・None)は、同じ計算だが値がわずかに違ってよい。Qwen3-0.6B の CPU は、2 個以上まとめると
+#   1 個のときと層の出力が 1〜2% 変わる。方向は平均の差なので相対誤差はそれより大きく出る。実測(6 問・返事 20 トークン・層 8,10,12、
+#   下の組み合わせの全部)の最大は相対誤差 0.032・cos の最小 0.9995 だった(8 問・32 トークン・7 層では 0.067・0.9978)ので、
+#   その 3 倍ほどの 0.1 と 0.995 を許す。読む位置が 1 つずれると相対誤差は 0.4 を超える(下で確かめる)。
+# - まとめても値が変わらない組み合わせ(SmolLM2 の Q8_0 を CPU で)では、決め打ちでも完全に一致し、既定は 2 個以上まとめる。
+# (区切り, 返事を短く切るか, まとめる数の並び)。短く切った返事は 1・2・3・4・9 トークンと元の長さで、区切りの境目より短いものが混ざる
+STACK_CASES = [("0,1-3,4-", False, (None, 8, 3)), ("0,1-3,4-", True, (8,)), ("0-", True, (None,)), ("2-3", False, (None,)),
+               ("0,3,5-6", True, (2,)), ("0,1-3,4-9,10-", False, (8,))]
+
+
+@pytest.mark.model
+def test_stack_segments_chunked_matches_per_token(built, monkeypatch):
+    s = built["s"]
+    rec = _stack_args(s, built["contrast"], monkeypatch, name="nw_stk", response_tokens=20, segments="0,1-3,4-", stack_layers="8,10,12")
+    assert rec["kw"] in ({}, {"chunk": "auto"}) and rec["stack"] == [8, 10, 12]                        # ふだんは既定のまとめ方(auto)
+    full = rec["replies"]
+    assert min(len(r) for r in full) >= 12
+    short = [r[:n] for r, n in zip(full, (1, 2, 3, 4, 9, 20), strict=True)]       # 区切りの境目より短い返事を混ぜる
+    worst = (0.0, 1.0)
+    for spec, cut, chunks in STACK_CASES:
+        replies = short if cut else full
+        old = _stack_run(s, rec, spec, replies, 1)
+        auto = _stack_run(s, rec, spec, replies, "auto")
+        assert all(np.array_equal(auto[k], old[k]) for k in old), (spec, cut, rec["used"])   # 既定は元の読み方と完全に同じ
+        for chunk in chunks:
+            new = _stack_run(s, rec, spec, replies, chunk)
+            assert all(np.array_equal(new[k], old[k]) for k in new if k[1] == 8)  # いちばん下の層は平均差そのまま
+            rel, cos = _stack_diff(new, old)
+            worst = (max(worst[0], rel), min(worst[1], cos))
+            assert rel < 0.1 and cos > 0.995, (spec, chunk, rel, cos)
+    print(f"stack: chunked vs per-token worst rel {worst[0]:.3g}, min cos {worst[1]:.5f}")
+    # gne direction が作った方向(既定のまとめ方)は、1 つずつ読んだ方向と完全に同じ。使った数は次の見積もりのために覚えている
+    again = _stack_run(s, rec, "0,1-3,4-", full, 1)
+    assert all(np.array_equal(again[(i, L)], rec["out"][i][L].astype(np.float64)) for i, L in again)
+    assert 1 <= s._stack_chunk <= 8
+    # 1 回に 1 個しか読まない区切り方では、まとめても元の読み方と完全に同じ
+    one = [r[:2] for r in full]
+    a, b = _stack_run(s, rec, "0,1,2", one, None), _stack_run(s, rec, "0,1,2", one, 1)
+    assert all(np.array_equal(a[k], b[k]) for k in a)
+    # 比べ方が位置のずれを見つけられること: 返事の区切りを 1 つずらすと、許す誤差を大きく超える
+    off = _stack_run(s, rec, "0-1,2-4,5-", full, 1)
+    rel, cos = _stack_diff(off, _stack_run(s, rec, "0,1-3,4-", full, 1))
+    assert rel > 0.4, (rel, cos)
+
+
+@pytest.mark.model
+def test_stack_segments_exact_where_batching_is_exact(tmp_path, monkeypatch):
+    """まとめ方で値が変わらない組み合わせ(SmolLM2-135M の Q8_0、CPU、32 個未満ずつ)では、まとめて読んだ方向が 1 つずつ読んだ
+    方向と完全に一致する。"""
+    small = ROOT / "models" / "SmolLM2-135M-Instruct-Q8_0.gguf"
+    if not small.exists():
+        pytest.skip(f"{small} がありません")
+    from gne.api import Session
+    c = tmp_path / "c.yaml"
+    c.write_text(yaml.safe_dump({**CONTRAST, "name": "stk_small", "system_b": "You are a polite butler. Always answer formally."},
+                                allow_unicode=True), encoding="utf-8")
+    s = Session(small, root=tmp_path / "root", n_gpu_layers=0)
+    try:
+        rec = _stack_args(s, c, monkeypatch, name="stk_small", response_tokens=24, segments="0,1-3,4-", stack_layers="6,9,12,15")
+        full = rec["replies"]
+        short = [r[:n] for r, n in zip(full, (1, 2, 3, 4, 9, 24), strict=True)]
+        used = []
+        for spec, cut, chunks in STACK_CASES:
+            replies = short if cut else full
+            old = _stack_run(s, rec, spec, replies, 1)
+            auto = _stack_run(s, rec, spec, replies, "auto")
+            assert all(np.array_equal(auto[k], old[k]) for k in old), (spec, cut, rec["used"])
+            used.append(rec["used"])
+            for chunk in chunks:
+                rel, cos = _stack_diff(_stack_run(s, rec, spec, replies, chunk), old)
+                assert rel < 1e-6, (spec, chunk, rel, cos)
+        assert max(used) >= 2, used                                               # この組み合わせでは、既定でまとめて読んでいる
+        off = _stack_run(s, rec, "0-1,2-4,5-", full, 1)
+        assert _stack_diff(off, _stack_run(s, rec, "0,1-3,4-", full, 1))[0] > 0.05
+    finally:
+        s.close()
+
+
+@pytest.mark.model
+def test_direction_stack_fast(built):
+    """--stack-fast: 層を重ねる読み直しを、区切りが続く範囲ごとに 1 回で読む。既定ではなく、方向のファイルに読み方が残る。"""
+    from gne.estimate import estimate
+    s = built["s"]
+    kw = dict(contrast=built["contrast"], positions="response", response_tokens=20, same_reply=True, segments="0,1-3,4-")
+    d = s.direction(name="nw_fast", **kw, stack_layers="8,12", stack_fast=True)
+    fs, ds = s.direction_set("nw_fast"), s.direction_set("nw_scene")                # nw_scene は同じ設定の既定の読み方
+    assert d["stack_fast"] is True and d["stack_layers"] == [8, 12] and fs.meta["stack_read"] == "fast"
+    assert "stack_fast" not in built["dir"] and "stack_read" not in ds.meta         # 既定の読み方の結果・ファイルは今までの項目のまま
+    for i in range(3):
+        assert np.array_equal(fs.seg[i][8], ds.seg[i][8]) and np.array_equal(fs.raw[12], ds.raw[12])   # いちばん下の層と全位置の平均は同じ
+        a, b = fs.seg[i][12].astype(np.float64), ds.seg[i][12].astype(np.float64)
+        assert np.linalg.norm(a - b) / np.linalg.norm(b) < 0.1, i                    # 上の層は、まとめ方の違いの分だけ違ってよい
+    with pytest.raises(GneError):
+        s.direction(name="nw_bad", **kw, stack_fast=True)                             # stack_layers が要る
+    base = {"contrast": str(built["contrast"]), "positions": "response", "response_tokens": 96, "same_reply": True,
+            "segments": "0,1-3,4-", "stack_layers": "8-20"}
+    fast, slow = estimate(s, "direction", {**base, "stack_fast": True}), estimate(s, "direction", base)
+    assert fast["detail"]["stack_chunk"] == "run" and fast["detail"]["stack_evals"] == 12 * len(CONTRAST["user_prompts"]) * 4
+    assert fast["seconds"] < slow["seconds"]
+    r = CliRunner().invoke(_app(), ["direction", "--contrast", str(built["contrast"]), "--name", "cli_fast", "--positions", "response",
+                                    "--response-tokens", "6", "--same-reply", "--segments", "0,1-", "--stack-layers", "8-10", "--stack-fast",
+                                    "-m", str(MODEL), "--root", str(built["root"]), "--n-gpu-layers", str(NGL), "--json"])
+    out = json.loads(r.output.strip().splitlines()[-1])
+    assert r.exit_code == 0 and out["stack_fast"] is True and out["stack_layers"] == [8, 9, 10], r.output
+
+
+def _app():
+    from gne.cli import app
+    return app
+
+
 @pytest.mark.model
 def test_direction_estimate_counts_stacked_layers(built):
-    """方向の見積もりに、層を重ねる分(層ごとに、返事を 1 トークンずつ読み直す回数)が入る。"""
-    from gne.estimate import Speed, estimate
+    """方向の見積もりに、層を重ねる分(層ごとに、返事を 1 本ずつ、区切りごとに数個ずつまとめて読み直す回数)が入る。"""
+    from gne.estimate import STACK_READ_STEPS, STACK_SWAP_STEPS, Speed, estimate
     s = built["s"]
     base = {"contrast": str(built["contrast"]), "positions": "response", "response_tokens": 96, "same_reply": True, "segments": "0,1-3,4-"}
-    plain = estimate(s, "direction", base)
-    one = estimate(s, "direction", {**base, "stack_layers": "8"})                   # 1 層だけなら読み直しは無い
-    st = estimate(s, "direction", {**base, "stack_layers": "8-20"})
     n_a, sp = len(CONTRAST["user_prompts"]), Speed(s)
-    evals = 12 * n_a * 97                                                          # (層の数 − 1) × 質問の数 × (返事の長さ + 1)
-    assert st["detail"]["stack_layers"] == 13 and st["detail"]["stack_evals"] == evals
-    assert st["seconds"] - plain["seconds"] == pytest.approx(evals * 2 * sp.step(1) / 1000, rel=1e-6)
-    assert one["seconds"] == pytest.approx(plain["seconds"]) and "stack_evals" not in one["detail"]
-    assert st["seconds"] > 10 * plain["seconds"]                                    # 13 層では、読み直しが大半になる
-    for form in ("8,9,10,11,12,13,14,15,16,17,18,19,20", list(range(8, 21)), ["8-20"], "8-12,13-20"):
-        assert estimate(s, "direction", {**base, "stack_layers": form})["seconds"] == pytest.approx(st["seconds"]), form
-    # 層の数にほぼ比例する。重ねる前提にならない組み合わせ(same_reply か segments が無い)と、読めない指定では足さない
-    three = estimate(s, "direction", {**base, "stack_layers": "8,12,16"})
-    assert (three["seconds"] - plain["seconds"]) * 6 == pytest.approx(st["seconds"] - plain["seconds"], rel=1e-6)
-    assert estimate(s, "direction", {**base, "segments": None, "stack_layers": "8-20"})["seconds"] == pytest.approx(plain["seconds"])
-    assert estimate(s, "direction", {**base, "stack_layers": "x"})["seconds"] == pytest.approx(plain["seconds"])
-    # 今までの作り方は A 側・B 側の返事を作る。same_reply は A 側だけ
-    old = estimate(s, "direction", {**base, "same_reply": False})
-    assert old["seconds"] - plain["seconds"] == pytest.approx(sp.gen(n_a, 96), rel=1e-6)
-    # 報告のあった大きさ(40 問・96 トークン・13 層)を 4B Q8_0 の基準の速さで数えると、実測(約 830 秒)と同じ桁になる
-    assert 400 < 12 * 40 * 97 * 2 * 8.8 / 1000 < 1700
+    memo = getattr(s, "_stack_chunk", None)
+
+    def per(reads: int, swaps: int) -> float:       # 返事 1 本: 質問の部分で 1 回 + 返事の位置の読み取り + control vector の付け替えの分
+        return (sp.setprefill + (reads * STACK_READ_STEPS + swaps * STACK_SWAP_STEPS) * sp.step(1)) / 1000
+    try:
+        # まとめて読める数は走らせるまで分からないので、層を重ねたことのないセッションでは 1 つずつ(いちばん遅い場合)で数える
+        s._stack_chunk = None
+        plain = estimate(s, "direction", base)
+        one = estimate(s, "direction", {**base, "stack_layers": "8"})               # 1 層だけなら読み直しは無い
+        st = estimate(s, "direction", {**base, "stack_layers": "8-20"})
+        evals = 12 * n_a * (97 + 1)                                                # (層の数 − 1) × 質問の数 × 読み取りの回数
+        assert st["detail"]["stack_layers"] == 13 and st["detail"]["stack_evals"] == evals and st["detail"]["stack_chunk"] == 1
+        assert st["seconds"] - plain["seconds"] == pytest.approx(12 * n_a * per(97, 3), rel=1e-6)   # 付け替えは区切りごとに 1 回
+        assert one["seconds"] == pytest.approx(plain["seconds"]) and "stack_evals" not in one["detail"]
+        assert st["seconds"] > 5 * plain["seconds"]                                 # 13 層では、読み直しが大半になる
+        # 区切りが 1 つなら付け替えは 1 回
+        one_seg = estimate(s, "direction", {**base, "segments": "0-", "stack_layers": "8-20"})
+        assert one_seg["seconds"] - estimate(s, "direction", {**base, "segments": "0-"})["seconds"] == pytest.approx(12 * n_a * per(97, 1), rel=1e-6)
+        # このセッションで層を重ねたことがあれば、そのときにまとめて読めた数で数える(4 個なら 1 + 1 + 24 回)
+        s._stack_chunk = 4
+        st4 = estimate(s, "direction", {**base, "stack_layers": "8-20"})
+        assert st4["detail"]["stack_chunk"] == 4 and st4["detail"]["stack_evals"] == 12 * n_a * 27
+        assert st4["seconds"] - plain["seconds"] == pytest.approx(12 * n_a * per(26, 3), rel=1e-6)
+        assert st4["seconds"] < 0.5 * st["seconds"]
+        s._stack_chunk = None
+        for form in ("8,9,10,11,12,13,14,15,16,17,18,19,20", list(range(8, 21)), ["8-20"], "8-12,13-20"):
+            assert estimate(s, "direction", {**base, "stack_layers": form})["seconds"] == pytest.approx(st["seconds"]), form
+        # 層の数にほぼ比例する。重ねる前提にならない組み合わせ(same_reply か segments が無い)と、読めない指定では足さない
+        three = estimate(s, "direction", {**base, "stack_layers": "8,12,16"})
+        assert (three["seconds"] - plain["seconds"]) * 6 == pytest.approx(st["seconds"] - plain["seconds"], rel=1e-6)
+        assert estimate(s, "direction", {**base, "segments": None, "stack_layers": "8-20"})["seconds"] == pytest.approx(plain["seconds"])
+        assert estimate(s, "direction", {**base, "stack_layers": "x"})["seconds"] == pytest.approx(plain["seconds"])
+        # 今までの作り方は A 側・B 側の返事を作る。same_reply は A 側だけ
+        old = estimate(s, "direction", {**base, "same_reply": False})
+        assert old["seconds"] - plain["seconds"] == pytest.approx(sp.gen(n_a, 96), rel=1e-6)
+    finally:
+        s._stack_chunk = memo
+    # 実測した大きさ(40 問・返事の上限 96 トークン・13 層)を 4B Q8_0 の基準の速さで数える: 1 つずつなら約 880 秒、4 個ずつなら約 280 秒。
+    # 実測は 310 秒・138 秒(返事の多くが上限より前に終わり、4B は読み取りが係数より速い)。短くは出ない
+    from gne.estimate import REF
+    ref = lambda reads: 12 * 40 * (REF["setprefill_ms"] + (reads * STACK_READ_STEPS + 3 * STACK_SWAP_STEPS) * REF["step1_ms"]) / 1000
+    assert 310 < ref(97) < 3 * 310 and 138 < ref(26) < 2.5 * 138
 
 
 @pytest.mark.model
@@ -681,10 +887,10 @@ def test_cli_and_jobs(built):
     assert r.exit_code == 0 and Path(d["path"]).name == "cli_named_check.json" and len(d["groups"]["scene"]["questions"]) == 6, r.output
     assert d["question_summary"]["low"] == 0.4 and set(d["groups"]["scene"]["questions"][0]["segments"]) == {"0", "1-"}
     r = CliRunner().invoke(app, ["nw", "pipeline", "--contrast", str(built["contrast"]), "--layers", "8", "--cap", "0.8-0.4", *common])
-    assert r.exit_code != 0 and json.loads(r.output.strip().splitlines()[-1])["error"]["code"] == "BAD_ARGS" and "見積もり" not in r.output
+    assert r.exit_code != 0 and json.loads(r.output.strip().splitlines()[-1])["error"]["code"] == "BAD_ARGS" and "估算" not in r.output
     r = CliRunner().invoke(app, ["nw", "pipeline", "--contrast", str(built["contrast"]), "--layers", "8", "--save", "bad name", *common])
     assert r.exit_code != 0 and json.loads(r.output.strip().splitlines()[-1])["error"]["code"] == "BAD_ARGS"     # 保存先が悪ければ、流す前に止まる
-    assert "見積もり" not in r.output
+    assert "估算" not in r.output
     # 重みに入れる前に試す(gne nw try): 区切り 0 / 1- の方向を、層 8 の出力に区切りごとの強さで直接足す
     r = CliRunner().invoke(app, ["nw", "try", "--direction", "cli_dir", "--contrast", str(built["contrast"]), "--layers", "8", "--alpha", "1,0.5",
                                  "-n", "2", "--max-tokens", "8", *common])
@@ -734,6 +940,116 @@ def test_cli_and_jobs(built):
 
 
 @pytest.mark.model
+def test_stack_fast_from_every_entry(built):
+    """速い読み方(stack_fast)を、まとめて作る所(Python・CLI・ジョブ)と方向のジョブから指定できる。効くのは方向を作る段だけで、
+    どちらの読み方で作った方向かが、方向のファイル・結果・要約に残る。すでにある方向を使うときは効かず、注意が出る。"""
+    from gne import fish
+    from gne.cli import app
+    from gne.estimate import Speed, _fish_cost, estimate
+    from gne.jobs import GpuArbiter, JobRunner, standard_kinds
+    s, root, c = built["s"], built["root"], str(built["contrast"])
+    small = dict(segments="0,1-", max_tokens=8, response_tokens=8, pseudo=2, top=6)
+    # Python: 方向の段だけが速い読み方になり、できた方向は gne direction --stack-fast(Session.direction)で作ったものと同じ
+    p = fish.pipeline(s, c, name="pf", layers="8,12", alpha="1,0.8", stack_fast=True, compare=False, rekey=False, **small)
+    ds = s.direction_set("pf")
+    assert p["direction_stack_fast"] is True and p["direction"]["stack_fast"] is True and ds.meta["stack_read"] == "fast"
+    assert p["summary"]["direction_stack_fast"] is True and p["summary"]["direction_reused"] is False and p["verify"]["ok"]
+    text = fish.summary_text(p)
+    assert "方向 pf（使用快速读取创建的方向）" in text and "注记：方向 pf 是用快速读取" in text and "要分发的成品" in text
+    ref = s.direction(contrast=c, name="pf_ref", positions="response", response_tokens=8, same_reply=True, segments="0,1-",
+                      stack_layers="8,12", stack_fast=True)
+    rs = s.direction_set("pf_ref")
+    assert ref["stack_fast"] is True and all(np.array_equal(ds.seg[i][L], rs.seg[i][L]) for i in range(2) for L in (8, 12))
+    # 既定(渡さない)は今までどおり: 既定の読み方で、方向のファイルに読み方の項目は無い
+    q = fish.pipeline(s, c, name="pd", layers="8,12", alpha="1,0.8", compare=False, rekey=False, **small)
+    assert q["direction_stack_fast"] is False and "stack_read" not in s.direction_set("pd").meta and "快速读取" not in fish.summary_text(q)
+    # 速い読み方で作った方向を使い回す: stack_fast を渡していなくても、要約に「速い読み方で作った方向」と出る
+    n_warn = len(s.warnings)
+    r1 = fish.pipeline(s, c, name="pf_use", layers="8,12", alpha="1,0.8", direction="pf", rekey=False, **small)
+    assert r1["direction_reused"] and r1["direction_stack_fast"] is True and not any("不会生效" in w for w in s.warnings[n_warn:])
+    t1 = fish.summary_text(r1)
+    assert "方向 pf（使用了已有方向）（使用快速读取创建的方向）" in t1 and "注记：方向 pf 是用快速读取" in t1 and "不会生效" not in t1
+    # すでにある方向と一緒に stack_fast を渡す: 効かないことを警告と注で知らせる(方向は作り直さない。読み方は方向のファイルの記録のまま)
+    r2 = fish.pipeline(s, c, name="pd_use", layers="8,12", alpha="1,0.8", direction="pd", stack_fast=True, rekey=False, **small)
+    assert r2["direction_reused"] and r2["direction_stack_fast"] is False and "stack_read" not in s.direction_set("pd").meta
+    assert any("不会生效" in w and "默认读取" in w for w in s.warnings[n_warn:]) and any("不会生效" in n for n in r2["notes"])
+    assert "使用快速读取创建的方向）" not in fish.summary_text(r2) and "注记：快速读取（stack_fast）在使用已有方向（direction）时不会生效" in fish.summary_text(r2)
+    # 読み直しが無いとき(層が 1 つ・重ねない)は使わず、注で知らせる。方向のファイルにも残さない
+    one = fish.direction_step(s, c, name="pf_one", layers="8", segments="0,1-", response_tokens=8, compare=False, stack_fast=True)
+    assert one["stack_fast"] is False and any("未使用快速读取" in n for n in one["notes"]) and "stack_read" not in s.direction_set("pf_one").meta
+    flat = fish.direction_step(s, c, name="pf_flat", layers="8,12", segments="0,1-", response_tokens=8, compare=False, stack=False, stack_fast=True)
+    assert flat["stack_fast"] is False and flat["stack"] is False and any("未使用快速读取" in n for n in flat["notes"])
+    # CLI: gne nw pipeline --stack-fast。要約(--json)と文の両方に読み方が出る。--direction と一緒なら注意
+    common = ["-m", str(MODEL), "--root", str(root), "--n-gpu-layers", str(NGL)]
+    args = ["nw", "pipeline", "--contrast", c, "--layers", "8,12", "--alpha", "1,0.8", "--segments", "0,1-", "--max-tokens", "8",
+            "--response-tokens", "8", "--pseudo", "2", "--top", "6", "--no-rekey"]
+    r = CliRunner().invoke(app, [*args, "--name", "cli_fastpipe", "--stack-fast", *common, "--json"])
+    d = json.loads(r.output.strip().splitlines()[-1])
+    assert r.exit_code == 0 and d["direction_stack_fast"] is True and d["direction"] == "cli_fastpipe" and d["ok"] is True, r.output
+    fs = s.direction_set("cli_fastpipe")
+    assert fs.meta["stack_read"] == "fast" and all(np.array_equal(fs.seg[i][L], ds.seg[i][L]) for i in range(2) for L in (8, 12))
+    r = CliRunner().invoke(app, [*args, "--name", "cli_fastuse", "--direction", "cli_fastpipe", "--stack-fast", *common])
+    assert r.exit_code == 0 and "方向 cli_fastpipe（使用了已有方向）（使用快速读取创建的方向）" in r.output, r.output
+    assert "不会生效" in r.output and "方向 cli_fastpipe 是用快速读取创建的方向" in r.output
+    r = CliRunner().invoke(app, [*args, "--name", "cli_slowuse", "--direction", "pd", "--no-stack-fast", *common, "--json"])
+    d = json.loads(r.output.strip().splitlines()[-1])
+    assert r.exit_code == 0 and d["direction_stack_fast"] is False and not any("不会生效" in n for n in d["notes"]), r.output
+    # ジョブ: 方向(direction)・FiSH の方向の段(fish_direction)・まとめて作る(fish_pipeline)。表の fish.stack_fast でも書ける
+    runner = JobRunner(s, GpuArbiter(), standard_kinds())
+
+    def run(kind, params):
+        import time
+        j = runner.start(kind, params)
+        t0 = time.time()
+        while j.status in ("queued", "running") and time.time() - t0 < 600:
+            time.sleep(0.2)
+        assert j.status == "done", j.view()
+        return j
+    jd = run("direction", {"contrast": c, "name": "job_fastdir", "positions": "response", "response_tokens": 8, "same_reply": True,
+                           "segments": "0,1-", "stack_layers": "8,12", "stack_fast": True})
+    assert jd.result["stack_fast"] is True and s.direction_set("job_fastdir").meta["stack_read"] == "fast"
+    assert jd.view()["estimate_stack_first"] is False
+    jf = run("fish_direction", {"contrast": c, "name": "job_fishdir", "layers": "8,12", "segments": "0,1-", "response_tokens": 8,
+                                "compare": False, "stack_fast": True})
+    assert jf.result["stack_fast"] is True and s.direction_set("job_fishdir").meta["stack_read"] == "fast"
+    assert all(np.array_equal(s.direction_set("job_fishdir").seg[1][L], ds.seg[1][L]) for L in (8, 12))
+    jp = run("fish_pipeline", {"spec": {**CONTRAST, "name": "job_fastpipe", "fish": {"segments": "0,1-", "stack_fast": True, "rekey": False,
+                                                                                     "max_tokens": 8, "response_tokens": 8, "pseudo": 2}},
+                               "layers": "8,12", "alpha": "1,0.8", "compare": False, "top": 6, "summary": True})
+    assert jp.result["direction_stack_fast"] is True and jp.result["ok"] is True and s.direction_set("job_fastpipe").meta["stack_read"] == "fast"
+    jo = run("fish_pipeline", {"contrast": c, "name": "job_fastoff", "layers": "8,12", "alpha": "1,0.8", "direction": "job_fastpipe",
+                               "stack_fast": False, "rekey": False, "summary": True, **{k: v for k, v in small.items() if k != "response_tokens"}})
+    assert jo.result["direction_stack_fast"] is True and jo.result["direction_reused"] is True
+    # 見積もり: 速い読み方なら、層を重ねる読み直しを「区切りが続く範囲ごとに 1 回」で数える(短くなる)。既定の読み方は、まとめて読める
+    # 数をまだ確かめていないセッションでは 1 つずつで数え、そのことを見積もりに残す(表示に「初回は長めに出ます」と添える)
+    memo = getattr(s, "_stack_chunk", None)
+    try:
+        s._stack_chunk = None
+        sp, ep = Speed(s), {"contrast": c, "layers": "8-20", "segments": "0,1-3,4-"}
+        slow, fast = _fish_cost(s, sp, "fish_pipeline", ep), _fish_cost(s, sp, "fish_pipeline", {**ep, "stack_fast": True})
+        assert slow["stack_first"] is True and fast["stack_first"] is False and fast["direction_seconds"] < 0.5 * slow["direction_seconds"]
+        assert slow["seconds"] - fast["seconds"] == pytest.approx(slow["direction_seconds"] - fast["direction_seconds"])   # ほかの段は同じ
+        dslow, dfast = _fish_cost(s, sp, "fish_direction", ep), _fish_cost(s, sp, "fish_direction", {**ep, "stack_fast": True})
+        assert dslow["stack_first"] is True and dfast["stack_first"] is False and dfast["seconds"] < dslow["seconds"]
+        assert dslow["stack_seconds"] - dfast["stack_seconds"] == pytest.approx(dslow["seconds"] - dfast["seconds"])
+        spec_fast = {"spec": {**CONTRAST, "name": "est_fast", "fish": {"stack_fast": True}}, "layers": "8-20"}       # 表の fish.stack_fast
+        assert _fish_cost(s, sp, "fish_pipeline", spec_fast)["direction_seconds"] == pytest.approx(fast["direction_seconds"])
+        for off in ({"stack": False}, {"layers": "8"}, {"direction": "pf"}):     # 読み直しが無い・方向を作らないときは、添えない
+            assert _fish_cost(s, sp, "fish_pipeline", {**ep, **off})["stack_first"] is False, off
+        base = {"contrast": c, "positions": "response", "same_reply": True, "segments": "0,1-3,4-", "stack_layers": "8-20"}
+        assert estimate(s, "direction", base)["detail"]["stack_first"] is True
+        assert estimate(s, "direction", {**base, "stack_fast": True})["detail"]["stack_first"] is False
+        s._stack_chunk = 4                                                       # このセッションで確かめた数があれば、それで数える(添えない)
+        known = _fish_cost(s, sp, "fish_pipeline", ep)
+        assert known["stack_first"] is False and fast["direction_seconds"] < known["direction_seconds"] < slow["direction_seconds"]
+        assert estimate(s, "direction", base)["detail"]["stack_first"] is False
+    finally:
+        s._stack_chunk = memo
+    r = CliRunner().invoke(app, ["nw", "pipeline", "--contrast", c, "--layers", "8", "--save", "bad name", "--stack-fast", *common, "--json"])
+    assert r.exit_code != 0 and json.loads(r.output.strip().splitlines()[-1])["error"]["code"] == "BAD_ARGS"
+
+
+@pytest.mark.model
 def test_mcp_tools(tmp_path):
     import anyio
     from mcp.client.session import ClientSession
@@ -746,18 +1062,24 @@ def test_mcp_tools(tmp_path):
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as c:
                 init = await c.initialize()
-                assert "nw" in (init.instructions or "") and "same_reply" in (init.instructions or "")
+                assert "nw" in (init.instructions or "") and "same_reply" in (init.instructions or "") and "stack_fast" in (init.instructions or "")
                 tools = {t.name: t for t in (await c.list_tools()).tools}
                 assert {"nw_neurons", "nw_verify", "nw_check", "nw_export", "nw_try", "fish_pipeline"} <= set(tools)
                 assert {"direction", "layers", "alpha", "temperature"} <= set(tools["nw_try"].input_schema["properties"])
-                assert {"alpha", "save", "summary", "direction", "cap"} <= set(tools["fish_pipeline"].input_schema["properties"])
+                assert {"alpha", "save", "summary", "direction", "cap", "stack_fast"} <= set(tools["fish_pipeline"].input_schema["properties"])
+                assert "探索" in tools["fish_pipeline"].description and "direction_stack_fast" in tools["fish_pipeline"].description
                 assert {"low", "over", "top", "save"} <= set(tools["nw_check"].input_schema["properties"])
                 assert {"strip_meta", "adapter_name"} <= set(tools["nw_export"].input_schema["properties"])
                 r = await c.call_tool("fish_pipeline", {"contrast": "tone_in_scene", "layers": []})       # 層は必須
                 sc = getattr(r, "structured_content", None)
                 d = (sc.get("result", sc) if isinstance(sc, dict) else None) or json.loads(r.content[0].text)
                 assert d["error"]["code"] == "BAD_ARGS"
-                assert {"same_reply", "segments", "stack_layers"} <= set(tools["direction"].input_schema["properties"])
+                assert {"same_reply", "segments", "stack_layers", "stack_fast"} <= set(tools["direction"].input_schema["properties"])
+                assert tools["direction"].input_schema["properties"]["stack_fast"].get("default") is False and "stack_read" in tools["direction"].description
+                r = await c.call_tool("direction", {"contrast": "evil", "positions": "response", "stack_fast": True})   # stack_layers が要る
+                sc = getattr(r, "structured_content", None)
+                d = (sc.get("result", sc) if isinstance(sc, dict) else None) or json.loads(r.content[0].text)
+                assert d["error"]["code"] == "BAD_ARGS" and "stack_fast" in d["error"]["message"]
                 assert "role" in tools["direction_key"].input_schema["properties"]
                 assert "same_reply" in tools["direction_key_pipeline"].input_schema["properties"]
                 r = await c.call_tool("nw_verify", {"units": ["8:N5:nw:a1@nope#nokey"]})
