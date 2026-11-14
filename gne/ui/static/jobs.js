@@ -1,8 +1,9 @@
-// ジョブ(別冊 §8.3)。下のバーに実行中・待機中のジョブと進捗、層の右クリックで計算メニュー。
+// ジョブ。下のバーに実行中・待機中のジョブと進捗。層の右クリックと地図の上の「この層で計算」で計算メニュー。
 // GPU を使うジョブはユニットの切れ目で、チャットや fires に GPU を譲る(§8.1)。
 import { deleteJSON, getJSON, postJSON } from "./api.js";
 import { t as tr } from "./i18n.js";
 import { esc } from "./panels.js";
+import { askConfirm } from "./ui.js";
 
 export const KIND = { embed: tr("埋め込み"), connections: "connections", layout: tr("配置"), lens_logit: "logit lens", lens_steer: "steer lens", sweep_rank: "sweep", sweep: "sweep", rank: "rank",
                stats_resid: tr("残差の統計"), stats_act: tr("活性の統計"), reverse: tr("逆引き"), eval: "eval",
@@ -12,7 +13,11 @@ export const KIND = { embed: tr("埋め込み"), connections: "connections", lay
                direction_key: tr("鍵の作成"), direction_key_check: tr("鍵の確認"), direction_key_experts: tr("専門家の選ばれ方"),
                direction_key_verify: tr("LoRA の確かめ(key-verify)"), direction_key_pipeline: tr("方向から key-check まで"),
                behave: tr("振る舞いを数える(behave)"), direction_key_causal: tr("効く層を探す(生成なし)"),
-               direction_key_causal_verify: tr("効く層を確かめる(生成)") };
+               direction_key_causal_verify: tr("効く層を確かめる(生成)"), writers: tr("書き手の強さ"),
+               fish_pipeline: tr("FiSH をまとめて作る"), fish_direction: tr("FiSH の方向を作る"), fish_try: tr("FiSH を重みに入れる前に試す"),
+               nw_neurons: tr("FiSH のニューロンを選ぶ"), fish_keys: tr("FiSH の鍵を作る"), fish_verify: tr("FiSH が式どおりか確かめる"),
+               fish_check: tr("FiSH の漏れを確かめる"), fish_behave: tr("FiSH の返事を読む"),
+               nw_check: tr("FiSH のユニットを確かめる(nw check)") };
 
 function eta(s) {
   if (s === null || s === undefined || !Number.isFinite(s)) return "";
@@ -82,7 +87,7 @@ export class JobsBar {
       if (e.code !== "NEEDS_CONFIRM") throw e;
       const est = (e.body && e.body.estimate) || {};
       const m = est.seconds ? Math.round(est.seconds / 60) : "?";
-      if (!window.confirm(tr("{kind} の見積もりは約 {m} 分です。走らせますか?", { kind, m }))) return null;
+      if (!(await askConfirm(tr("{kind} の見積もりは約 {m} 分です。走らせますか?", { kind, m }), { ok: tr("走らせる") }))) return null;
       j = await postJSON("/api/jobs", { kind, params: { ...params, yes: true } });
     }
     this.update(j);
@@ -111,7 +116,7 @@ export class JobsBar {
 
   render() {
     const js = [...this.jobs.values()].reverse();
-    if (!js.length) { this.root.innerHTML = `<span class="muted">${tr("jobs: なし(層の番号やラベルを右クリックすると計算を投げられます)")}</span>`; return; }
+    if (!js.length) { this.root.innerHTML = `<span class="muted">${tr("ジョブ: なし(地図の上の「この層で計算」か、層の番号の右クリックで計算を投げられます)")}</span>`; return; }
     const one = (j) => {
       const pct = j.total ? Math.round((j.done / j.total) * 100) : 0;
       const st = { queued: tr("待機中"), running: "", done: tr("完了"), error: tr("エラー"), cancelled: tr("中止済み") }[j.status];
@@ -128,7 +133,7 @@ export class JobsBar {
     const shown = [...live, ...ended.slice(0, 2)];
     this.root.innerHTML = `<span class="jb-list">${shown.map(one).join(`<span class="muted"> │ </span>`)}${
       ended.length > 2 ? `<span class="muted"> ${tr("ほか {n} 件", { n: ended.length - 2 })}</span>` : ""}</span>${
-      ended.length ? ` <button class="small" data-clear="1" title="${tr("終わったジョブを一覧から消す(ジョブの結果は消えない)")}">${tr("終わった分を消す")}</button>` : ""}`;
+      ended.length ? ` <button class="small quiet" data-clear="1" title="${tr("終わったジョブを一覧から消す(ジョブの結果は消えない)")}">${tr("終わった分を消す")}</button>` : ""}`;
   }
 }
 
@@ -147,9 +152,9 @@ export function computeMenu(ev, L, li, cov, { onStart, arch, model }) {
     ["lens_steer", { layer: L }, tr("steer lens(全 {n} ニューロン + 対照 64)", { n }), about(mins((0.145 * (n + 64)) / 60)), cov && cov.steer_lens],
     ["sweep_rank", { layer: L, design: "quick", neurons: "random:64", random_controls: 16 }, tr("sweep quick(ランダムに 64 個 + 対照 16)"), about(mins(5)), runs("quick")],
     ["sweep_rank", { layer: L, design: "main_rel", neurons: "random:384" }, tr("sweep main_rel(ランダムに 384 個 + 対照 64)"), about(mins((6.4 * 448) / 60)), runs("main_rel")],
-    ["layout", { kind: "writes", layers: [L] }, tr("配置 writes(この層、W_down → UMAP)"), about(mins((25 * k) / 60)), lay("writes").includes(L)],
-    ["layout", { kind: "writes", layers: "all" }, tr("配置 writes(全層)"), about(mins((25 * k * nL) / 60)), lay("writes").length === nL && lay("writes").length],
-    ["layout", { kind: "lens", layers: [L] }, tr("配置 lens(この層、lens の語 → UMAP)"), about(mins((10 * k) / 60)), lay("lens").includes(L)],
+    ["layout", { kind: "writes", layers: [L] }, tr("配置: 書く向き(この層、W_down → UMAP)"), about(mins((25 * k) / 60)), lay("writes").includes(L)],
+    ["layout", { kind: "writes", layers: "all" }, tr("配置: 書く向き(全層)"), about(mins((25 * k * nL) / 60)), lay("writes").length === nL && lay("writes").length],
+    ["layout", { kind: "lens", layers: [L] }, tr("配置: lens の語(この層、lens の語 → UMAP)"), about(mins((10 * k) / 60)), lay("lens").includes(L)],
     ["connections", {}, tr("connections(全 {p} 層ペア、重みだけ、CPU)", { p: pairs }), about(mins((4.5 * k * k * (d / 2560) * pairs) / 60)), !!model.connections],
   ];
   const m = document.createElement("div");
@@ -159,9 +164,11 @@ export function computeMenu(ev, L, li, cov, { onStart, arch, model }) {
   m.style.left = `${Math.min(ev.clientX + 14, window.innerWidth - 400)}px`;               // 右クリックしたラベルを覆わないように
   m.style.top = `${Math.min(ev.clientY + 10, window.innerHeight - 170)}px`;
   document.body.appendChild(m);
-  const close = () => { m.remove(); document.removeEventListener("pointerdown", away, true); };
+  const close = () => { m.remove(); document.removeEventListener("pointerdown", away, true); document.removeEventListener("keydown", esc_, true); };
   const away = (e) => { if (!m.contains(e.target)) close(); };
+  const esc_ = (e) => { if (e.key === "Escape" && !e.isComposing) close(); };   // Esc でも閉じる
   document.addEventListener("pointerdown", away, true);
+  document.addEventListener("keydown", esc_, true);
   for (const el of m.querySelectorAll(".cm-item")) {
     el.addEventListener("click", () => { const [kind, p] = items[+el.dataset.i]; close(); onStart(kind, p); });
   }

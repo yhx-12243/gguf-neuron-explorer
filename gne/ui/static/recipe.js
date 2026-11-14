@@ -1,4 +1,5 @@
-// レシピ(別冊 §2 LIST の recipe タブ、§4.8 マーク)。ユニットの追加・dose のスライダー・保存と読み込み・cvec の書き出し。
+// レシピ(右のパネル。タブは 中身・試す・書き出す)。ユニットの追加・強さのスライダー・保存と読み込み・cvec の書き出し。
+// どの画面からも「レシピに足す」(1 つ足す)か「レシピを置き換える」(いまのレシピを入れ替える。空でなければ確かめる)のどちらか。
 // ablate(方向の射影消去、本体設計 §6.17)の行: 方向・層の範囲・倍率。3 列チャットでは − の列で倍率を反転する。
 // ヘッドの gain(CHANGE-04 D・G、L:Hh:xk): 行の倍率 k は 1 が無介入。全体に掛ける倍率 s では 1 + (k − 1)·s(eval の倍率列と同じ)。
 // MoE(CHANGE-05 G): 専門家のニューロン L:Ee:Nn(add = 書き込み方向の押し、gain = 選ばれたときだけ効く)、専門家全体の gain L:Ee:xk、
@@ -13,6 +14,7 @@ import { getJSON, postJSON } from "./api.js";
 import { t } from "./i18n.js";
 import { targetKind } from "./keys.js";
 import { esc } from "./panels.js";
+import { wireTabs, noteHTML, askConfirm, layersInput, useContrastList } from "./ui.js";
 
 const fmt = (x, d = 2) => (x === null || x === undefined || !Number.isFinite(+x) ? "—" : (+x).toFixed(d));
 const signed = (x, d = 2) => `${x >= 0 ? "+" : "−"}${fmt(Math.abs(x), d)}`;
@@ -53,27 +55,27 @@ const unitOrder = (u) => (isNw(u) ? [u.layer, 4, u.neuron ?? 0, 0]
 
 // スライダーは 0(中央)から値まで塗る。+ は黄、− は赤紫。中央に 0 の目盛り
 function trackBG(v, max = 3) {
-  const p = ((Math.max(-max, Math.min(max, v)) + max) / (2 * max)) * 100, c = v >= 0 ? "#f2d24b" : "#c94fa7", bg = "#1f2630";
+  const p = ((Math.max(-max, Math.min(max, v)) + max) / (2 * max)) * 100, c = v >= 0 ? "var(--plus)" : "var(--minus)", bg = "var(--line)";
   const [a, b] = v >= 0 ? [50, p] : [p, 50];
-  return `linear-gradient(to right, transparent calc(50% - 1px), #8a96a7 calc(50% - 1px), #8a96a7 calc(50% + 1px), transparent calc(50% + 1px)),` +
+  return `linear-gradient(to right, transparent calc(50% - 1px), var(--text-4) calc(50% - 1px), var(--text-4) calc(50% + 1px), transparent calc(50% + 1px)),` +
          `linear-gradient(to right, ${bg} ${a}%, ${c} ${a}%, ${c} ${b}%, ${bg} ${b}%)`;
 }
 
 // ヘッドの倍率のスライダー: 無介入の 1 から値まで塗る。強める(k > 1)は黄、弱める・消す(k < 1)は赤紫。1 に目盛り
 function gainBG(k) {
   const at = (x) => ((Math.max(GAIN.min, Math.min(GAIN.max, x)) - GAIN.min) / (GAIN.max - GAIN.min)) * 100;
-  const one = at(1), p = at(k), c = k >= 1 ? "#f2d24b" : "#c94fa7", bg = "#1f2630";
+  const one = at(1), p = at(k), c = k >= 1 ? "var(--plus)" : "var(--minus)", bg = "var(--line)";
   const [a, b] = k >= 1 ? [one, p] : [p, one];
-  return `linear-gradient(to right, transparent calc(${one}% - 1px), #8a96a7 calc(${one}% - 1px), #8a96a7 calc(${one}% + 1px), transparent calc(${one}% + 1px)),` +
+  return `linear-gradient(to right, transparent calc(${one}% - 1px), var(--text-4) calc(${one}% - 1px), var(--text-4) calc(${one}% + 1px), transparent calc(${one}% + 1px)),` +
          `linear-gradient(to right, ${bg} ${a}%, ${c} ${a}%, ${c} ${b}%, ${bg} ${b}%)`;
 }
 const kLabel = (k) => `×${fmt(k, 2)}`;
 // 射影の強さのスライダー: 0(無介入)から値まで赤紫(方向成分を引く)。1(消す)と 2(反転)に目盛り
 function projBG(v) {
   const at = (x) => ((Math.max(PROJ.min, Math.min(PROJ.max, x)) - PROJ.min) / (PROJ.max - PROJ.min)) * 100;
-  const p = at(v), tick = (x) => `transparent calc(${at(x)}% - 1px), #8a96a7 calc(${at(x)}% - 1px), #8a96a7 calc(${at(x)}% + 1px), transparent calc(${at(x)}% + 1px)`;
+  const p = at(v), tick = (x) => `transparent calc(${at(x)}% - 1px), var(--text-4) calc(${at(x)}% - 1px), var(--text-4) calc(${at(x)}% + 1px), transparent calc(${at(x)}% + 1px)`;
   return `linear-gradient(to right, ${tick(1)}), linear-gradient(to right, ${tick(2)}),` +
-         `linear-gradient(to right, #c94fa7 0%, #c94fa7 ${p}%, #1f2630 ${p}%, #1f2630 100%)`;
+         `linear-gradient(to right, var(--minus) 0%, var(--minus) ${p}%, var(--line) ${p}%, var(--line) 100%)`;
 }
 const sLabel = (s) => `s${+(+s).toFixed(2)}`;
 const aLabel = (a) => `a${a >= 0 ? "+" : "−"}${fmt(Math.abs(a), 2)}`;
@@ -298,13 +300,23 @@ export class Recipe {
   }
 }
 
+// レシピを置き換える前に確かめる(どの入口でも同じ)。いまのレシピが空なら確かめない。置き換えてよければ true
+export async function askReplace(recipe, name) {
+  if (recipe.empty()) return true;
+  return askConfirm(t("いまのレシピ({n} ユニット)を {name} で置き換えますか?", { n: recipe.units.length + (recipe.ablate ? 1 : 0), name: name || "—" }));
+}
+
 // サンプリングの値の短い表示(温度 1.0・top-k 20・…)
 export const samplingLabel = (sp) => (sp ? `${t("温度")} ${+sp.temperature} · top-k ${sp.top_k} · top-p ${+sp.top_p} · min-p ${+sp.min_p} · presence ${+sp.presence_penalty}` : "");
 
 export class RecipePanel {
-  constructor(root, recipe, { onOpen, onOpenHead, onOpenExpert, onChat, unitWords, directions, projDirections, headKind, nFF, onRunJob, keys, nLayer }) {
+  constructor(root, recipe, { onOpen, onOpenHead, onOpenExpert, onChat, unitWords, directions, projDirections, headKind, nFF, onRunJob, keys, nLayer,
+                               onAdded, onReplaced }) {
     this.root = root;
     this.r = recipe;
+    this.tab = "units";                           // いまのタブ: units 中身 / try 試す / out 書き出す
+    this.onAdded = onAdded || (() => this.render());          // このパネルの中で足したとき(app.js がパネルを開いて描き直す)
+    this.onReplaced = onReplaced || (() => this.render());    // 保存したレシピで置き換えたとき
     this.directions = directions || (() => []);   // 方向の名前(gne direction / reverse)
     this.projDirections = projDirections || this.directions;   // proj・keyed に使える方向(gne direction の方向セット、CHANGE-06)
     this.keys = keys || (() => []);               // 保存した鍵の要約(/api/keys: name・target・layers、CHANGE-07)
@@ -338,15 +350,28 @@ export class RecipePanel {
     if (el) el.innerHTML = this.savedOptions();
   }
 
+  setTab(tab) {
+    this.tab = ["units", "try", "out"].includes(tab) ? tab : "units";
+    for (const b of this.root.querySelectorAll("#recipe-tabs [data-rtab]")) {
+      const on = b.dataset.rtab === this.tab;
+      b.setAttribute("aria-selected", String(on));
+      b.classList.toggle("on", on);
+      b.tabIndex = on ? 0 : -1;
+    }
+    for (const el of this.root.querySelectorAll("[data-rpanel]")) el.hidden = el.dataset.rpanel !== this.tab;
+  }
+
   savedOptions() {
-    return `<option value="">${t("保存したレシピを読む…")}</option>${
+    return `<option value="">${t("保存したレシピで置き換える…")}</option>${
       this.saved.map((x) => `<option value="${esc(x.name)}">${esc(x.name)}(${x.units.length})</option>`).join("")}`;
   }
 
   render() {
+    this.renders = (this.renders || 0) + 1;     // 描いた回数(app.js が、同じ変更で 2 度描かないように見る)
     const r = this.r;
     // 入力中の欄(id のある文字・数の欄)は、描き直した後も入力を続けられるようにフォーカスとカーソルの位置を戻す
     const fe = document.activeElement;
+    const tabFocus = fe && this.root.contains(fe) && fe.matches("#recipe-tabs [role=tab]") ? fe.dataset.rtab : null;
     const focus = fe && fe.id && this.root.contains(fe) && (fe.tagName === "TEXTAREA" || (fe.tagName === "INPUT" && !["range", "checkbox", "radio"].includes(fe.type)))
       ? { id: fe.id, a: fe.selectionStart, b: fe.selectionEnd } : null;
     const rows = r.units.map((u, i) => {
@@ -360,47 +385,64 @@ export class RecipePanel {
         : isMoe(u) ? this.moeId(u, i)
         : `<a href="#" data-open="${i}">L${u.layer} N${u.neuron}</a> <span class="muted w">${esc(this.unitWords(u.layer, u.neuron))}</span>`;
       return `
-      <tr data-i="${i}"${isMoe(u) ? ` class="rc-moe"` : ""}><td class="id">${id}<button class="small rm" data-rm="${i}" title="${t("外す")}">×</button>
+      <tr data-i="${i}"${isMoe(u) ? ` class="rc-moe"` : ""}><td class="id">${id}<button class="small quiet rm" data-rm="${i}" title="${t("外す")}">×</button>
         <div class="sl"><span class="muted">−${g.max}</span><input type="range" class="dose" min="-${g.max}" max="${g.max}" step="${g.step}" value="${u.dose}" data-i="${i}" style="background:${trackBG(u.dose, g.max)}"><span class="muted">+${g.max}</span>
           <span class="sg mono ${u.dose >= 0 ? "plus" : "minus"}">${signed(u.dose, g.d)}</span>
           <input type="number" min="-10" max="10" step="${g.step}" value="${u.dose}" data-i="${i}" class="num" title="${t("値を直接入れる")}"></div></td></tr>`;
     }).join("");
+    const tabs = [["units", t("中身")], ["try", t("試す")], ["out", t("書き出す")]];
+    const panel = (k) => `role="tabpanel" data-rpanel="${k}" aria-labelledby="rtab-${k}"${this.tab === k ? "" : " hidden"}`;
     this.root.innerHTML = `
+      <div class="tabs" id="recipe-tabs" role="tablist" aria-label="${t("レシピ")}">${tabs.map(([k, l]) =>
+        `<button type="button" role="tab" id="rtab-${k}" data-rtab="${k}" aria-selected="${this.tab === k}" tabindex="${this.tab === k ? 0 : -1}"${this.tab === k ? ' class="on"' : ""}>${l}</button>`).join("")}</div>
+      <div ${panel("units")}>
       <div class="list-tools"><input id="rc-name" placeholder="${t("レシピ名(英数字・_・-)")}" value="${esc(r.name)}" spellcheck="false">
         <button class="small" id="rc-save" title="${t("保存先の recipes フォルダに保存(既定は ~/.gne/recipes、--root を指定していればその下)")}">${t("保存")}</button></div>
       <div class="list-tools"><select id="rc-load">${this.savedOptions()}</select></div>
       ${r.units.length ? `<table class="rc mono"><tbody>${rows}</tbody></table>`
-        : `<p class="muted note">${t("ユニットがありません。NEURON の「+ レシピ」「− レシピ」で足します。")}</p>`}
+        : `<p class="muted note">${t("ユニットがありません。どの画面の「レシピに足す」でも、ここに入ります。")}</p>`}
       ${r.skipped ? `<p class="muted note">${t("UI では扱えないユニット(ニューロンの gain・ヘッドの query・ランダム方向など){n} 個を外しました", { n: r.skipped })}</p>` : ""}
-      ${r.heads().length ? `<p class="muted note">${t("ヘッドの倍率 k は 1 が無介入(0 で消す、2 で倍、負で反転)。LoRA で当てるので cvec には入りません。3 列チャットの − 列は 1 の反対側(×0 なら ×2)。")}</p>` : ""}
+      ${r.heads().length ? `${noteHTML(t("ヘッドの倍率 k は 1 が無介入(0 で消す、2 で倍、負で反転)。LoRA で当てるので cvec には入りません。3 列チャットの − 列は 1 の反対側(×0 なら ×2)。"), "muted note")}` : ""}
       ${r.projs().length || r.keyed().length ? this.projNote() : ""}
       ${r.keyed().length ? this.keyedNote() : ""}
       ${this.keyedAddHTML()}
-      ${r.moe().length ? `<p class="muted note">${t("MoE: 方向押し = 専門家のニューロンの add。専門家が選ばれたかに関係なく全トークンにその書き込み方向を足す(ニューロン押しではない)。選ばれたときだけ効くのは gain(×)。専門家全体の ×k と route はモデルを読み直すパッチで当てる(列ごとに 0.3〜1 秒)。3 列チャットの − 列は ×k が 2 − k、route と add は符号を反転。")}</p>` : ""}
+      ${r.moe().length ? `${noteHTML(t("MoE: 方向押し = 専門家のニューロンの add。専門家が選ばれたかに関係なく全トークンにその書き込み方向を足す(ニューロン押しではない)。選ばれたときだけ効くのは gain(×)。専門家全体の ×k と route はモデルを読み直すパッチで当てる(列ごとに 0.3〜1 秒)。3 列チャットの − 列は ×k が 2 − k、route と add は符号を反転。"), "muted note")}` : ""}
       ${this.ablateHTML()}
       ${r.sampling ? `<div class="rc-sampling muted note" title="${t("このレシピを試すときのサンプリング。チャットの「レシピの設定」で使い、保存するとレシピのファイルに入る(OpenAI 互換 API の既定にもなる)")}">${t("サンプリング")}: <span class="mono">${esc(samplingLabel(r.sampling))}</span><button class="small" id="rc-sp-rm" title="${t("レシピから外す")}">×</button></div>` : ""}
-      <p class="muted note">${t("dose は rel(その層の残差ノルムの中央値に対する大きさ)。マップに + は黄、− は赤紫の輪で出ます。")}</p>
+      <p class="muted note">${t("ニューロンの強さは rel(その層の残差ノルムの中央値に対する大きさ)。マップに + は黄、− は赤紫の輪で出ます。")}</p>
+      ${r.units.length ? `<div class="rc-actions"><button class="small quiet" id="rc-clear" title="${t("すべてのユニットを外す")}">${t("レシピを空にする")}</button></div>` : ""}
+      </div>
+      <div ${panel("try")}>
+      ${noteHTML(t("いまのレシピを当てた返事を、何もしない返事・逆向きに当てた返事と並べて比べます。チャットは「くわしく見る」のニューロンの Chat に開きます。"), "muted note")}
+      <div class="rc-actions"><button class="main" id="rc-chat"${r.empty() ? " disabled" : ""}>${t("3 列チャットで試す")}</button></div>
+      </div>
+      <div ${panel("out")}>
+      ${noteHTML(t("書き出しはここにまとめています。足す押し方(ニューロン・方向)は cvec、ヘッド・鍵つきの書き込みは「LoRA・焼き込み」、計算で作るニューロン(FiSH)は nw の LoRA です。"), "muted note")}
       <div class="rc-actions">
-        <button id="rc-chat"${r.empty() ? " disabled" : ""}>${t("3 列チャットで試す")}</button>
         <button id="rc-export"${r.addSpecs().length && document.body.dataset.cvec !== "off" ? "" : " disabled"}>${t("cvec を書き出す")}</button>
         <label class="muted"><input type="checkbox" id="rc-verify"> ${t("llama.cpp で確かめる")}</label>
         <button id="rc-lora"${r.heads().length || r.projs().length || r.keyed().length ? "" : " disabled"} title="${t("ヘッドの方向成分(proj)と倍率(gain)、鍵つきの書き込み(keyed)を、llama.cpp の --lora で使う LoRA アダプタか、重みに焼き込んだ GGUF に書き出す")}">${t("LoRA・焼き込み")}${this.lxOpen ? " ▴" : " ▾"}</button>
       </div>
-      ${r.keyed().length ? `<p class="muted note">${t("鍵つきの書き込み(keyed)は control vector に入りません(入力の活性で効き分けるので足し算にならない)。「LoRA・焼き込み」で書き出します。")}</p>` : ""}
+      ${r.keyed().length ? `${noteHTML(t("鍵つきの書き込み(keyed)は control vector に入りません(入力の活性で効き分けるので足し算にならない)。「LoRA・焼き込み」で書き出します。"), "muted note")}` : ""}
       ${r.nws().length ? `<div class="rc-actions"><button id="rc-nw" title="${t("計算で作るニューロン(nw)を、llama.cpp の --lora で使う LoRA アダプタに書き出す(焼き込みは無い)")}">${t("nw の LoRA を書き出す")}</button></div>
-        <p class="muted note">${t("計算で作るニューロン(nw)は control vector にも「LoRA・焼き込み」にも入りません。「nw の LoRA を書き出す」で別のアダプタにします。")}</p>` : ""}
+        ${noteHTML(t("計算で作るニューロン(nw)は control vector にも「LoRA・焼き込み」にも入りません。「nw の LoRA を書き出す」で別のアダプタにします。"), "muted note")}` : ""}
       ${this.lxOpen ? this.lxHTML() : ""}
-      ${r.units.length ? `<div class="rc-actions"><button class="small" id="rc-clear" title="${t("すべてのユニットを外す")}">${t("レシピを空にする")}</button></div>` : ""}
+      </div>
       <div id="rc-result"></div>`;
+    // 中身のタブを押したら、保存したレシピの一覧も取り直して描き直す(ほかの画面で足した・保存したものを出す)
+    wireTabs(this.root.querySelector("#recipe-tabs"), (k) => { this.setTab(k); if (k === "units") this.refreshSaved(); });
     const $ = (s) => this.root.querySelector(s);
     $("#rc-name").addEventListener("input", (ev) => r.setName(ev.target.value));
     $("#rc-name").addEventListener("change", (ev) => r.setName(ev.target.value.trim()));
     $("#rc-save").addEventListener("click", () => this.save());
     const clr = $("#rc-clear");
-    if (clr) clr.addEventListener("click", () => { if (confirm(t("レシピの {n} ユニットをすべて外しますか", { n: r.units.length }))) { r.clear(); this.render(); } });
-    $("#rc-load").addEventListener("change", (ev) => {
+    if (clr) clr.addEventListener("click", async () => { if (await askConfirm(t("レシピの {n} ユニットをすべて外しますか", { n: r.units.length }), { ok: t("外す") })) { r.clear(); this.render(); } });
+    $("#rc-load").addEventListener("change", async (ev) => {
       const x = this.saved.find((y) => y.name === ev.target.value);
-      if (x) { r.load(x.name, x.units, x.ablate, x.sampling, x.direction_layer, { default_direction: x.default_direction, default_key: x.default_key }); this.render(); }
+      if (!x) return;
+      if (!(await askReplace(r, x.name))) { ev.target.value = ""; return; }      // いまのレシピが空でなければ確かめる(やめたら選択を戻す)
+      r.load(x.name, x.units, x.ablate, x.sampling, x.direction_layer, { default_direction: x.default_direction, default_key: x.default_key });
+      this.onReplaced();
     });
     for (const el of this.root.querySelectorAll("input[data-i]")) {
       el.addEventListener("input", (ev) => {
@@ -458,15 +500,16 @@ export class RecipePanel {
       el.focus();
       try { el.setSelectionRange(focus.a, focus.b); } catch { /* 数の欄はカーソルの位置を持たない */ }
     }
+    if (tabFocus) this.root.querySelector(`#recipe-tabs [data-rtab="${tabFocus}"]`)?.focus();   // タブのフォーカスも戻す(キーで操作中)
   }
 
   // MoE の単位の名前(CHANGE-05 G)。add には「方向押し」の印、専門家全体は EXPERT パネルへ
   moeId(u, i) {
     const push = isPush(u) ? ` <span class="badge push" title="${t("書き込み方向の押し: 専門家が選ばれたかに関係なく、全トークンでこのニューロンの書き込み方向を足す(ニューロン押しではない)")}">${t("方向押し")}</span>` : "";
-    if (u.kind === "expert_neuron") return `<a href="#" data-open="${i}" title="${t("NEURON パネルで開く")}">L${u.layer} E${u.expert} N${u.neuron}</a>${push}${
+    if (u.kind === "expert_neuron") return `<a href="#" data-open="${i}" title="${t("くわしく見るで開く")}">L${u.layer} E${u.expert} N${u.neuron}</a>${push}${
       isGain(u) ? ` <span class="muted w">gain · ${t("選ばれたときだけ")}</span>` : ""}`;
     if (u.kind === "shared") return `<span class="mono">L${u.layer} S N${u.neuron}</span>${push} <span class="muted w">shared expert${isGain(u) ? " · gain" : ""}</span>`;
-    return `<a href="#" data-open="${i}" title="${t("EXPERT パネルで開く")}">L${u.layer} E${u.expert}</a> <span class="muted w">${
+    return `<a href="#" data-open="${i}" title="${t("くわしく見るで開く")}">L${u.layer} E${u.expert}</a> <span class="muted w">${
       isRoute(u) ? t("route(ルーターのバイアスに足す)") : t("専門家全体 · gain(パッチ)")}</span>`;
   }
 
@@ -480,9 +523,9 @@ export class RecipePanel {
       ? `<span class="badge rank1" title="${t("L{L} の射影のヘッドはどれも同じ方向なので、LoRA は階数 1 に畳める", { L: u.layer })}">rank 1</span>`
       : `<span class="badge rankk" title="${t("L{L} の射影のヘッドの方向が {n} 種類あるので、LoRA の階数は {n}(同じ方向なら 1 に畳める)", { L: u.layer, n: rank })}">rank ${rank}</span>`;
     return `
-      <tr data-i="${i}" class="rc-proj"><td class="id"><a href="#" data-open="${i}" title="${t("HEAD パネルで開く")}">L${u.layer} H${u.head}</a>
+      <tr data-i="${i}" class="rc-proj"><td class="id"><a href="#" data-open="${i}" title="${t("くわしく見るで開く")}">L${u.layer} H${u.head}</a>
         <span class="sg mono minus">${sLabel(u.s)}</span> <span class="mono">@</span><select class="rc-pdir" data-pdir="${i}" title="${t("射影する方向(gne direction の方向セット)")}">${opts}</select>
-        ${rk}<button class="small rm" data-rm="${i}" title="${t("外す")}">×</button>
+        ${rk}<button class="small quiet rm" data-rm="${i}" title="${t("外す")}">×</button>
         <div class="sl"><span class="muted">${PROJ.min}</span><input type="range" class="dose" min="${PROJ.min}" max="${PROJ.max}" step="${PROJ.step}" value="${u.s}" data-i="${i}" style="background:${projBG(u.s)}"><span class="muted">${PROJ.max}</span>
           <input type="number" min="-300" max="300" step="${PROJ.step}" value="${+(+u.s).toFixed(3)}" data-i="${i}" class="num" title="${t("値を直接入れる")}"></div></td></tr>`;
   }
@@ -490,12 +533,12 @@ export class RecipePanel {
   // 方向の層(own / base)の選択と、射影の説明(proj があるとき)
   projNote() {
     const r = this.r;
-    const tip = r.keyed().length ? t("proj・keyed のユニットに当てる方向の層。own = そのユニットがある層の方向 r_L、base = 方向セットの基準層の r(gne direction score で記録した層)")
-      : t("proj のユニットに当てる方向の層。own = そのヘッドがある層の方向 r_L、base = 方向セットの基準層の r(gne direction score で記録した層)");
+    const tip = r.keyed().length ? t("proj・keyed のユニットに当てる方向の層。その層 = そのユニットがある層の方向 r_L(own)、基準層 = 方向セットの基準層の r(base。gne direction score で記録した層)")
+      : t("proj のユニットに当てる方向の層。その層 = そのヘッドがある層の方向 r_L(own)、基準層 = 方向セットの基準層の r(base。gne direction score で記録した層)");
     return `<div class="rc-ablate"><span class="muted" title="${tip}">${t("方向の層")}</span>
-        <select id="rc-dl"><option value="own"${r.directionLayer === "own" ? " selected" : ""}>own</option><option value="base"${r.directionLayer === "base" ? " selected" : ""}>base</option></select></div>
-      ${r.projs().length ? `<p class="muted note">${t("射影 s: ヘッドが残差に書くベクトルのうち方向 r̂ に沿った成分だけを (1 − s) 倍にする(1 で消す、2 で反転、直交成分はそのまま)。LoRA で当てるので cvec には入りません。3 列チャットの − 列は s が負(その方向へ強める)。")}</p>` : ""}${
-        r.directionLayer === "base" ? `<p class="muted note">${t("方向の層 base は保存したレシピのファイルにだけ入ります(3 列チャットと「今のレシピで eval」はユニットの文字列を送るので own で当てます)。")}</p>` : ""}`;
+        <select id="rc-dl"><option value="own"${r.directionLayer === "own" ? " selected" : ""}>${t("その層")}</option><option value="base"${r.directionLayer === "base" ? " selected" : ""}>${t("基準層")}</option></select></div>
+      ${r.projs().length ? `${noteHTML(t("射影 s: ヘッドが残差に書くベクトルのうち方向 r̂ に沿った成分だけを (1 − s) 倍にする(1 で消す、2 で反転、直交成分はそのまま)。LoRA で当てるので cvec には入りません。3 列チャットの − 列は s が負(その方向へ強める)。"), "muted note")}` : ""}${
+        r.directionLayer === "base" ? `${noteHTML(t("方向の層「基準層」は保存したレシピのファイルにだけ入ります(3 列チャットと「今のレシピで eval」はユニットの文字列を送るので、その層の方向で当てます)。"), "muted note")}` : ""}`;
   }
 
   // 鍵つきの書き込みの行(CHANGE-07、L14 ffn keyed a+1.00 @方向 #鍵)。書き込み先・方向・鍵の選択(方向・鍵の「既定」は
@@ -509,7 +552,7 @@ export class RecipePanel {
     return `
       <tr data-i="${i}" class="rc-nw"><td class="id"><span class="mono">${esc(what)}</span>
         <span class="badge keyed" title="${t("計算で作るニューロン: ニューロンを計算した重みで上書きし、鍵が反応する位置でだけ方向を書く(LoRA)")}">nw</span>
-        <button class="small rm" data-rm="${i}" title="${t("外す")}">×</button>
+        <button class="small quiet rm" data-rm="${i}" title="${t("外す")}">×</button>
         <div class="rc-kx muted mono" title="${t("方向・鍵・形は direction ビューの FiSH のタブ(か CLI・MCP の gne nw …)で決める(docs/fish.md)")}">@${esc(u.direction || "—")} #${esc(u.key || "—")}${u.key2 ? `&amp;${esc(u.key2)}` : ""} · ${esc(form)}</div></td>
         <td class="sl"><input type="range" class="dose" data-i="${i}" min="${-KEYED.max}" max="${KEYED.max}" step="${KEYED.step}" value="${a}" style="background:${trackBG(a, KEYED.max)}"></td>
         <td class="nm"><input type="number" class="num" data-i="${i}" step="${KEYED.step}" value="${a}"></td>
@@ -536,7 +579,7 @@ export class RecipePanel {
         <select class="rc-kkind" data-kkind="${i}" title="${t("書き込み先: ffn = ffn_down、attn = attn_output、S = shared expert、E = 専門家 e(鍵を作った書き込み先と同じにする)")}">${kinds}</select>${
           u.kind === "expert" ? `<input type="number" class="num rc-kexp" data-kexp="${i}" min="0" value="${esc(String(this.kexpDraft && this.kexpDraft.u === u ? this.kexpDraft.v : u.expert ?? 0))}" title="${t("専門家の番号")}">` : ""}
         <span class="badge keyed" title="${t("鍵つきの書き込み: 入力の活性に鍵が反応するときだけ方向を書く(LoRA)")}">keyed</span>
-        <button class="small rm" data-rm="${i}" title="${t("外す")}">×</button>
+        <button class="small quiet rm" data-rm="${i}" title="${t("外す")}">×</button>
         <div class="rc-kx"><span class="mono">@</span><select data-kdir="${i}" title="${t("書き込む方向(gne direction の方向セットの r_L)")}">${opts(dirs, u.direction, r.defaultDirection)}</select>
           <span class="mono">#</span><select data-kkey="${i}" title="${t("鍵(direction ビューの「鍵」か gne direction key で作ったもの)")}">${opts(keys.map((k) => k.name), u.key, r.defaultKey)}</select>
           ${warn.map((w) => `<span class="badge warn">${esc(w)}</span>`).join(" ")}</div>
@@ -553,7 +596,7 @@ export class RecipePanel {
     return `<div class="rc-ablate rc-kdef" title="${t("@方向・#鍵を「既定」にした keyed の行が使う方向と鍵(保存するとレシピの default_direction・default_key)")}"><span class="muted">${t("keyed の既定")}</span>
         <span class="mono">@</span><select id="rc-kdd">${opt(dirs, r.defaultDirection)}</select>
         <span class="mono">#</span><select id="rc-kdk">${opt(keys, r.defaultKey)}</select></div>
-      <p class="muted note">${t("鍵つきの書き込み a: 入力の活性 x に鍵 κ が反応する(鍵の反応の強さ ρ = κᵀx が大きい)ときだけ、方向 r_L を α·ρ 倍で書く(α = 1 で、観測した A − B の平均差をそのまま)。書き込みたくない位置では ρ ≈ 0 で何も足さない。LoRA で当てるので cvec には入りません。3 列チャットの − 列は α が負(打ち消す)。")}</p>`;
+      ${noteHTML(t("鍵つきの書き込み a: 入力の活性 x に鍵 κ が反応する(鍵の反応の強さ ρ = κᵀx が大きい)ときだけ、方向 r_L を α·ρ 倍で書く(α = 1 で、観測した A − B の平均差をそのまま)。書き込みたくない位置では ρ ≈ 0 で何も足さない。LoRA で当てるので cvec には入りません。3 列チャットの − 列は α が負(打ち消す)。"), "muted note")}`;
   }
 
   // 「鍵つきの書き込み(keyed)を足す」: 鍵・その鍵の層・方向・α を選んで行を足す(保存した鍵があるときだけ)
@@ -573,7 +616,7 @@ export class RecipePanel {
         <span class="muted mono" title="${t("鍵の書き込み先")}">${esc(k.target)}</span>
         <span class="mono">@</span><select id="rc-ka-dir" title="${t("書き込む方向(gne direction の方向セットの r_L)")}">${dopts}</select>
         <span class="muted">α</span><input id="rc-ka-a" type="number" step="${KEYED.step}" value="${f.alpha}" class="num">
-        <button class="small" id="rc-ka-go">${t("足す")}</button></div></details>`;
+        <button class="small" id="rc-ka-go">${t("レシピに足す")}</button></div></details>`;
   }
 
   wireKeyed() {
@@ -602,16 +645,16 @@ export class RecipePanel {
       if (!k) return;
       const { kind, expert } = targetKind(k.target);
       r.addKeyed({ layer: this.ka.layer, kind, expert, alpha: this.ka.alpha, direction: this.ka.direction || null, key: k.name });
-      this.render();
+      this.onAdded();
     });
   }
 
   // 倍率の行(ヘッド L21 H7 ×0.00、MoE の gain)。スライダーは倍率 k(−1〜3、1 が無介入)
   gainRow(u, i) {
-    const id = isHead(u) ? `<a href="#" data-open="${i}" title="${t("HEAD パネルで開く")}">L${u.layer} H${u.head}</a> <span class="muted w">${esc(this.headKind(u.layer))} · gain</span>`
+    const id = isHead(u) ? `<a href="#" data-open="${i}" title="${t("くわしく見るで開く")}">L${u.layer} H${u.head}</a> <span class="muted w">${esc(this.headKind(u.layer))} · gain</span>`
       : this.moeId(u, i);
     return `
-      <tr data-i="${i}" class="rc-gain${isHead(u) ? " rc-head" : " rc-moe"}"><td class="id">${id}<button class="small rm" data-rm="${i}" title="${t("外す")}">×</button>
+      <tr data-i="${i}" class="rc-gain${isHead(u) ? " rc-head" : " rc-moe"}"><td class="id">${id}<button class="small quiet rm" data-rm="${i}" title="${t("外す")}">×</button>
         <div class="sl"><span class="muted">${GAIN.min}</span><input type="range" class="dose" min="${GAIN.min}" max="${GAIN.max}" step="${GAIN.step}" value="${u.k}" data-i="${i}" style="background:${gainBG(u.k)}"><span class="muted">${GAIN.max}</span>
           <span class="sg mono ${u.k >= 1 ? "plus" : "minus"}">${kLabel(u.k)}</span>
           <input type="number" min="-4" max="8" step="${GAIN.step}" value="${u.k}" data-i="${i}" class="num" title="${t("値を直接入れる")}"></div></td></tr>`;
@@ -622,10 +665,10 @@ export class RecipePanel {
     const opts = [`<option value="">${t("なし")}</option>`, ...dirs.map((d) => `<option${a && a.direction === d ? " selected" : ""}>${esc(d)}</option>`)];
     if (a && !dirs.includes(a.direction)) opts.push(`<option selected>${esc(a.direction)}</option>`);
     const sc = a ? a.scale : 1;
-    return `<div class="rc-ablate" title="${t("方向の射影消去(§6.17): 選んだ方向を残差に書き込む重みから消す(LoRA で当てる)。gne direction で作った方向を使う")}">
+    return `<div class="rc-ablate" title="${t("方向の射影消去: 選んだ方向を残差に書き込む重みから消す(LoRA で当てる)。gne direction で作った方向を使う")}">
         <span class="muted">ablate</span><select id="rc-ab-dir">${opts.join("")}</select>${a ? `
-        <span class="muted">${t("倍率")}</span><span class="sl"><input type="range" id="rc-ab-scale" min="0" max="1.5" step="0.05" value="${sc}"><span class="mono" id="rc-ab-scale-v">×${fmt(sc, 2)}</span></span>
-        <span class="muted">${t("層")}</span><input id="rc-ab-layers" value="${esc(a.layers || "all")}" spellcheck="false" title="${t("all / 10-40 / 1,5,9-12")}">
+        <span class="muted">${t("強さ")}</span><span class="sl"><input type="range" id="rc-ab-scale" min="0" max="1.5" step="0.05" value="${sc}"><span class="mono" id="rc-ab-scale-v">×${fmt(sc, 2)}</span></span>
+        <span class="muted">${t("層")}</span>${layersInput("rc-ab-layers", { value: a.layers || "all", placeholder: "all" })}
         <span class="muted">${t("測った層")}</span><input id="rc-ab-from" type="number" min="0" value="${a.from_layer ?? ""}" placeholder="${t("既定")}" title="${t("どの層で測った方向を使うか(空なら gne direction --select で選んだ層)")}">` : ""}
       </div>${dirs.length || a ? "" : `<p class="muted note">${t("方向がありません(gne direction --contrast で作れます)")}</p>`}`;
   }
@@ -743,7 +786,7 @@ export class RecipePanel {
       <div class="rc-lx-row"><label title="${t("gne が書く記録(gne.* のメタデータ: レシピ・ヘッド・強さ・方向の鍵、名前の印、横の .headproj.json)を入れない。人に渡すファイル用。書いたあと、メタデータに手元のパスが残っていないかも確かめる")}"><input type="checkbox" id="lx-strip"${f.strip ? " checked" : ""}> ${t("gne の記録(メタデータ)を入れない(人に渡す用)")}</label></div>
       ${bake ? "" : `<div class="rc-lx-row"><span class="muted" title="${t("LoRA のファイルの中の名前の欄(general.name)。空なら「元のモデルの名前 gain レシピの名前」、記録を入れないときは adapter")}">${t("名前の欄")}</span>
         <input id="lx-adname" size="26" value="${esc(f.adapterName)}" placeholder="${f.strip ? "adapter" : ""}" spellcheck="false"></div>`}
-      <div class="rc-lx-row"><button id="lx-go">${t(bake ? "焼き込む" : "LoRA を書き出す")}</button>
+      <div class="rc-lx-row"><button class="main" id="lx-go">${t(bake ? "焼き込む" : "LoRA を書き出す")}</button>
         <span class="muted note">${nk ? t("名前は上のレシピの名前(空なら headproj)。LoRA に入るユニット {n} 個(ヘッド {h}・鍵つきの書き込み {k})", { n, h: n - nk, k: nk })
           : t("名前は上のレシピの名前(空なら headproj)。ヘッドのユニット {n} 個が入る", { n })}${nAdd ? ` · ${t("add のユニット {k} 個は入らない(cvec で書き出す)", { k: nAdd })}` : ""}${bake ? ` · ${t("焼き込みはモデルを丸ごともう 1 つ書く(同じくらいのディスク・時間)")}` : ""}</span></div>
       <div id="lx-result">${this.lxMsg ? this.lxMsg.html : ""}</div></div>`;
@@ -759,6 +802,7 @@ export class RecipePanel {
     on("#lx-imatrix", "input", (ev) => { f.imatrix = ev.target.value; });
     on("#lx-verify", "change", (ev) => { f.verify = ev.target.checked; this.render(); });
     on("#lx-contrast", "input", (ev) => { f.contrast = ev.target.value; });
+    useContrastList($("#lx-contrast"));                                  // 対照集合は同じ候補の一覧から選べる
     on("#lx-strip", "change", (ev) => { f.strip = ev.target.checked; });
     on("#lx-strip", "change", (ev) => { const el = this.root.querySelector("#lx-adname"); if (el) el.placeholder = ev.target.checked ? "adapter" : ""; });
     on("#lx-adname", "input", (ev) => { f.adapterName = ev.target.value; });

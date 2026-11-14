@@ -3,7 +3,7 @@
 // 描く順: 点 → ベースライン(白い縁の ◇)→ プロンプトの札(かたまりの上)→ 開いているニューロンの白い輪 → hover の輪(水色)。
 // 凡例は図の外(下)に置き、点を隠さない。
 import { getJSON } from "./api.js";
-import { t } from "./i18n.js";
+import { t, tl } from "./i18n.js";
 import { esc } from "./panels.js";
 
 const PAL = ["#5fb3b3", "#e8b04a", "#9b8bd9", "#7fc97f", "#f08a5d", "#6fa8dc", "#d4a5c9", "#c9c96f"];
@@ -31,9 +31,9 @@ export class EmbedView {
     this.hover = -1;
     this.top = [];                               // その run の順位の上位(neuron の色)
     root.innerHTML = `
-      <div class="ev-tools"><label class="muted">run <select id="ev-run"></select></label>
-        <label class="muted">${t("色")} <select id="ev-color"><option value="kind">kind</option><option value="prompt">prompt</option>
-          <option value="dose">dose</option><option value="neuron">neuron</option></select></label>
+      <div class="ev-tools"><label class="muted" title="${t("埋め込みを見る sweep の結果")}">${t("sweep の結果")} <select id="ev-run"></select></label>
+        <label class="muted">${t("色")} <select id="ev-color"><option value="kind">${t("種類")}</option><option value="prompt">${tl("プロンプト", "prompt", "提示词")}</option>
+          <option value="dose">dose</option><option value="neuron">${tl("ニューロン", "neuron", "神经元")}</option></select></label>
         <button id="ev-compute" class="hidden">${t("埋め込みを計算")}</button><button id="ev-reset" class="small hidden">${t("表示を戻す")}</button>
         <span class="muted note" id="ev-status"></span></div>
       <div id="ev-info" class="mono"></div>
@@ -230,8 +230,8 @@ export class EmbedView {
       row = it(t("この run の順位の上位 8 本: ")) + row;
     }
     const f = this.getFocus(), nf = f ? this.data.points.filter((p) => this._isFocus(p, f)).length : 0;
-    const ring = nf ? it('<span class="sw ring" style="border-color:#fff"></span>', t("開いている {who} の rollout({n} 本)", { who: f.kind === "random" ? `random ${f.n}` : `L${f.layer} N${f.n}`, n: nf })) : "";
-    el.innerHTML = `<div>${row}${ring}${it('<span class="sw ring" style="border-color:#6fe3ff"></span>', t("マウスの下の点"))}</div>
+    const ring = nf ? it('<span class="sw ring white"></span>', t("開いている {who} の rollout({n} 本)", { who: f.kind === "random" ? `random ${f.n}` : `L${f.layer} N${f.n}`, n: nf })) : "";
+    el.innerHTML = `<div>${row}${ring}${it('<span class="sw ring agent"></span>', t("マウスの下の点"))}</div>
       <div class="note">${t("すぐ近くの点どうしは文が似ている。かたまり同士の距離・大きさ・向き、座標軸には意味がない(UMAP)")}</div>`;
   }
 

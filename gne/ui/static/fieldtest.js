@@ -3,6 +3,7 @@
 import { getJSON } from "./api.js";
 import { t } from "./i18n.js";
 import { esc } from "./panels.js";
+import { noteHTML } from "./ui.js";
 
 const SECTION = { long: "長い作業", tools: "ツール呼び出し", ppl: "perplexity" };
 const LABEL = {
@@ -36,7 +37,7 @@ export class FieldtestPanel {
     this.data = null;
     this.openSeq = 0;                                 // open の通し番号(後から別の結果を開いたら、先に始めた読み込みの結果は捨てる)
     root.innerHTML = `
-      <p class="muted note">${t("本番と同じ動かし方(llama-server、思考あり、サンプリングあり)で、長い作業・ツール呼び出し・質問集・perplexity を測り、ファイルどうしを比べます。eval で見えない、長い思考の途中のループや、ツール呼び出しの崩れを見ます。焼き込んだファイルもそのまま測れます。走っている間は読み込んでいるモデルを GPU から下ろすので、チャットなどは待たされます。27B で質問集 200 問を足して 1 ファイル 30〜45 分かかります。")}</p>
+      ${noteHTML(t("本番と同じ動かし方(llama-server、思考あり、サンプリングあり)で、長い作業・ツール呼び出し・質問集・perplexity を測り、ファイルどうしを比べます。eval で見えない、長い思考の途中のループや、ツール呼び出しの崩れを見ます。焼き込んだファイルもそのまま測れます。走っている間は読み込んでいるモデルを GPU から下ろすので、チャットなどは待たされます。27B で質問集 200 問を足して 1 ファイル 30〜45 分かかります。"), "muted note")}
       <div class="ft-form">
         <label class="muted" title="${t("測るファイル(GGUF のパス)。空ならいま読んでいるモデル")}">${t("測るファイル")} <input id="ft-model" size="44" spellcheck="false" placeholder="${t("空ならいま読んでいるモデル")}"></label>
         <label class="muted" title="${t("比べるファイル(例 元のモデル)。空なら測るだけ")}">${t("比べるファイル")} <input id="ft-against" size="44" spellcheck="false" placeholder="${t("空なら比べない")}"></label>
@@ -52,7 +53,7 @@ export class FieldtestPanel {
         <label class="muted" title="${t("能力を測るベンチマーク。データは初回に取得する。合わせて数時間かかる")}"><input id="ft-mmlu" type="checkbox"> MMLU-Pro</label>
         <label class="muted" title="${t("能力を測るベンチマーク。データは初回に取得する。合わせて数時間かかる")} ${t("採点に bench extra が要る")}"><input id="ft-math500" type="checkbox"> MATH-500</label>
         <label class="muted" title="${t("能力を測るベンチマーク。データは初回に取得する。合わせて数時間かかる")} ${t("採点に bench extra が要る")}"><input id="ft-ifeval" type="checkbox"> IFEval</label>
-        <button id="ft-go">${t("実地テストを走らせる")}</button> <span class="muted note" id="ft-status"></span></div>
+        <button class="main" id="ft-go">${t("実地テストを走らせる")}</button> <span class="muted note" id="ft-status"></span></div>
       <div id="ft-list"></div><div id="ft-result"></div>`;
     this.$ = (s) => root.querySelector(s);
     this.$("#ft-go").addEventListener("click", () => this.run());
@@ -105,7 +106,7 @@ export class FieldtestPanel {
     const el = this.$("#ft-list");
     if (!list.length) { el.innerHTML = `<p class="muted note">${t("まだありません")}</p>`; return; }
     el.innerHTML = `<table class="evx mono ft-past"><thead><tr><th class="l">${t("名前")}</th><th class="l">${t("対象")}</th><th class="l">${t("比較")}</th><th>${t("結論")}</th><th class="l">${t("更新")}</th></tr></thead><tbody>${
-      list.map((x) => `<tr data-ft="${esc(x.name)}" class="${this.data && this.data.name === x.name ? "on" : ""}"><td class="l">${esc(x.name)}</td><td class="l">${esc(x.target || "—")}</td><td class="l">${esc(x.reference || "—")}</td>
+      list.map((x) => `<tr data-ft="${esc(x.name)}" class="pick${this.data && this.data.name === x.name ? " on" : ""}"><td class="l">${esc(x.name)}</td><td class="l">${esc(x.target || "—")}</td><td class="l">${esc(x.reference || "—")}</td>
         <td class="${x.same_level === false ? "ng" : x.same_level ? "ok" : ""}">${x.same_level === null || x.same_level === undefined ? "—" : x.same_level ? t("同程度") : t("悪化 {n} 項目", { n: x.n_worse })}</td>
         <td class="l">${esc((x.updated || "").replace("T", " ").slice(0, 16))}</td></tr>`).join("")}</tbody></table>`;
     for (const tr of el.querySelectorAll("tr[data-ft]")) tr.addEventListener("click", () => this.open(tr.dataset.ft));
@@ -154,6 +155,6 @@ export class FieldtestPanel {
       ${(d.warnings || []).map((w) => `<p class="note ng">${esc(w)}</p>`).join("")}
       ${d.same_level === null || d.same_level === undefined ? "" : `<p class="note ${d.same_level ? "ok" : "ng"}">${d.same_level ? t("すべて同程度です") : t("悪化した項目があります")}</p>`}
       <table class="evx mono ft-table"><thead><tr><th class="l"></th>${hasRef ? `<th>${t("比較")}</th>` : ""}<th>${t("対象")}</th></tr></thead><tbody>${body}</tbody></table>
-      <p class="muted note">${t("同程度の目安: 割合は 2 問ぶん、perplexity は 1% までの差。種は同じですが、1 問の違いはサンプリングの揺れで起きます。生成した文章は結果と同じ場所の .replies.json にあります(画面には出しません)。")}</p>`;
+      ${noteHTML(t("同程度の目安: 割合は 2 問ぶん、perplexity は 1% までの差。種は同じですが、1 問の違いはサンプリングの揺れで起きます。生成した文章は結果と同じ場所の .replies.json にあります(画面には出しません)。"), "muted note")}`;
   }
 }

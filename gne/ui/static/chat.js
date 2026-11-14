@@ -2,10 +2,14 @@
 // reads you = 文章を流して、このニューロンの活性をトークンごとに色で見る(§5.5 の 1 ニューロン版)。
 // 会話の状態はブラウザが持ち、毎ターン列ごとの履歴をサーバに送る(サーバは状態を持たない)。
 import { postJSON, postSSE } from "./api.js";
-import { t as tr } from "./i18n.js";                 // t は会話のターンの変数名に使っているので tr
+import { t as tr, tl } from "./i18n.js";             // t は会話のターンの変数名に使っているので tr
 import { esc, tokHTML } from "./panels.js";
 import { samplingLabel } from "./recipe.js";
 import { Mic } from "./mic.js";
+import { askConfirm } from "./ui.js";
+
+// 足す位置(when)。値はジョブ・CLI と同じ、表示は画面の言葉
+const WHEN = [["all", "全位置"], ["gen", "生成中だけ"], ["assistant", "assistant の発話だけ"], ["skip-replies", "過去の返事以外"], ["after", "文字列が出てから"], ["ramp", "倍率を a から b へ"]];
 
 // "14:8949:+1" → "L14 N8949 +1"、ヘッドの gain "21:H7:x0" → "L21 H7 ×0"、方向 "30:dir:NAME:+0.3" → "L30 dir:NAME +0.3"。
 // MoE(CHANGE-05): "12:E37:N511:+0.8" → "L12 E37 N511 +0.8"、"12:E3:x0" → "L12 E3 ×0"、"12:E3:route:+2" → "L12 E3 route +2"、
@@ -34,9 +38,10 @@ const SP_KEY = "gne.chat.sampling";            // このブラウザに覚えて
 const COLS_KEY = "gne.chat.single";            // 1 列(+ の列だけ)で話すか
 
 export class ChatPanel {
-  constructor({ recipe, onStatus }) {
+  constructor({ recipe, onStatus, onAdded }) {
     this.recipe = recipe;
     this.onStatus = onStatus || (() => {});
+    this.onAdded = onAdded || (() => {});    // レシピに足したとき(app.js がレシピのパネルを開く。どの入口でも同じ)
     this.mode = "writes";
     this.target = "neuron";
     this.dose = 0.8;
@@ -68,9 +73,9 @@ export class ChatPanel {
   }
 
   // 列の数を切り替える。履歴は列ごとなので、会話があれば確かめてから消す
-  setSingle(on) {
+  async setSingle(on) {
     if (on === this.single || this.busy) return;
-    if (this.turns.length && !window.confirm(tr("列の数を変えると、今の会話を消します。切り替えますか?"))) { this.render(); return; }
+    if (this.turns.length && !(await askConfirm(tr("列の数を変えると、今の会話を消します。切り替えますか?")))) { this.render(); return; }
     this.single = on;
     this.turns = [];
     this.status = "";
@@ -115,8 +120,8 @@ export class ChatPanel {
     if (!v) return sel;
     const fields = SP_FIELDS.map(([k, label, step]) => `<span class="muted">${k === "temperature" ? tr(label) : label}</span><input class="sp-v" data-k="${k}" type="number" step="${step}" min="${k === "presence_penalty" ? -2 : 0}" value="${v[k]}">`).join("");
     return `${sel}</div><div class="ch-tools ch-sp">${fields}
-      <label class="muted" title="${tr("固定すると、強さやレシピだけ変えて送り直したときに違いが介入だけになる。切ると毎回変える")}"><input type="checkbox" id="ch-seed-fixed"${this.seedFixed ? " checked" : ""}> seed ${tr("固定")}</label><input id="ch-seed" type="number" min="0" step="1" value="${this.seed}"${this.seedFixed ? "" : " disabled"}>
-      ${this.target === "recipe" && this.spPreset !== "recipe" ? `<button class="small" id="ch-sp-to-recipe" title="${tr("この値をレシピに入れる(レシピのタブで保存するとファイルに入る)")}">${tr("レシピに入れる")}</button>` : ""}`;
+      <label class="muted" title="${tr("固定すると、強さやレシピだけ変えて送り直したときに違いが介入だけになる。切ると毎回変える")}"><input type="checkbox" id="ch-seed-fixed"${this.seedFixed ? " checked" : ""}> ${tr("種を固定")}</label><input id="ch-seed" type="number" min="0" step="1" value="${this.seed}"${this.seedFixed ? "" : " disabled"}>
+      ${this.target === "recipe" && this.spPreset !== "recipe" ? `<button class="small" id="ch-sp-to-recipe" title="${tr("このサンプリングをレシピに足す(レシピを保存するとファイルに入る)")}">${tr("レシピに足す")}</button>` : ""}`;
   }
 
   // 送る本文の sampling(greedy なら無し)。seed は固定か、毎回新しく引く
@@ -159,7 +164,7 @@ export class ChatPanel {
     const seg = (name, items, cur) => `<span class="seg">${items.map(([v, t, dis]) =>
       `<button data-${name}="${v}"${v === cur ? ' class="on"' : ""}${dis ? " disabled" : ""}>${t}</button>`).join("")}</span>`;
     this.el.innerHTML = `
-      <div class="ch-tools">${seg("mode", [["writes", "writes"], ["reads", "reads you"]], this.mode)}
+      <div class="ch-tools">${seg("mode", [["writes", tl("押して話す", "steer & chat", "按键说话")], ["reads", tl("反応を見る", "read a text", "读取文本")]], this.mode)}
         ${this.mode === "writes" ? seg("target", [["neuron", tr("このニューロン")], ["recipe", tr("レシピ({n})", { n: nR }), !nR]], this.target) : ""}</div>
       ${this.mode === "writes" ? this.writesHTML() : this.readsHTML()}
       ${lens.length && this.target === "neuron" ? `<div class="ch-lens">${lens.join("<span class='muted'> | </span>")}</div>` : ""}`;
@@ -172,9 +177,9 @@ export class ChatPanel {
   writesHTML() {
     const cols = this.columns();
     const amount = this.target === "recipe"
-      ? `${tr("倍率")} <button class="small" data-step="-0.25" title="${tr("小さく")}">▼</button><input id="ch-dose" type="number" step="0.25" value="${this.scale}"><button class="small" data-step="0.25" title="${tr("大きく")}">▲</button>`
-      : `dose <button class="small" data-step="-0.1" title="${tr("小さく")}">▼</button><input id="ch-dose" type="number" step="0.1" value="${this.dose}"><button class="small" data-step="0.1" title="${tr("大きく")}">▲</button>
-         <span class="seg"><button class="on" title="${tr("本体設計の rel dose(残差ノルムの中央値に対する大きさ)を足す")}">add</button><button disabled title="${tr("活性の倍率は本体設計で未対応")}">×</button></span>${
+      ? `${tr("強さ")} <button class="small" data-step="-0.25" title="${tr("小さく")}">▼</button><input id="ch-dose" type="number" step="0.25" value="${this.scale}"><button class="small" data-step="0.25" title="${tr("大きく")}">▲</button>`
+      : `${tr("強さ")} <button class="small" data-step="-0.1" title="${tr("小さく")}">▼</button><input id="ch-dose" type="number" step="0.1" value="${this.dose}"><button class="small" data-step="0.1" title="${tr("大きく")}">▲</button>
+         <span class="seg"><button class="on" title="${tr("rel(残差ノルムの中央値に対する大きさ)で足す")}">${tr("足す")}</button><button disabled title="${tr("活性を何倍にするやり方は、まだ使えません")}">×</button></span>${
           this.detail && this.detail.expert !== undefined && this.detail.expert !== null
             ? `<span class="badge push" title="${tr("MoE の専門家のニューロンの add は書き込み方向の押し(専門家が選ばれたかに関係なく全トークンに足す)。選ばれたときだけ効く gain は NEURON の ×0 / ×2 からレシピで試す")}">${tr("方向押し")}</span>` : ""}`;
     const turns = this.turns.map((t, ti) => `
@@ -183,9 +188,9 @@ export class ChatPanel {
     const colSeg = `<span class="seg" title="${tr("3 列: −・無介入・+ を並べて比べる / 1 列: + の列(レシピありか、このニューロンを + で押した返事)だけで話す。1 列は生成が 3 分の 1 で、長い会話を試すのに向く")}">${
       [["3", tr("3 列")], ["1", tr("1 列")]].map(([v, l]) => `<button data-cols="${v}"${(this.single ? "1" : "3") === v ? ' class="on"' : ""}${this.busy ? " disabled" : ""}>${l}</button>`).join("")}</span>`;
     return `
-      <div class="ch-tools">${colSeg}${amount}<span class="muted">max</span><input id="ch-max" type="number" min="1" max="2048" value="${this.maxTokens}">
-        <span class="muted" title="${tr("足す位置: all = 全位置 / gen = 生成中だけ(プロンプトの理解を壊さない)/ assistant = assistant の発話だけ / skip-replies = 過去の返事以外(過去の返事は素のまま読む)/ after = 出力にその文字列が出てから / ramp = 倍率を a から b へ変える")}">when</span><select id="ch-when">${
-          ["all", "gen", "assistant", "skip-replies", "after", "ramp"].map((w) => `<option value="${w}"${this.when === w ? " selected" : ""}>${w}</option>`).join("")}</select>${
+      <div class="ch-tools">${colSeg}${amount}<span class="muted">${tr("返事の長さ")}</span><input id="ch-max" type="number" min="1" max="2048" value="${this.maxTokens}">
+        <span class="muted" title="${tr("足す位置: all = 全位置 / gen = 生成中だけ(プロンプトの理解を壊さない)/ assistant = assistant の発話だけ / skip-replies = 過去の返事以外(過去の返事は素のまま読む)/ after = 出力にその文字列が出てから / ramp = 倍率を a から b へ変える")}">${tr("足す位置")}</span><select id="ch-when">${
+          WHEN.map(([w, l]) => `<option value="${w}"${this.when === w ? " selected" : ""}>${tr(l)}</option>`).join("")}</select>${
           this.when === "after" || this.when === "ramp" ? `<input id="ch-when-x" size="8" value="${esc(this.whenArg)}" placeholder="${this.when === "after" ? tr("結論:") : "1.5-0.5"}">` : ""}</div>
       <div class="ch-tools">${this.samplingHTML()}</div>
       <div class="ch-tools"><span class="muted">system</span><input id="ch-system" class="ch-system" value="${esc(this.system)}" placeholder="${tr("空なら無し(音声で話すなら Respond in text.)")}">
@@ -197,7 +202,7 @@ export class ChatPanel {
           : tr("同じ発話を 3 列で生成します(左から −、無介入、+)。返答は列ごとに別の履歴になります。")}</p>`}
       </div>
       <div class="ch-input"><textarea id="ch-text" rows="2" placeholder="${tr("メッセージ(Ctrl+Enter で送る)")}"${this.busy ? " disabled" : ""}>${esc(this.draft)}</textarea>
-        <button id="ch-send"${this.busy ? " disabled" : ""}>${tr("送る")}</button><button id="ch-mic" class="${this.mic.recording ? "rec" : ""}" title="${tr("音声で話しかける(押して話し、もう一度押すと送る。入力欄の文も一緒に送る)")}"${this.busy ? " disabled" : ""}>${this.mic.recording ? `■ ${tr("止めて送る")}` : `🎤 ${tr("話す")}`}</button><button id="ch-stop"${this.busy ? "" : " disabled"}>${tr("止める")}</button><button id="ch-reset" title="${tr("会話を消して、最初から話す(どの列も)")}"${this.busy ? " disabled" : ""}>${tr("新しい会話")}</button></div>
+        <button class="main" id="ch-send"${this.busy ? " disabled" : ""}>${tr("送る")}</button><button id="ch-mic" class="${this.mic.recording ? "rec" : ""}" title="${tr("音声で話しかける(押して話し、もう一度押すと送る。入力欄の文も一緒に送る)")}"${this.busy ? " disabled" : ""}>${this.mic.recording ? `■ ${tr("止めて送る")}` : `🎤 ${tr("話す")}`}</button><button id="ch-stop"${this.busy ? "" : " disabled"}>${tr("止める")}</button><button id="ch-reset" title="${tr("会話を消して、最初から話す(どの列も)")}"${this.busy ? " disabled" : ""}>${tr("新しい会話")}</button></div>
       <div class="ch-status muted note" id="ch-status">${esc(this.status || "")}</div>`;
   }
 
@@ -249,12 +254,12 @@ export class ChatPanel {
     const sd = $("#ch-seed");
     if (sd) sd.addEventListener("change", (ev) => { this.seed = Math.max(0, Math.floor(+ev.target.value || 0)); this.saveSp(); });
     const tor = $("#ch-sp-to-recipe");
-    if (tor) tor.addEventListener("click", () => { this.recipe.setSampling(this.spValues()); this.spPreset = "recipe"; this.saveSp(); this.render(); });
+    if (tor) tor.addEventListener("click", () => { this.recipe.setSampling(this.spValues()); this.spPreset = "recipe"; this.saveSp(); this.render(); this.onAdded(); });
     $("#ch-when").addEventListener("change", (ev) => { this.when = ev.target.value; this.render(); });
     const wx = $("#ch-when-x");
     if (wx) wx.addEventListener("change", (ev) => { this.whenArg = ev.target.value.trim(); });
-    $("#ch-reset").addEventListener("click", () => {
-      if (this.turns.length && !window.confirm(tr("いまの会話を消して、最初から話しますか?"))) return;
+    $("#ch-reset").addEventListener("click", async () => {
+      if (this.turns.length && !(await askConfirm(tr("いまの会話を消して、最初から話しますか?")))) return;
       this.turns = []; this.status = ""; this.render();
       const ta = this.el.querySelector("#ch-text");
       if (ta) ta.focus();
@@ -383,7 +388,7 @@ export class ChatPanel {
     const base = o && o.normalization === "text_p99" ? tr("文章の中の層内 p99(この層は活性統計が無い)") : tr("この層の基準(活性統計の q999)");
     return `
       <div class="ch-input"><textarea id="rd-text" rows="4" placeholder="${tr("文章を貼る(このニューロンがどこで光るかを見る)")}">${esc(this.readsText)}</textarea>
-        <button id="rd-run">${tr("流す")}</button></div>
+        <button class="main" id="rd-run">${tr("流す")}</button></div>
       <p class="muted note">${tr("スコア = 活性 ÷ {base}。濃さはこの文章の中の最大 |スコア|{mx}に対する割合(fires の地図の色は絶対値)。黄 = 正、赤紫 = 負。先頭のトークン(灰色)は除く。マウスを当てると値。", { base, mx: o ? ` (${fmt(mx, 1)})` : "" })}</p>
       <div class="rd-out">${first}${toks}</div>
       ${top.length ? `<p class="muted note">${tr("強い順")}: ${top.map(([, t, s]) => `${tokHTML(t)}${fmt(s, 2)}`).join(" ")}</p>` : ""}

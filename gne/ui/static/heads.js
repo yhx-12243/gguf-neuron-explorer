@@ -11,8 +11,9 @@
 //   ratio・効率 η・B 側への影響、射影の値を測る層ごと)と、選んだスクリーニングの上位のヘッドの表(並べ替え・表示する測る層)、
 //   強さの配分(gne heads allocate)の組。見出しの「射影 s1」でこのヘッドの方向成分の射影(L:Hh:s1@方向)をレシピに足す。
 import { getJSON, postJSON } from "./api.js";
-import { t } from "./i18n.js";
+import { t, tl } from "./i18n.js";
 import { esc, toksHTML } from "./panels.js";
+import { plainEnter, noteHTML } from "./ui.js";
 
 const fmt = (x, d = 2) => (x === null || x === undefined || !Number.isFinite(+x) ? "—" : (+x).toFixed(d));
 const sgn = (x, d = 3) => (x === null || x === undefined || !Number.isFinite(+x) ? "—" : `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(d)}`);
@@ -135,7 +136,7 @@ export class HeadPanel {
     const d = this.d;
     if (!d) return;
     const best = d.contrasts[0];
-    const stats = best ? `#${best.rank}/${best.n_ranked} · z ${fmt(best.z, 2)} · null ${fmt(best.null_pct, 2)} · ${esc(best.name)}` : t("ヘッドの対照分析なし");
+    const stats = best ? `#${best.rank}/${best.n_ranked} · z ${fmt(best.z, 2)} · ${t("対照超え")} ${fmt(best.null_pct, 2)} · ${esc(best.name)}` : t("ヘッドの対照分析なし");
     this.root.innerHTML = `
       <div class="n-head">
         <div class="n-id mono">L${d.layer} H${d.head} <span class="muted h-kind">${kindLabel(d.kind)}</span></div>
@@ -143,7 +144,7 @@ export class HeadPanel {
         <div class="n-row"><input class="n-name h-name" placeholder="${t("名前(入力して Enter か欄の外で保存)")}" value="${esc(d.name || "")}" spellcheck="false">
           ${this.recipeButtons(d)}</div>
       </div>
-      <div class="tabs"><button data-tab="pattern">Pattern</button><button data-tab="contrast">Contrast${d.contrasts.length ? ` <span class="muted">${d.contrasts.length}</span>` : ""}</button><button data-tab="details">Details</button><button data-tab="listen">Listen</button><button data-tab="causal">Causal${(d.causal || []).length ? ` <span class="muted">${d.causal.length}</span>` : ""}</button></div>
+      <div class="tabs"><button data-tab="pattern">${tl("注目", "Pattern", "注意力")}</button><button data-tab="contrast">${tl("対照分析", "Contrast", "对照分析")}${d.contrasts.length ? ` <span class="muted">${d.contrasts.length}</span>` : ""}</button><button data-tab="details">${tl("くわしく", "Details", "详情")}</button><button data-tab="listen">${tl("聞く", "Listen", "监听")}</button><button data-tab="causal">${tl("効き目", "Causal", "因果")}${(d.causal || []).length ? ` <span class="muted">${d.causal.length}</span>` : ""}</button></div>
       <div class="n-tab" id="h-tab"></div>`;
     for (const b of this.root.querySelectorAll(".tabs button")) {
       b.classList.toggle("on", b.dataset.tab === this.tab);
@@ -158,7 +159,7 @@ export class HeadPanel {
       setTimeout(() => name.classList.remove("saved"), 800);
       this.onNamed(r.names);
     };
-    name.addEventListener("keydown", (ev) => { if (ev.key === "Enter") save(); });
+    name.addEventListener("keydown", (ev) => { if (plainEnter(ev)) save(); });
     name.addEventListener("blur", save);
     for (const b of this.root.querySelectorAll("[data-hk]")) b.addEventListener("click", () => { this.onRecipe(d.layer, d.head, +b.dataset.hk); this.render(); });
     const pb = this.root.querySelector("[data-hp]");
@@ -176,8 +177,8 @@ export class HeadPanel {
     const cur = this.inRecipe(d.layer, d.head);
     const b = (k) => {
       const on = cur !== null && cur === k;
-      return `<button data-hk="${k}" class="${on ? `on ${k < 1 ? "minus" : "plus"}` : ""}" title="${on ? t("もう一度押すとレシピから外す") : t("レシピに ×{k} で足す(倍率は recipe タブで変えられる)", { k })}">${
-        on ? `${t("レシピ")} ×${k}` : t("×{k} レシピ", { k })}</button>`;
+      return `<button data-hk="${k}" class="${on ? `on ${k < 1 ? "minus" : "plus"}` : ""}" title="${on ? t("もう一度押すとレシピから外す") : t("強さ ×{k} でレシピに足す(強さはレシピのパネルで変えられる)", { k })}">${
+        on ? `${t("レシピ")} ×${k}` : t("レシピに足す(×{k})", { k })}</button>`;
     };
     const other = cur !== null && cur !== 0 && cur !== 2 ? `<span class="muted mono h-cur" title="${t("レシピの中の倍率")}">${t("レシピ")} ×${fmt(cur, 2)}</span>` : "";
     return `${b(0)}${b(2)}${other}${this.projButton(d)}`;
@@ -189,24 +190,24 @@ export class HeadPanel {
     const dirs = this.projDirections();
     const cur = this.inProj(d.layer, d.head);
     if (cur) {
-      return `<button data-hp="${esc(cur.direction || "")}" class="on minus" title="${t("もう一度押すとレシピから外す(s と方向は recipe タブで変えられる)")}">${t("レシピ")} s${fmt(cur.s, 2)} @${esc(cur.direction || "")}</button>`;
+      return `<button data-hp="${esc(cur.direction || "")}" class="on minus" title="${t("もう一度押すとレシピから外す(強さ s と方向はレシピのパネルで変えられる)")}">${t("レシピ")} s${fmt(cur.s, 2)} @${esc(cur.direction || "")}</button>`;
     }
     const want = [...(d.causal || []).map((c) => c.direction), ...d.contrasts.map((c) => c.direction)].find((x) => x && dirs.includes(x)) || dirs[0];
     if (!want) return "";
-    return `<button data-hp="${esc(want)}" title="${t("このヘッドの書き込みのうち方向 {d} に沿った成分だけを消す射影(L:Hh:s1@{d})をレシピに足す(s は recipe タブで変えられる)", { d: want })}">${t("射影 s1 レシピ")}</button>`;
+    return `<button data-hp="${esc(want)}" title="${t("このヘッドの書き込みのうち方向 {d} に沿った成分だけを消す射影(L:Hh:s1@{d})をレシピに足す(強さ s はレシピのパネルで変えられる)", { d: want })}">${t("レシピに足す(射影 s1)")}</button>`;
   }
 
   // --- Pattern -------------------------------------------------------------------------------------
   pattern(el) {
     const p = this.pat, d = this.d;
     if (d.kind !== "attn") {
-      el.innerHTML = `<p class="muted note">${t("線形注意(Gated DeltaNet など)の層には softmax の注目のパターンがありません。Details の W_O ブロックの lens と、Contrast の出力の差(out_shift・dir_cos)で見てください。")}</p>`;
+      el.innerHTML = `${noteHTML(t("線形注意(Gated DeltaNet など)の層には softmax の注目のパターンがありません。Details の W_O ブロックの lens と、Contrast の出力の差(out_shift・dir_cos)で見てください。"), "muted note")}`;
       return;
     }
     const canCmp = p.chat && !!p.system.trim();
     el.innerHTML = `
       <div class="ch-input"><textarea id="hp-text" rows="3" placeholder="${t("文章を入れて「流す」(このヘッドがどのトークンを見ているか)")}">${esc(p.text)}</textarea>
-        <button id="hp-run"${this.busy ? " disabled" : ""}>${t("流す")}</button></div>
+        <button class="main" id="hp-run"${this.busy ? " disabled" : ""}>${t("流す")}</button></div>
       <div class="ch-tools hp-opts">
         <label class="muted" title="${t("文章をユーザーの発話としてチャットテンプレートに入れる")}"><input type="checkbox" id="hp-chat"${p.chat ? " checked" : ""}> ${t("チャットの形")}</label>
         <label class="muted" title="${t("同じユーザーの発話を system あり/なしで流し、共通の末尾で注目の差を見る")}"><input type="checkbox" id="hp-compare"${p.compare ? " checked" : ""}${canCmp ? "" : " disabled"}> ${t("ペルソナあり/なしを比べる")}</label></div>
@@ -316,7 +317,7 @@ export class HeadPanel {
       return `<tr><td class="w">${esc(tokText(a.text, 24))}</td>${cell(a.last, b && b.last)}${cell(a.after, b && b.after)}</tr>`;
     }).join("");
     return `<h4>${t("トリガー区間への注目(共通部分の中の割合)")}</h4><table class="kv mono hp-trig">${head}${rows}</table>
-      <p class="muted note">${t("割合 = その行の注目のうち、トリガーのトークンへのもの(比べるときは system の部分を除いた共通部分の中で。gne heads contrast の trigger_mass と同じ分母)。最後の行 = 返事の最初のトークンを決める位置。")}</p>`;
+      ${noteHTML(t("割合 = その行の注目のうち、トリガーのトークンへのもの(比べるときは system の部分を除いた共通部分の中で。gne heads contrast の trigger_mass と同じ分母)。最後の行 = 返事の最初のトークンを決める位置。"), "muted note")}`;
   }
 
   drawHeat(cv) {
@@ -398,16 +399,16 @@ export class HeadPanel {
         const v = c[k], f = fl[k], hot = v !== null && v !== undefined && f !== undefined && (signed ? Math.abs(v) : v) > f;
         return `<tr title="${esc(tip())}"><td>${label()}</td><td class="mono ${hot ? "hot" : ""}">${v === null || v === undefined ? "—" : signed ? sgn(v, 4) : fmt(v, 4)}</td><td class="mono muted">${f === undefined ? "—" : fmt(f, 4)}</td><td class="muted">${k}</td></tr>`;
       }).join("");
-      const top = sm ? sm.rows.slice(0, 12).map((x, i) => `<tr data-go="${x.layer}:${x.head}" class="${x.layer === d.layer && x.head === d.head ? "sel" : ""}"><td>${i + 1}</td><td>L${x.layer} H${x.head}</td><td>${x.kind === "attn" ? "attn" : "linear"}</td><td>${fmt(x.z, 2)}</td><td>${fmt(x.null_pct, 2)}</td></tr>`).join("") : "";
+      const top = sm ? sm.rows.slice(0, 12).map((x, i) => `<tr data-go="${x.layer}:${x.head}" class="pick${x.layer === d.layer && x.head === d.head ? " sel" : ""}"><td>${i + 1}</td><td>L${x.layer} H${x.head}</td><td>${x.kind === "attn" ? "attn" : "linear"}</td><td>${fmt(x.z, 2)}</td><td>${fmt(x.null_pct, 2)}</td></tr>`).join("") : "";
       const samples = sm && sm.samples ? sm.samples.filter((s) => s.triggers && s.triggers.length) : [];
       return `<div class="h-con">
-        <h4><b class="mono">${esc(c.name)}</b> <span class="mono">#${c.rank}/${c.n_ranked} · z ${fmt(c.z, 2)} · null ${fmt(c.null_pct, 2)}</span>
+        <h4><b class="mono">${esc(c.name)}</b> <span class="mono">#${c.rank}/${c.n_ranked} · z ${fmt(c.z, 2)} · ${t("対照超え")} ${fmt(c.null_pct, 2)}</span>
           <button class="small" data-ov="${esc(c.name)}" title="${t("地図の板の上辺のヘッドをこの対照分析の z で色付けする")}">${t("地図で見る")}</button></h4>
         <table class="kv h-met"><tr><th>${t("指標")}</th><th>${t("値")}</th><th title="${t("中立どうし(system を別の中立の文に替えただけ)で測った同じ指標の、全ヘッドの 95% 点")}">${t("基準値(中立どうしの差の p95)")}</th><th></th></tr>${mrows}</table>
-        <p class="muted note">${t("琥珀 = 基準値を超えた指標。z = 測れた指標ごとの対照に対する z の平均、null = 対照のヘッドの何割より大きいか。")}${c.direction ? ` ${t("方向 {d}", { d: esc(c.direction) })}` : ""}</p>
+        <p class="muted note">${t("琥珀 = 基準値を超えた指標。z = 測れた指標ごとの対照に対する z の平均、対照超え = 対照のヘッドの何割より大きいか。")}${c.direction ? ` ${t("方向 {d}", { d: esc(c.direction) })}` : ""}</p>
         ${samples.length ? `<h4>${t("トリガーのある会話(Pattern で、このヘッドの注目をペルソナあり/なしで見る)")}</h4>${samples.slice(0, 8).map((s, i) =>
           `<div class="h-sample"><button class="small" data-pat="${esc(c.name)}" data-i="${i}">${t("Pattern で見る")}</button> <span class="note">${esc(s.prompt)}</span> <span class="muted mono">${s.triggers.map((x) => esc(tokText(x, 16))).join(" · ")}</span></div>`).join("")}` : ""}
-        ${top ? `<h4>${t("この対照分析の上位")}</h4><table class="rank mono h-top"><tr><th>#</th><th>${t("ヘッド")}</th><th>kind</th><th>z</th><th>null</th></tr>${top}</table>` : sm === undefined ? `<p class="muted">${t("読み込み中…")}</p>` : ""}
+        ${top ? `<h4>${t("この対照分析の上位")}</h4><table class="rank mono h-top"><tr><th>#</th><th>${t("ヘッド")}</th><th>${t("種類")}</th><th>z</th><th>${t("対照超え")}</th></tr>${top}</table>` : sm === undefined ? `<p class="muted">${t("読み込み中…")}</p>` : ""}
       </div>`;
     }).join("");
     for (const b of el.querySelectorAll("[data-ov]")) b.addEventListener("click", () => this.onOverlay(`heads:${b.dataset.ov}`));
@@ -501,7 +502,7 @@ export class HeadPanel {
           <tr><td>${t("下がり方")}</td><td class="mono" colspan="3">${drops(r)}</td></tr>${b}</table></div>`);
       }
     }
-    out.push(`<p class="muted note">${t("下がり方 = 介入の前 − 後の A 側の射影の値(正 = このヘッドが A 側の向きに押していた)。ratio > 1 は間接の経路、< 1 は補い合い。η = いまの組から s を Δs 上げたときの、効きにくい例での下がり方 ÷ Δs。")}</p>`);
+    out.push(`${noteHTML(t("下がり方 = 介入の前 − 後の A 側の射影の値(正 = このヘッドが A 側の向きに押していた)。ratio > 1 は間接の経路、< 1 は補い合い。η = いまの組から s を Δs 上げたときの、効きにくい例での下がり方 ÷ Δs。"), "muted note")}`);
     return out.join("");
   }
 
@@ -525,7 +526,7 @@ export class HeadPanel {
     const th = (key, label, tip) => `<th data-czsort="${key}" class="${cz.sort === key ? "on" : ""}" title="${esc(tip)}">${label}${cz.sort === key ? " ▾" : ""}</th>`;
     const body = rows.slice(0, 40).map((x, i) => {
       const b = x.a || x.m;
-      return `<tr data-go="${x.layer}:${x.head}" class="${x.layer === d.layer && x.head === d.head ? "sel" : ""}${x.m && x.m.excluded ? " rnd" : ""}"><td>${i + 1}</td><td>L${x.layer} H${x.head}</td>
+      return `<tr data-go="${x.layer}:${x.head}" class="pick${x.layer === d.layer && x.head === d.head ? " sel" : ""}${x.m && x.m.excluded ? " rnd" : ""}"><td>${i + 1}</td><td>L${x.layer} H${x.head}</td>
         <td>${fmt(val(x, "causal_max"), 2)}</td><td>${fmt(val(x, "causal"), 2)}</td><td>${fmt(val(x, "contrib"), 2)}</td><td>${fmt(val(x, "ratio"), 2)}</td>
         <td>${fmt(val(x, "eta"), 3)}${x.m && x.m.in_base ? "*" : ""}</td><td>${fmt(b.b_side_delta, 2)}</td><td>${fmt(b.drift_orth_b, 3)}</td></tr>`;
     }).join("");
@@ -538,7 +539,7 @@ export class HeadPanel {
         th("ratio", "ratio", t("causal ÷ 直接の寄与(表示中の測る層)"))}${th("eta", `η L${esc(k)}`, t("効率 η(marginal、表示中の測る層)。* = いまの組のヘッド"))}<th title="${t("B 側の射影の値の変化")}">B Δ</th><th title="${t("B 側の直交成分のずれ")}">B ⊥</th></tr>${body}</table></div>
       <p class="muted note">${t("見出しをクリックで並べ替え、行をクリックでそのヘッドを開く。灰色 = 配分から外したヘッド。")}</p>
       ${lrows ? `<details><summary class="muted note">${t("層単位のスクリーニング({n} 層、層のヘッドを全部止めたとき)", { n: lr.length })}</summary>
-        <table class="kv mono cz-layers"><tr><th>${t("層")}</th><th>kind</th><th>${t("ヘッド")}</th><th>causal_max</th><th>L${esc(k)}</th><th>B Δ</th><th>B ⊥</th></tr>${lrows}</table></details>` : ""}
+        <table class="kv mono cz-layers"><tr><th>${t("層")}</th><th>${t("種類")}</th><th>${t("ヘッド")}</th><th>causal_max</th><th>L${esc(k)}</th><th>B Δ</th><th>B ⊥</th></tr>${lrows}</table></details>` : ""}
       ${this.allocHTML(sm)}`;
   }
 
@@ -548,7 +549,7 @@ export class HeadPanel {
     if (!al || !(al.table || []).length) return "";
     const rows = al.table.filter((r) => !r.skipped).map((r) => `<tr class="${r.recommended ? "on" : ""}"><td>${r.n_heads}${r.recommended ? ` <span class="badge">${t("推奨")}</span>` : ""}</td>
       <td>${fmt(r.s_max, 2)}</td><td>${r.remain ?? "—"}</td><td>${fmt(r.a_max, 2)}</td><td>${fmt(r.b_drift_orth, 3)}</td><td>${fmt(r.b_side_delta, 2)}</td>
-      <td class="w">${esc((r.units || []).join(" "))}</td><td><button class="small" data-alloc="${r.n_heads}" title="${t("この組(proj のユニット)で今のレシピを置き換える")}">${t("レシピに読み込む")}</button></td></tr>`).join("");
+      <td class="w">${esc((r.units || []).join(" "))}</td><td><button class="small" data-alloc="${r.n_heads}" title="${t("この組(proj のユニット)で今のレシピを置き換える")}">${t("レシピを置き換える")}</button></td></tr>`).join("");
     return `<h4>${t("強さの配分(gne heads allocate、L{L} の射影の値を {v} まで)", { L: al.score_layer ?? "—", v: fmt(al.target, 2) })}</h4>
       <div class="cz-scroll"><table class="kv mono cz-alloc"><tr><th>${t("ヘッド数")}</th><th>s max</th><th title="${t("目標に届かず残った例の数")}">${t("残り")}</th><th title="${t("A 側の射影の値の最大")}">A max</th><th title="${t("B 側の直交成分のずれ")}">B ⊥</th><th title="${t("B 側の射影の値の変化")}">B Δ</th><th>${t("ユニット")}</th><th></th></tr>${rows}</table></div>`;
   }
@@ -572,10 +573,10 @@ export class HeadPanel {
     if (!L.system && this.pat.system) L.system = this.pat.system;
     const dirs = this.directions();
     el.innerHTML = `
-      <p class="muted note">${t("返事のトークンが、選んだヘッドで文脈のどのトークンに注目しているか。方向を選ぶと、文脈の各トークンがヘッドの出力を通してその方向にどれだけ寄与したか(注目 × ゲート × OV)も出す。")}</p>
+      ${noteHTML(t("返事のトークンが、選んだヘッドで文脈のどのトークンに注目しているか。方向を選ぶと、文脈の各トークンがヘッドの出力を通してその方向にどれだけ寄与したか(注目 × ゲート × OV)も出す。"), "muted note")}
       <textarea id="ls-system" class="hp-sys" rows="3" placeholder="${t("system(空なら system なし)")}">${esc(L.system)}</textarea>
       <div class="ch-input"><textarea id="ls-user" rows="2" placeholder="${t("ユーザーの発話")}">${esc(L.user)}</textarea>
-        <button id="ls-run"${this.busy ? " disabled" : ""}>${t("流す")}</button></div>
+        <button class="main" id="ls-run"${this.busy ? " disabled" : ""}>${t("流す")}</button></div>
       <textarea id="ls-reply" class="hp-sys" rows="2" placeholder="${t("返事(空なら greedy に作る)")}">${esc(L.reply)}</textarea>
       <div class="list-tools ls-opts">
         <label class="muted">${t("ヘッド")} <input id="ls-heads" class="mono" value="${esc(L.heads)}" spellcheck="false" title="${t("例 14:H0-3,16:H2(L:H* で層の全ヘッド)")}"></label>
@@ -668,7 +669,7 @@ export class HeadPanel {
         : t("色 = 返事の各トークンからの注目の平均(選んだヘッドの合計)。明るさ = √(値 / 文脈の最大)。")} ${t("トークンにマウスを当てるとヘッドごとの値。")}</p>
       ${layers}
       <h4>${contrib ? t("寄与の上位(文脈のトークン)") : t("注目の上位(文脈のトークン)")}</h4>
-      <table class="kv mono hp-trig"><tr><th>pos</th><th>${t("トークン")}</th><th>${t("役")}</th><th>${t("合計")}</th>${keys.map((k) => `<th>${esc(k)}</th>`).join("")}</tr>${rows}</table>
+      <table class="kv mono hp-trig"><tr><th>${tl("位置", "pos", "位置")}</th><th>${t("トークン")}</th><th>${t("役")}</th><th>${t("合計")}</th>${keys.map((k) => `<th>${esc(k)}</th>`).join("")}</tr>${rows}</table>
       <h4>${t("役ごとの合計")}</h4><table class="kv mono"><tr><th>${t("役")}</th><th>${t("注目")}</th><th>${t("寄与")}</th></tr>${role}</table>`;
     for (const b of out.querySelectorAll("[data-m]")) b.addEventListener("click", () => { L.mode = b.dataset.m; this._modeChosen = true; this.drawListen(); });
   }
@@ -677,8 +678,8 @@ export class HeadPanel {
   details() {
     const d = this.d, ll = d.logit_lens, out = [];
     out.push(`<h4>${t("大きさ")}</h4><table class="kv mono">
-      <tr><td>kind</td><td>${kindLabel(d.kind)}</td><td>n_head</td><td>${d.n_head}${d.n_head_kv ? ` / kv ${d.n_head_kv}` : ""}</td></tr>
-      <tr><td>head_dim</td><td>${d.head_dim}</td><td>${d.kind === "attn" ? "kv group" : ""}</td><td>${d.kv_group ?? ""}</td></tr>
+      <tr><td>${t("種類")}</td><td>${kindLabel(d.kind)}</td><td>n_head</td><td>${d.n_head}${d.n_head_kv ? ` / kv ${d.n_head_kv}` : ""}</td></tr>
+      <tr><td>head_dim</td><td>${d.head_dim}</td><td>${d.kind === "attn" ? t("kv の組") : ""}</td><td>${d.kv_group ?? ""}</td></tr>
       <tr><td>${t("書き込み")}</td><td colspan="3">${esc(d.writer)} [${d.block[0]}, ${d.block[1]})</td></tr></table>`);
     if (ll) {
       out.push(`<h4>${t("W_O の列ブロックの logit lens(主成分 1 本目の割合 {p})", { p: pct(ll.sv_share) })}</h4>`);
@@ -686,10 +687,10 @@ export class HeadPanel {
         out.push(`<div class="muted note mono">PC${i + 1} · σ ${fmt(c.sv, 3)}</div>
           <div class="lens"><span class="sg plus">+</span>${toksHTML(c.up_tokens)}</div><div class="lens"><span class="sg minus">−</span>${toksHTML(c.down_tokens)}</div>`);
       });
-      out.push(`<p class="muted note">${t("このヘッドが残差に書ける向き(W_O の列ブロック)を特異値分解し、主成分を出力層に通したときに上がる語(+)と下がる語(−)。主成分の符号は任意なので、+ と − は入れ替わりうる。")}</p>`);
+      out.push(`${noteHTML(t("このヘッドが残差に書ける向き(W_O の列ブロック)を特異値分解し、主成分を出力層に通したときに上がる語(+)と下がる語(−)。主成分の符号は任意なので、+ と − は入れ替わりうる。"), "muted note")}`);
     } else out.push(`<h4>W_O logit lens</h4><p class="muted">${t("計算中…")}</p>`);
     out.push(d.gain_k && d.gain_k.length ? `<p class="muted note mono">${t("当てたことのある gain")}: ${d.gain_k.map((k) => `×${fmt(k, 2)}`).join(" ")}</p>`
-      : `<p class="muted note">${t("このヘッドの gain はまだ当てていません(上の「×0 レシピ」「×2 レシピ」から 3 列チャットや eval で試せます)")}</p>`);
+      : `${noteHTML(t("このヘッドの gain はまだ当てていません(上の「×0 レシピ」「×2 レシピ」から 3 列チャットや eval で試せます)"), "muted note")}`);
     return out.join("");
   }
 }

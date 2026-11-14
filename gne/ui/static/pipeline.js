@@ -9,6 +9,8 @@
 import { getJSON } from "./api.js";
 import { LANG, t } from "./i18n.js";
 import { esc } from "./panels.js";
+import { Steps } from "./steps.js";
+import { noteHTML, askConfirm } from "./ui.js";
 
 const fmt = (x, d = 2) => (x === null || x === undefined || !Number.isFinite(+x) ? "—" : (+x).toFixed(d));
 const sgn = (x, d = 2) => (x === null || x === undefined || !Number.isFinite(+x) ? "—" : `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(d)}`);
@@ -119,7 +121,7 @@ export class PipelinePanel {
     this.onShowDirection = onShowDirection || (() => {});   // (名前) → 上の「方向を見る」でその方向を開く
     this.onOpenHead = onOpenHead || (() => {});   // ({ layer, head, tab }) → HEAD パネル
     this.onLoadProj = onLoadProj || (() => {});   // (名前, ["L:Hh:sS@NAME"], 方向) → レシピを置き換える
-    this.onEval = onEval || (() => {});           // (params) → ジョブ eval
+    this.onEval = onEval || (() => {});           // (params, 名前) → 評価の画面へ送る(そこで設定を見て、変えて、始める)
     this.onOverlay = onOverlay || (() => {});     // (field) → 地図の色(causal:<name>)
     this.onOpenCandidates = onOpenCandidates || (() => {});   // (名前) → 「強さの候補」で開く
     this.list = [];
@@ -132,26 +134,30 @@ export class PipelinePanel {
                 judge_b: false, qa: "", qb: "", with_recipe: "" };   // 「候補を作る」の欄(結果を開き直しても残す)
     this.lastPipe = null;                        // 最後に欄に入れた spec の pipeline(変わったときだけ設定の欄を書き換える)
     root.innerHTML = `
-      <p class="muted note pp-help">${t("1 つの JSON(対照集合と同じ中身)から、方向 → 基準層 → 因果スクリーニング → 強さの配分 を 1 回のジョブで回します。A と B は system_a / system_b(system の文)か recipe_a / recipe_b(レシピの名前・パス・ユニットのリスト)で作ります。片側の system を省くと system なしで読ませます。")}</p>
+      <div id="pp-input">
+      ${noteHTML(t("1 つの JSON(対照集合と同じ中身)から、方向 → 基準層 → 因果スクリーニング → 強さの配分 を 1 回のジョブで回します。A と B は system_a / system_b(system の文)か recipe_a / recipe_b(レシピの名前・パス・ユニットのリスト)で作ります。片側の system を省くと system なしで読ませます。"))}
       <div class="pp-in">
         <label class="muted">${t("JSON ファイル")} <input type="file" id="pp-file" accept=".json,application/json"></label>
         <label class="muted" title="${t("用途別のテンプレート(configs/pipeline/)。選ぶと入力欄に入る")}">${t("ひな形")}
-          <select id="pp-tpl-sel"><option value="small">${t("小さな例(海賊、system を両側に)")}</option></select></label>
-        <button class="small" id="pp-tpl" title="${t("選んだひな形を入力欄に入れる")}">${t("入れる")}</button>
+          <select id="pp-tpl-sel"><option value="">${t("(ひな形を選ぶ)")}</option><option value="small">${t("小さな例(海賊、system を両側に)")}</option></select></label>
         <span class="muted note">${t("または下に貼り付け")}</span></div>
       <div id="pp-tpl-about" class="muted note"></div>
       <textarea id="pp-text" class="mono" rows="9" spellcheck="false" placeholder='{"name": "…", "system_a": "…", "system_b": "…", "user_prompts": ["…", "…", "…", "…"]}'></textarea>
       <div id="pp-check" class="note"></div>
+      </div>
+      <div id="pp-shared"><p class="stage-shared-h">${t("共通の設定(方向とヘッドを作る が使う)")}</p>
       <div class="pp-set">
-        <label class="muted" title="${t("配分で A 側の射影の値をここまで下げる(射影の値を測る最後の層)。数か、B(B 側の平均まで = 消し切る)。空なら A と B の平均の真ん中(半分ほど消す)")}">${t("目標")} <input id="pp-target" size="7" placeholder="${t("真ん中")}" spellcheck="false"></label>
+        <label class="muted" title="${t("配分で A 側の射影の値をここまで下げる(射影の値を測る最後の層)。数か、B(B 側の平均まで = 消し切る)。空なら A と B の平均の真ん中(半分ほど消す)")}">${t("射影の目標")} <input id="pp-target" size="7" placeholder="${t("真ん中")}" spellcheck="false"></label>
         <label class="muted" title="${t("比べる組のヘッドの数(カンマ区切り)。少ない組ほど 1 ヘッドの強さが大きくなる")}">${t("ヘッド数")} <input id="pp-nheads" size="8" value="${DEFAULTS.n_heads}" spellcheck="false"></label>
-        <label class="muted" title="${t("射影の値を測る段(基準層・因果・配分)で使う質問の数(等間隔に間引く)。方向づくりには全部使う")}">max_examples <input id="pp-mx" type="number" min="4" max="4096" value="${DEFAULTS.max_examples}"></label>
-        <label class="muted" title="${t("方向を作る位置。last = 質問の最後のトークン、response = 返事を書かせてその位置(遅い)")}">positions <select id="pp-pos"><option>last</option><option>response</option></select></label>
-        <label class="muted" title="${t("層ごとのスクリーニングのあと、ヘッドを 1 個ずつ止めて測る層の数")}">top_layers <input id="pp-tl" type="number" min="1" max="64" value="${DEFAULTS.top_layers}"></label>
-        <label class="muted" title="${t("効率を測るときの、射影の値が残りやすい質問の数")}">hard <input id="pp-hard" type="number" min="1" max="1024" value="${DEFAULTS.hard}"></label>
+        <label class="muted" title="${t("射影の値を測る段(基準層・因果・配分)で使う質問の数(等間隔に間引く)。方向づくりには全部使う")}">${t("測る質問の数")} <input id="pp-mx" type="number" min="4" max="4096" value="${DEFAULTS.max_examples}"></label>
+        <label class="muted" title="${t("方向を作る位置。last = 質問の最後のトークン、response = 返事を書かせてその位置(遅い)")}">${t("方向を作る位置")} <select id="pp-pos"><option value="last">${t("質問の最後")}</option><option value="response">${t("返事(遅い)")}</option></select></label>
+        <label class="muted" title="${t("層ごとのスクリーニングのあと、ヘッドを 1 個ずつ止めて測る層の数")}">${t("ヘッドを測る層の数")} <input id="pp-tl" type="number" min="1" max="64" value="${DEFAULTS.top_layers}"></label>
+        <label class="muted" title="${t("効率を測るときの、射影の値が残りやすい質問の数")}">${t("残りやすい質問の数")} <input id="pp-hard" type="number" min="1" max="1024" value="${DEFAULTS.hard}"></label>
         <label class="muted" title="${t("同じ JSON・同じ設定で作り済みの方向と因果の結果があっても使い回さず、最初から作り直す(止めて流し直すときは外したままにすると配分からやり直せる)")}"><input type="checkbox" id="pp-fresh"> ${t("最初から作り直す")}</label></div>
-      <div class="pp-go"><button id="pp-go" disabled>${t("方向とヘッドを作る")}</button> <span class="muted note" id="pp-status"></span></div>
-      <h4>${t("これまでの実行")}</h4><div id="pp-past"><p class="muted note">${t("読み込み中…")}</p></div>
+      </div>
+      <div class="pp-go" id="pp-run"><button class="main" id="pp-go" disabled>${t("方向とヘッドを作る")}</button> <span class="muted note" id="pp-status"></span></div>
+      <div id="pp-past-wrap"><div id="pp-past"><p class="muted note">${t("読み込み中…")}</p></div></div>
+      <p class="muted note" id="pp-nores">${t("まだ結果がありません。「1. 対照の文」で「方向とヘッドを作る」を押すか、「これまでの実行」から開いてください。")}</p>
       <div id="pp-result"></div>`;
     this.$ = (s) => root.querySelector(s);
     const ta = this.$("#pp-text");
@@ -167,7 +173,6 @@ export class PipelinePanel {
     this.templates = [];                         // 用途別のテンプレート(/api/pipeline-templates)
     this.tplText = null;                         // 最後に入れたひな形の文字列(書き換えていなければ確かめずに差し替える)
     const sel = this.$("#pp-tpl-sel");
-    this.$("#pp-tpl").addEventListener("click", () => this.insertTemplate(sel.value, false));
     sel.addEventListener("change", () => this.insertTemplate(sel.value, true));
     getJSON("/api/pipeline-templates").then((list) => {
       this.templates = Array.isArray(list) ? list : [];
@@ -179,22 +184,51 @@ export class PipelinePanel {
       }
     }).catch(() => { /* テンプレートが無くても小さな例は使える */ });
     this.$("#pp-go").addEventListener("click", () => this.run());
+    // 左に手順、右に選んだ手順。結果は 1 回のジョブ(方向とヘッドを作る)の段ごとに分けて見せる
+    const res = (sel) => () => (this.data ? [this.$("#pp-result .pp-res-head"), ...this.$$(`#pp-result ${sel}`)] : [this.$("#pp-nores")]);
+    this.steps = new Steps(root, {
+      shared: this.$("#pp-shared"), store: "gne.chips.step", label: t("CHiPS の手順"),
+      steps: [{ key: "input", label: t("1. 対照の文"), els: () => [this.$("#pp-input"), this.$("#pp-run")], shared: true },
+              { key: "dir", label: t("2. 方向と基準層"), els: res("section.pp-stage:nth-of-type(1)") },
+              { key: "causal", label: t("3. 効くヘッドを探す"), els: res("section.pp-stage:nth-of-type(2)") },
+              { key: "alloc", label: t("4. 配り方を決める"), els: res("section.pp-stage:nth-of-type(3), section.pp-stage:nth-of-type(4)") },
+              { key: "cand", label: t("5. 強さの候補を作る"), els: res(".pp-cand") },
+              { key: "past", label: t("これまでの実行"), els: () => [this.$("#pp-past-wrap")], sep: true }],
+    });
+    const check = this.check.bind(this);                            // 入力を確かめるたびに 1. の印も付け直す
+    this.check = (...a) => { const r = check(...a); this.marks(); return r; };
     this.check();
+  }
+
+  $$(s) { return [...this.root.querySelectorAll(s)]; }
+
+  // 手順の印(済・実行中・まだ)
+  marks() {
+    if (!this.steps) return;
+    const run = (id) => !!(id && !(this.endedJobs || new Set()).has(id));
+    const d = this.data, pipe = run(this.jobId) || run(this.refineJobId);
+    const m = (k, running, done) => this.steps.mark(k, running ? "run" : done ? "done" : "todo");
+    m("input", false, !this.$("#pp-go").disabled);
+    m("dir", pipe, !!(d && d.direction));
+    m("causal", pipe, !!(d && d.causal));
+    m("alloc", pipe, !!(d && d.allocate));
+    m("cand", run(this.candJobId), !!this.candSaved);
   }
 
   status(s, err = false) { const el = this.$("#pp-status"); el.textContent = s; el.classList.toggle("err", err); }
 
   // ひな形を入力欄に入れる(key = "small" か configs/pipeline/ のファイル名)。選び直したときは、書きかけの JSON を消す前に確かめる
-  insertTemplate(key, ask) {
+  async insertTemplate(key, ask) {
+    if (!key) return;
     const ta = this.$("#pp-text"), about = this.$("#pp-tpl-about");
     const x = this.templates.find((y) => y.file === key);
     const spec = x ? x.spec : TEMPLATE;
     const cur = ta.value.trim();
-    if (ask && cur && cur !== this.tplText && !window.confirm(t("入力欄の JSON をひな形で置き換えます。よいですか?"))) return;
+    if (ask && cur && cur !== this.tplText && !(await askConfirm(t("入力欄の JSON をひな形で置き換えます。よいですか?")))) return;
     ta.value = JSON.stringify(spec, null, 2);
     this.tplText = ta.value.trim();
     const a = x ? (x[LANG] && x[LANG].text) || (x.ja && x.ja.text) || "" : "";
-    about.textContent = a;
+    about.innerHTML = noteHTML(esc(a), "");                         // 長い説明は最初の文だけ見せて、全文はたたむ
     about.title = x ? `configs/pipeline/${x.file}` : "";
     this.check();
   }
@@ -256,6 +290,7 @@ export class PipelinePanel {
       if (!j) this.status(t("やめました"));
       else {
         this.jobId = j.id;
+        this.marks();
         this.status(t("ジョブを投げました。進み具合は下のジョブのバーに出ます(終わるとここに結果を出します)"));
       }
     } catch (e) { this.status(`${t("エラー")}: ${e.message}`, true); }
@@ -268,6 +303,7 @@ export class PipelinePanel {
       const j = await this.onRun("heads_refine", { name, n_heads: nHeads });
       if (!j) return;
       this.refineJobId = j.id;
+      this.marks();
       if (btn) { btn.textContent = t("探しています…"); btn.disabled = true; }
       this.status(t("{n} ヘッドの組で残った質問から、追加のヘッドを探すジョブを投げました(終わると新しい結果を開きます)", { n: nHeads }));
     } catch (e) { this.status(`${t("エラー")}: ${e.message}`, true); }
@@ -282,14 +318,16 @@ export class PipelinePanel {
       { base: esc(r.base), n: r.n_heads, k: rm.n ?? "—", nA: rm.n_a ?? "—" })}${rm.padded ? ` ${t("(残りが少ないので、射影の値の高い順に {u} 問で作りました)", { u: rm.used })}` : ""}</p>
       ${c ? `<p><b>${t("元の組と合わせた組({m} ヘッド)", { m: c.n_heads })}</b>${c.chosen_by === "fewest_remaining" ? ` <span class="muted">${t("(目標に届いた組が無いので、合わせた残りが最も少ない組)")}</span>` : ""}: ${t("残り {a} → {b} 問", { a: c.remain_before, b: c.remain_after })} ·
         ${t("A 平均 {a} → {b}", { a: fmt(c.a_mean_before, 2), b: fmt(c.a_mean_after, 2) })} · ${t("B ⊥ {a} → {b}", { a: fmt(c.b_drift_orth_base, 3), b: fmt(c.b_drift_orth, 3) })}
-        <button class="small" id="pp-rf-load" title="${t("元の組と追加の組を合わせたユニットで今のレシピを置き換える")}">${t("合わせた組をレシピに読み込む")}</button>
-        <button class="small" id="pp-rf-eval" title="${t("合わせた組のレシピで eval を投げる(倍率 0 と 1、ランダムな対照 8 本)")}">${t("合わせた組で eval する")}</button></p>`
+        <button class="small" id="pp-rf-load" title="${t("元の組と追加の組を合わせたユニットで今のレシピを置き換える")}">${t("合わせた組でレシピを置き換える")}</button>
+        <button class="small" id="pp-rf-eval" title="${t("合わせた組のレシピを評価の画面へ送る(強さ 0 と 1、ランダムな向きの比べる用 8 本が入る。始める前に変えられる)")}">${t("合わせた組を評価へ送る")}</button></p>`
         : `<p class="muted">${t("追加の組を作れなかったので、合わせた組はありません。")}</p>`}
       <p class="muted">${t("下の比較表の「元の組と合わせて読み込む」「合わせて eval する」は、どの行も元の組とその行の組を合わせて使います(追加の組は元の組を当てた状態で探したので、単独では使いません)。")}</p></div>`;
   }
 
   // app.js の onJobFinished から(このパネルで投げたものでなくても一覧は取り直す)
   async jobEnded(j) {
+    (this.endedJobs || (this.endedJobs = new Set())).add(j.id);
+    this.marks();
     const mine = j.id === this.jobId || (j.kind === "heads_refine" && j.id === this.refineJobId);
     if (j.status === "done") {
       const name = j.result && j.result.name;
@@ -306,7 +344,7 @@ export class PipelinePanel {
     const el = this.$("#pp-past");
     if (!this.list.length) { el.innerHTML = `<p class="muted note">${t("まだありません")}</p>`; return; }
     el.innerHTML = `<table class="evx mono pp-past"><thead><tr><th class="l">${t("名前")}</th><th>${t("質問")}</th><th>${t("推す組")}</th><th>${t("目標")}</th><th>${t("時間")}</th><th class="l">${t("更新")}</th></tr></thead><tbody>${
-      this.list.map((x) => `<tr data-pp="${esc(x.name)}" class="${this.data && this.data.name === x.name ? "on" : ""}"><td class="l">${esc(x.name)}</td><td>${x.n_prompts ?? "—"}</td>
+      this.list.map((x) => `<tr data-pp="${esc(x.name)}" class="pick${this.data && this.data.name === x.name ? " on" : ""}"><td class="l">${esc(x.name)}</td><td>${x.n_prompts ?? "—"}</td>
         <td>${x.recommended ? t("{n} ヘッド", { n: x.recommended.n_heads }) : "—"}</td><td>${fmt(x.target, 2)}</td><td>${x.seconds ? t("{n} 秒", { n: Math.round(x.seconds) }) : "—"}</td>
         <td class="l">${esc((x.updated || "").replace("T", " ").slice(0, 16))}</td></tr>`).join("")}</tbody></table>`;
     for (const tr of el.querySelectorAll("tr[data-pp]")) tr.addEventListener("click", () => this.open(tr.dataset.pp));
@@ -326,18 +364,24 @@ export class PipelinePanel {
     this.candSaved = cl.some((x) => x.name === name);
     this.data = d;
     this.causal = c;
+    if (this.steps && ["input", "past"].includes(this.steps.current)) this.steps.select("dir");
     for (const tr of this.$("#pp-past").querySelectorAll("tr[data-pp]")) tr.classList.toggle("on", tr.dataset.pp === name);
     this.render();
   }
 
   render() {
+    this._render();
+    if (this.steps) { this.steps.apply(); this.marks(); }
+  }
+
+  _render() {
     const d = this.data, out = this.$("#pp-result");
     if (!d) { out.innerHTML = ""; return; }
     const sides = d.sides || {};
     const side = (x) => (x ? [x.recipe ? (Array.isArray(x.recipe) ? t("レシピ(ユニット {n} 個: {u})", { n: x.recipe.length, u: x.recipe.slice(0, 3).join(", ") })
       : typeof x.recipe === "object" ? t("レシピ(表)") : t("レシピ {r}", { r: x.recipe })) : null, x.system ? `system「${short(x.system)}」` : t("system なし")].filter(Boolean).join(" + ") : "—");
     out.innerHTML = `
-      <div class="pp-res">
+      <div class="pp-res"><div class="pp-res-head">
       <h3>${t("{name} の結果", { name: esc(d.name) })} <span class="muted note mono">${esc((d.updated || "").replace("T", " ").slice(0, 16))} · ${t("{n} 秒", { n: Math.round(d.seconds || 0) })}</span></h3>
       <p class="note">${t("質問 {n} 個", { n: d.n_prompts ?? "—" })} · A: ${esc(side(sides.A))} · B: ${esc(side(sides.B))}</p>
       ${this.refineNote(d)}
@@ -348,7 +392,8 @@ export class PipelinePanel {
       <div class="pp-actions"><button class="small" id="pp-showdir" title="${t("上の「方向を見る」で、この方向の層ごとの射影の値と分布を見る")}">${t("方向を見る")}</button>
         <button class="small" id="pp-map" title="${t("地図の板の上辺のヘッドを、止めたときの下がり方で色付けする")}">${t("地図: 効き")}</button>
         ${d.spec ? `<button class="small" id="pp-respec" title="${t("この実行に使った JSON を入力欄に戻す(設定を変えて流し直すため)")}">${t("入力欄に戻す")}</button>` : ""}</div>
-      ${this.stage1(d)}${this.stage2(d)}${this.stage3(d)}${this.stage4(d)}</div>`;
+      </div>${this.stage1(d)}${this.stage2(d)}${this.stage3(d)}${this.stage4(d)}
+      ${this.candForm(d) || `<div class="pp-cand"><p class="muted note">${t("この実行には、候補を作れる組がありません(4. の組がどれも作れていない)。")}</p></div>`}</div>`;
     const $ = (s) => out.querySelector(s);
     $("#pp-showdir").addEventListener("click", () => this.onShowDirection(d.name));
     $("#pp-map").addEventListener("click", () => this.onOverlay(`causal:${d.name}`));
@@ -385,21 +430,13 @@ export class PipelinePanel {
     const rf = d.refine && d.refine.combined;
     const rl = $("#pp-rf-load"), re = $("#pp-rf-eval");
     if (rf && rl) rl.addEventListener("click", () => this.onLoadProj(`${d.name}-combined`, rf.units, d.name));
-    if (rf && re) {
-      re.addEventListener("click", () => {
-        this.onEval({ recipe: rf.recipe, doses: [0, 1], random_controls: 8 });
-        re.textContent = t("eval を投げました");
-        re.disabled = true;
-      });
-    }
+    if (rf && re) re.addEventListener("click", () => this.onEval({ recipe: rf.recipe, doses: [0, 1], random_controls: 8 }, `${d.name}-combined`));
     for (const b of out.querySelectorAll("[data-eval]")) {
       b.addEventListener("click", () => {
         const r = table.find((x) => String(x.n_heads) === b.dataset.eval);
         if (!r || !r.recipe) return;
         const c = crow(b.dataset.eval);
-        this.onEval({ recipe: c ? c.recipe : r.recipe, doses: [0, 1], random_controls: 8 });
-        b.textContent = t("eval を投げました");
-        b.disabled = true;
+        this.onEval({ recipe: c ? c.recipe : r.recipe, doses: [0, 1], random_controls: 8 }, c ? `${d.name}-n${c.n_new}-combined` : `${d.name}-n${r.n_heads}`);
       });
     }
   }
@@ -410,19 +447,19 @@ export class PipelinePanel {
     if (!ok) return "";
     const sp = [["llama_server", t("llama-server の既定")], ["common", t("よく使う設定")], ["greedy", "greedy"]];
     return `<div class="pp-cand"><h4 class="pp-sub">${t("強さの候補を作る(名前を伏せて採点する)")}</h4>
-      <p class="muted note">${t("比較表の組それぞれに全体の倍率を何段か掛けて、A 側(振る舞いが出ている状態)と B 側(ふつうの状態)で返事を作ります。正の倍率は A 側で振る舞いを消す向き(A 側の返事を採点)、負の倍率は符号を返して B 側で強める向き(B 側の返事を採点)。無介入(base)は必ず入ります。どの候補の返事か伏せて採点し、候補ごとに集計します。調整に使っていない質問で作ると、強さを決めるのに使えます。")}</p>
+      ${noteHTML(t("比較表の組それぞれに全体の倍率を何段か掛けて、A 側(振る舞いが出ている状態)と B 側(ふつうの状態)で返事を作ります。正の倍率は A 側で振る舞いを消す向き(A 側の返事を採点)、負の倍率は符号を返して B 側で強める向き(B 側の返事を採点)。無介入(base)は必ず入ります。どの候補の返事か伏せて採点し、候補ごとに集計します。調整に使っていない質問で作ると、強さを決めるのに使えます。"), "muted note")}
       <div class="pp-set">
-        <label class="muted" title="${t("カンマ区切り。正 = A 側で消す向き、負 = B 側で強める向き。0 は使えない(無介入は base)")}">${t("倍率")} <input id="pc-scales" size="16" value="${esc(f.scales)}" spellcheck="false"></label>
+        <label class="muted" title="${t("カンマ区切り。正 = A 側で消す向き、負 = B 側で強める向き。0 は使えない(無介入は base)")}">${t("強さ")} <input id="pc-scales" size="16" value="${esc(f.scales)}" spellcheck="false"></label>
         <label class="muted" title="${t("比較表のどの組を使うか(ヘッド数、カンマ区切り)。空なら全部")}">${t("組(ヘッド数)")} <input id="pc-nheads" size="6" value="${esc(f.n_heads)}" placeholder="${t("全部")}" spellcheck="false"></label>
-        <label class="muted" title="${t("各側の質問の数の上限(多ければ等間隔に間引く)")}">max_prompts <input id="pc-mp" type="number" min="1" max="1000" value="${f.max_prompts}"></label>
-        <label class="muted" title="${t("返事の長さの上限(トークン)")}">max_tokens <input id="pc-mt" type="number" min="1" max="2048" value="${f.max_tokens}"></label>
+        <label class="muted" title="${t("各側の質問の数の上限(多ければ等間隔に間引く)")}">${t("質問の数")} <input id="pc-mp" type="number" min="1" max="1000" value="${f.max_prompts}"></label>
+        <label class="muted" title="${t("返事の長さの上限(トークン)")}">${t("返事の長さ")} <input id="pc-mt" type="number" min="1" max="2048" value="${f.max_tokens}"></label>
         <label class="muted" title="${t("全部の候補(無介入も)で同じ種を使うので、違いは介入だけになる")}">${t("サンプリング")} <select id="pc-sp">${sp.map(([k, l]) => `<option value="${k}"${f.sampling === k ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
-        <label class="muted">seed <input id="pc-seed" type="number" min="0" value="${f.seed}"></label>
+        <label class="muted">${t("種")} <input id="pc-seed" type="number" min="0" value="${f.seed}"></label>
         <label class="muted" title="${t("全部の候補の両側の返事を採点する(既定は、消す向きは A 側、強める向きは B 側だけ)")}"><input type="checkbox" id="pc-jb"${f.judge_b ? " checked" : ""}> ${t("両側を採点する")}</label></div>
       <div class="pp-cand-q"><textarea id="pc-qa" rows="4" spellcheck="false" placeholder="${t("A 側の質問(調整に使っていないもの。1 行に 1 つ。空なら対照集合の質問)")}">${esc(f.qa)}</textarea>
         <textarea id="pc-qb" rows="4" spellcheck="false" placeholder="${t("B 側の質問(空なら A と同じ質問)")}">${esc(f.qb)}</textarea></div>
       <div class="pp-set"><label class="muted" title="${t("全部の候補(無介入も)に重ねるレシピ(ニューロンの種火など)。保存したレシピの名前か .yaml のパス")}">${t("重ねるレシピ")} <input id="pc-with" size="28" value="${esc(f.with_recipe)}" placeholder="${t("なし")}" spellcheck="false"></label></div>
-      <div class="pp-go"><button id="pc-go">${t("候補を作る")}</button>${this.candSaved ? ` <button class="small" id="pc-open">${t("保存した候補を開く")}</button>` : ""} <span class="muted note" id="pc-status">${esc(this.candStatus || "")}</span></div></div>`;
+      <div class="pp-go"><button class="main" id="pc-go">${t("候補を作る")}</button>${this.candSaved ? ` <button class="small" id="pc-open">${t("保存した候補を開く")}</button>` : ""} <span class="muted note" id="pc-status">${esc(this.candStatus || "")}</span></div></div>`;
   }
 
   wireCand(out, d) {
@@ -474,13 +511,15 @@ export class PipelinePanel {
     try {
       const j = await this.onRun("heads_candidates", p);
       if (!j) this.candStatusSet(t("やめました"));
-      else { this.candJobId = j.id; this.candStatusSet(t("ジョブを投げました。進み具合は下のジョブのバーに出ます(終わると「強さの候補」で開きます)")); }
+      else { this.candJobId = j.id; this.marks(); this.candStatusSet(t("ジョブを投げました。進み具合は下のジョブのバーに出ます(終わると「強さの候補」で開きます)")); }
     } catch (e) { this.candStatusSet(`${t("エラー")}: ${e.message}`, true); }
   }
 
   // direction.js から(heads_candidates のジョブが終わった)
   candJobEnded(j) {
     if (j.id !== this.candJobId) return;
+    (this.endedJobs || (this.endedJobs = new Set())).add(j.id);
+    setTimeout(() => this.marks());
     if (j.status === "done") { this.candSaved = true; this.candStatusSet(t("できました({s} 秒)", { s: fmt(j.seconds, 0) })); }
     else this.candStatusSet(j.status === "error" ? `${t("失敗")}: ${(j.error && j.error.message) || ""}` : t("止めました"), j.status === "error");
   }
@@ -489,7 +528,7 @@ export class PipelinePanel {
   stage1(d) {
     const sc = d.score || {}, dir = d.direction || {}, nr = dir.n_rows || {};
     return `<section class="pp-stage"><h4>${t("1. 方向と基準層")}</h4>
-      <p class="muted note">${t("A と B で同じ質問を読ませ、層ごとに残差の平均の差を方向にします(質問は全部使う)。cohen_d は、A と B の射影の値(残差 · 方向)がどれだけ離れているか。いちばん離れる層を基準層として記録します。")}</p>
+      ${noteHTML(t("A と B で同じ質問を読ませ、層ごとに残差の平均の差を方向にします(質問は全部使う)。cohen_d は、A と B の射影の値(残差 · 方向)がどれだけ離れているか。いちばん離れる層を基準層として記録します。"), "muted note")}
       <p class="note mono">${t("基準層")} <b>L${sc.base_layer ?? "—"}</b> · ${t("cohen_d 最大")} L${sc.best_layer ?? "—"} · positions ${esc(dir.positions || "—")} · ${t("方向を作った例")} A ${nr.A ?? "—"} / B ${nr.B ?? "—"} · ${
         t("射影の値を測った例")} A ${(sc.n || {}).A ?? "—"} / B ${(sc.n || {}).B ?? "—"}</p>
       ${dChart(sc.layers, sc.base_layer, sc.best_layer)}
@@ -513,7 +552,7 @@ export class PipelinePanel {
       <td>${fmt(r.contrib, 2)}</td><td>${fmt(r.ratio, 2)}</td><td>${sgn(r.b_side_delta, 2)}</td><td>${fmt(r.drift_orth_b, 3)}</td><td class="l">${why(r)}</td></tr>`).join("");
     const slh = SL.map((L) => `<th title="${t("止めたときの、L{L} での A 側の射影の値の下がり方", { L })}">L${L}${L === P ? "*" : ""}</th>`).join("");
     return `<section class="pp-stage"><h4>${t("2. 因果スクリーニング")}</h4>
-      <p class="muted note">${t("層ごとにその層のヘッドを全部止め、後ろの層(射影の値を測る層)で A 側の射影の値がどれだけ下がるかを測って、よく下がる層を選びます(top_layers = {k})。止めると中立の入力(B 側)の残差まで大きく動く層とヘッドは、効いているのではなくモデルを壊しているだけなので外します。選んだ層のヘッドを 1 個ずつ止めて、同じように下がり方(因果の効き目)を測ります。", { k: k ?? "—" })}</p>
+      ${noteHTML(t("層ごとにその層のヘッドを全部止め、後ろの層(射影の値を測る層)で A 側の射影の値がどれだけ下がるかを測って、よく下がる層を選びます(top_layers = {k})。止めると中立の入力(B 側)の残差まで大きく動く層とヘッドは、効いているのではなくモデルを壊しているだけなので外します。選んだ層のヘッドを 1 個ずつ止めて、同じように下がり方(因果の効き目)を測ります。", { k: k ?? "—" }), "muted note")}
       <p class="note mono">${t("射影の値を測る層")} ${SL.map((L) => (L === P ? `<b>L${L}</b>` : `L${L}`)).join(" ")} · ${t("測った例")} A ${c.n_a ?? "—"} / B ${c.n_b ?? "—"} · ${t("ヘッドの行 {n}", { n: c.n_rows ?? "—" })} · ${
         t("ヘッドを測った層")} ${[...measured].sort((a, b) => a - b).map((L) => `L${L}`).join(", ") || "—"}${broke.length ? ` · ${t("外した層")} ${broke.map((r) => `L${r.layer}`).join(", ")}` : ""}</p>
       <h4 class="pp-sub">${t("止めたときの下がり方が大きいヘッド(上位 {n})", { n: (c.top || []).length })}</h4>
@@ -528,7 +567,7 @@ export class PipelinePanel {
   // 3. 最初の比率
   stage3(d) {
     const a = d.allocate || {}, init = a.initial;
-    const intro = `<p class="muted note">${t("前の段の因果の効き目(ヘッドを 1 個ずつ止めたときに、後ろの層の射影の値がどれだけ下がるか)が大きいヘッドを選び、強さはこの効き目に比例させます。全体の大きさ α だけを、返事を書かせずに測る射影の値が目標に届くよう二分探索で決めます。")}</p>`;
+    const intro = `${noteHTML(t("前の段の因果の効き目(ヘッドを 1 個ずつ止めたときに、後ろの層の射影の値がどれだけ下がるか)が大きいヘッドを選び、強さはこの効き目に比例させます。全体の大きさ α だけを、返事を書かせずに測る射影の値が目標に届くよう二分探索で決めます。"), "muted note")}`;
     if (!init) return `<section class="pp-stage"><h4>${t("3. 最初の比率")}</h4>${intro}<p class="muted note">${t("(この実行には最初の組がありません)")}</p></section>`;
     const us = (init.heads || []).map(parseUnit).filter(Boolean);
     const mx = Math.max(1e-9, ...us.map((u) => u.s));
@@ -564,13 +603,13 @@ export class PipelinePanel {
         <td>${fmt(r.s_max, 2)}</td><td>${r.remain ?? "—"}${nA ? ` / ${nA}` : ""}</td><td>${fmt(r.a_max, 2)}</td><td>${fmt(r.a_mean, 2)}</td><td>${sgn(r.b_side_delta, 2)}</td><td>${fmt(r.b_drift_orth, 3)}</td>
         <td class="${r.reached ? "ok" : "ng"}">${r.reached ? "✓" : "×"}</td>
         <td class="l">${crow(r.n_heads) ? `<div class="muted note">${t("元の組と合わせると: 残り {a} → {b} 問 · B ⊥ {c}", { a: crow(r.n_heads).remain_before, b: crow(r.n_heads).remain_after, c: fmt(crow(r.n_heads).b_drift_orth, 3) })}</div>` : ""}
-          <button class="small" data-load="${r.n_heads}" title="${crow(r.n_heads) ? t("元の組とこの組を合わせたユニットで今のレシピを置き換える(この組は元の組を当てた状態で探したので、単独では使わない)") : t("この組(proj のユニット)で今のレシピを置き換える")}">${crow(r.n_heads) ? t("元の組と合わせて読み込む") : t("レシピに読み込む")}</button>
-          <button class="small" data-eval="${r.n_heads}" title="${crow(r.n_heads) ? t("元の組とこの組を合わせたレシピで eval を投げる(倍率 0 と 1、ランダムな対照 8 本)") : t("この組のレシピで eval を投げる(倍率 0 と 1、ランダムな対照 8 本)")}"${r.recipe ? "" : " disabled"}>${crow(r.n_heads) ? t("合わせて eval する") : t("eval する")}</button>
+          <button class="small" data-load="${r.n_heads}" title="${crow(r.n_heads) ? t("元の組とこの組を合わせたユニットで今のレシピを置き換える(この組は元の組を当てた状態で探したので、単独では使わない)") : t("この組(proj のユニット)で今のレシピを置き換える")}">${crow(r.n_heads) ? t("元の組と合わせてレシピを置き換える") : t("レシピを置き換える")}</button>
+          <button class="small" data-eval="${r.n_heads}" title="${crow(r.n_heads) ? t("元の組とこの組を合わせたレシピを評価の画面へ送る(強さ 0 と 1、ランダムな向きの比べる用 8 本が入る。始める前に変えられる)") : t("この組のレシピを評価の画面へ送る(強さ 0 と 1、ランダムな向きの比べる用 8 本が入る。始める前に変えられる)")}"${r.recipe ? "" : " disabled"}>${crow(r.n_heads) ? t("合わせて評価へ送る") : t("評価へ送る")}</button>
           <button class="small" data-refine="${r.n_heads}" title="${t("この組を当てても目標まで下がらない質問(残り)だけで、組を当てたまま方向を作り直し、因果 → 配分で足すヘッドを探す。結果は新しい一括の結果(名前 _r1 …)として出る")}"${r.remain > 0 ? "" : " disabled"}>${t("残りから追加")}</button></td></tr>`;
     }).join("");
     const hp = hard.prompts || [], hs = hard.scores || [];
     return `<section class="pp-stage"><h4>${t("4. 効率での配り直し")}</h4>
-      <p class="muted note">${t("最初の組を当てた状態で、射影の値が残りやすい質問を選び、ヘッドごとに強さを少しだけ上げて、その質問での下がり方(効率 η)を測ります。強さを効率に比例させて 0 から配り直し、もう一度二分探索で目標に合わせます。丸ごと止めたときの効き目と効率では順位が入れ替わるので、この段が要ります。ヘッドの数を減らした組も作って比べます。")}</p>
+      ${noteHTML(t("最初の組を当てた状態で、射影の値が残りやすい質問を選び、ヘッドごとに強さを少しだけ上げて、その質問での下がり方(効率 η)を測ります。強さを効率に比例させて 0 から配り直し、もう一度二分探索で目標に合わせます。丸ごと止めたときの効き目と効率では順位が入れ替わるので、この段が要ります。ヘッドの数を減らした組も作って比べます。"), "muted note")}
       ${hp.length ? `<details><summary class="muted note">${t("射影の値が残りやすい質問 {n} 個(L{L} の射影の値)", { n: hard.n ?? hp.length, L: hard.layer ?? S ?? "—" })}</summary>
         <table class="evx mono dv-ex"><tbody>${hp.map((q, i) => `<tr><td class="w">${esc(q)}</td><td>${fmt(hs[i], 2)}</td></tr>`).join("")}</tbody></table></details>` : ""}
       <h4 class="pp-sub">${t("効率 η(大きい順)")}</h4>
@@ -582,7 +621,7 @@ export class PipelinePanel {
       <div class="evx-scroll"><table class="evx mono pp-cmp"><thead><tr><th>${t("ヘッド数")}</th><th class="l">${t("ヘッドと強さ")}</th><th>s max</th>
         <th title="${t("目標を超えて残った A 側の例の数")}">${t("残り")}</th><th title="${t("A 側の射影の値の最大")}">A max</th><th title="${t("A 側の射影の値の平均")}">${t("A 平均")}</th>
         <th title="${t("B 側の射影の値の変化")}">B Δ</th><th title="${t("B 側の直交成分のずれ(小さいほど他を壊さない)")}">B ⊥</th><th title="${t("射影の値が残りやすい質問の平均が目標に届いたか")}">${t("届いた")}</th><th></th></tr></thead><tbody>${cmp}</tbody></table></div>
-      <p class="muted note">${t("推奨 = 目標に届いた組のうち、残る例の数が最も少ない組と同程度(A 側の 5% まで)で、B 側のずれが最小の 1.25 倍までの組の中で、ヘッドが最も少ない組。ヘッドの名前をクリックで HEAD パネル。")}</p>
-      ${this.candForm(d)}</section>`;
+      ${noteHTML(t("推奨 = 目標に届いた組のうち、残る例の数が最も少ない組と同程度(A 側の 5% まで)で、B 側のずれが最小の 1.25 倍までの組の中で、ヘッドが最も少ない組。ヘッドの名前をクリックでくわしく見る。"), "muted note")}
+      </section>`;
   }
 }

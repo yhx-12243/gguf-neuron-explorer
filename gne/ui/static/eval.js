@@ -10,6 +10,8 @@ import { getJSON } from "./api.js";
 import { t } from "./i18n.js";
 import { FieldtestPanel } from "./fieldtest.js";
 import { esc } from "./panels.js";
+import { Steps } from "./steps.js";
+import { noteHTML, useContrastList } from "./ui.js";
 
 const C = { text: "#aeb9c8", muted: "#6b7686", grid: "#1a212b", amber: "#e8b04a", minus: "#c94fa7", ppl: "#7c8796", judge: "#9fb3cf", ok: "#6fcf8f",
             react: "#5fd0c0" };
@@ -59,6 +61,7 @@ export class EvalView {
     this.onLoadRecipe = onLoadRecipe || (() => {});   // (レシピの dict) → 方式の比較の行のレシピを読み込む
     this.list = [];
     this.data = null;
+    this.sent = null;                  // ほかの画面から「評価へ送る」で送られたレシピ { recipe: ファイル, label }(無ければ今のレシピ)
     this.dose = null;                  // 下に出力の例を出す倍率
     // 読み込みの順番: 後から始めた読み込みがあるか、待つ間に表示が替わった(ほかの eval を選んだなど)なら、先に始めた読み込みの
     // 結果は捨てる(遅れて届いた古い結果で、選び直した表示を上書きしないように)
@@ -68,23 +71,23 @@ export class EvalView {
     root.innerHTML = `<div class="evx-tools">
         <label class="muted">${t("保存した eval")} <select id="evx-pick"></select></label>
         <span class="evx-run"><span class="muted" id="evx-rc"></span>
-          <label class="muted">${t("倍率")} <input id="evx-doses" value="0,0.25,0.5,0.75,1" size="16" spellcheck="false"></label>
-          <label class="muted">when <select id="evx-when"><option>all</option><option>gen</option><option>assistant</option></select></label>
-          <label class="muted" title="${t("各倍率で同じ大きさのランダムな向きのレシピも測る(時間はおよそ本数倍)")}">${t("対照")} <input id="evx-rc-n" type="number" min="0" max="64" value="0" style="width:4em"></label>
-          <label class="muted" title="${t("反応性(CHANGE-04 F): reactivity の対(トリガーあり/なし)と validate.match を持つ対照集合の YAML。空なら測らない")}">${t("反応性")} <input id="evx-react" placeholder="configs/contrast/….yaml" size="22" spellcheck="false"></label>
-          <label class="muted" title="${t("レシピのヘッドを同じ k のランダムなヘッドに替えた対照で反応性も測る本数(反応性があるときだけ)")}">${t("ヘッドの対照")} <input id="evx-hc-n" type="number" min="0" max="64" value="0" style="width:4em"></label>
+          <label class="muted">${t("強さ")} <input id="evx-doses" value="0,0.25,0.5,0.75,1" size="16" spellcheck="false"></label>
+          <label class="muted">${t("足す位置")} <select id="evx-when"><option>all</option><option>gen</option><option>assistant</option></select></label>
+          <label class="muted" title="${t("各倍率で同じ大きさのランダムな向きのレシピも測る(時間はおよそ本数倍)")}">${t("ランダムな向きと比べる本数")} <input class="w4" id="evx-rc-n" type="number" min="0" max="64" value="0"></label>
+          <label class="muted" title="${t("反応性: reactivity の対(トリガーあり/なし)と validate.match を持つ対照集合の YAML。空なら測らない")}">${t("反応性")} <input id="evx-react" placeholder="configs/contrast/….yaml" size="22" spellcheck="false"></label>
+          <label class="muted" title="${t("レシピのヘッドを同じ k のランダムなヘッドに替えた対照で反応性も測る本数(反応性があるときだけ)")}">${t("ランダムなヘッドと比べる本数")} <input class="w4" id="evx-hc-n" type="number" min="0" max="64" value="0"></label>
           <label class="muted" title="${t("方向を使うレシピ(ヘッドの proj など)で、方向の指標(射影の値の下がり方・ずれ・判定の一致率)も測る。外すと能力・ppl・混入・性格の変化量だけで早く終わる")}"><input type="checkbox" id="evx-dm" checked> ${t("方向の指標")}</label>
-          <label class="muted" title="${t("方向の指標で読む質問の数(A・B それぞれ。一致率の返事もこの数まで)。多い対照集合は等間隔に間引く。0 で全部")}">${t("問")} <input id="evx-dm-n" type="number" min="0" max="4096" value="64" style="width:4.5em"></label>
+          <label class="muted" title="${t("方向の指標で読む質問の数(A・B それぞれ。一致率の返事もこの数まで)。多い対照集合は等間隔に間引く。0 で全部")}">${t("問")} <input class="w45" id="evx-dm-n" type="number" min="0" max="4096" value="64"></label>
           <span id="evx-kx" class="evx-kx-in hidden">
             <label class="muted" title="${t("keyed のユニットがあるとき、鍵の対照集合の保留した例で eval の選択性(書き込みたい位置の残差を動かし、書き込みたくない位置・dont_touch を動かさないか)と、add・gain・proj との比較、比較用の鍵との比較を測る(prefill だけ)。key-check の選択性(鍵の反応の強さの差)とは別の量")}"><input type="checkbox" id="evx-km" checked> ${t("keyed の選択性")}</label>
             <label class="muted" title="${t("鍵の対照集合。自動 = 方向を作った対照集合が鍵と同じものならそれ(違えば測らずに理由を出す)")}">${t("鍵の対照集合")} <select id="evx-kc"><option value="">${t("自動")}</option></select></label>
-            <label class="muted" title="${t("会話の組ごとに読む例の数")}">${t("例")} <input id="evx-ke" type="number" min="1" max="4096" value="8" style="width:4.5em"></label>
-            <label class="muted" title="${t("比べる比較用の鍵の本数(0 で比べない)")}">${t("比較用の鍵")} <input id="evx-kp" type="number" min="0" max="256" value="8" style="width:4em"></label>
-            <label class="muted" title="${t("読む質問。自動 = 鍵の作成と反対側(even ↔ odd)")}">subset <select id="evx-ks"><option value="">${t("自動")}</option><option>odd</option><option>even</option><option>all</option></select></label>
+            <label class="muted" title="${t("会話の組ごとに読む例の数")}">${t("例")} <input class="w45" id="evx-ke" type="number" min="1" max="4096" value="8"></label>
+            <label class="muted" title="${t("比べる比較用の鍵の本数(0 で比べない)")}">${t("比較用の鍵")} <input class="w4" id="evx-kp" type="number" min="0" max="256" value="8"></label>
+            <label class="muted" title="${t("読む質問。自動 = 鍵の作成と反対側(even ↔ odd)")}">${t("使う質問")} <select id="evx-ks"><option value="">${t("自動")}</option><option value="odd">${t("奇数番目")}</option><option value="even">${t("偶数番目")}</option><option value="all">${t("全部")}</option></select></label>
             <label class="muted" title="${t("add・gain・proj の強さを探して、書き込みたい位置の変化を keyed にそろえる(外すと同じ α の add とだけ比べて早く終わる)")}"><input type="checkbox" id="evx-kmatch" checked> ${t("大きさ合わせ")}</label>
           </span>
-          <button id="evx-go">${t("今のレシピで eval")}</button></span></div>
-      <p class="muted note evx-help">${t("倍率はレシピ全体に掛ける係数(0 = 無介入)。能力 = exact と format の正答率、ppl は参照テキスト、混入は日本語の回答に出た簡体字・ハングルなどの割合。4B で数分。")}</p>
+          <button class="main" id="evx-go">${t("今のレシピで eval")}</button> <span class="muted note" id="evx-status"></span></span></div>
+      <div class="evx-help">${noteHTML(t("倍率はレシピ全体に掛ける係数(0 = 無介入)。能力 = exact と format の正答率、ppl は参照テキスト、混入は日本語の回答に出た簡体字・ハングルなどの割合。4B で数分。"))}</div>
       <div id="evx-body"></div>
       <details class="evx-ft" id="evx-ft-wrap"><summary>${t("実地テスト(本番と同じ動かし方で、ファイルどうしを比べる)")}</summary><div id="evx-ft"></div></details>`;
     this.$ = (s) => root.querySelector(s);
@@ -92,13 +95,28 @@ export class EvalView {
     this.$("#evx-ft-wrap").addEventListener("toggle", () => { if (this.$("#evx-ft-wrap").open) this.ft.refresh(); });
     this.$("#evx-pick").addEventListener("change", (ev) => this.load(ev.target.value));
     this.$("#evx-go").addEventListener("click", () => this.run());
+    useContrastList(this.$("#evx-react"));                               // 対照集合は同じ候補の一覧から選べる
     new ResizeObserver(() => this.draw()).observe(root);
+    // 左に作業の一覧(能力と ppl・実地テスト)、右に 入力 → 実行 → 結果
+    this.steps = new Steps(root, {
+      store: "gne.eval.step", label: t("評価の作業"),
+      steps: [{ key: "main", label: t("能力と ppl"), els: () => [this.$(".evx-tools"), this.$(".evx-help"), this.$("#evx-body")] },
+              { key: "ft", label: t("実地テスト"), els: () => [this.$("#evx-ft-wrap")] }],
+      onSelect: (k) => { if (k === "ft" && !this.$("#evx-ft-wrap").open) this.$("#evx-ft-wrap").open = true; },
+    });
   }
 
   async refresh(select) {
-    const r = this.recipe;
-    this.$("#evx-rc").textContent = r && r.units.length ? t("レシピ {name}({n} ユニット)", { name: r.name || "—", n: r.units.length }) : t("レシピが空です");
-    this.$("#evx-go").disabled = !(r && r.units.length);
+    const r = this.recipe, rc = this.$("#evx-rc");
+    if (this.sent) {                                                // 送られたレシピ(外すと今のレシピに戻る)
+      rc.innerHTML = `${esc(t("送られたレシピ {name}", { name: this.sent.label || this.sent.recipe }))} <button class="small quiet" id="evx-unsend" title="${t("送られたレシピを外して、今のレシピで評価する")}">${t("外す")}</button>`;
+      rc.querySelector("#evx-unsend").addEventListener("click", () => { this.sent = null; this.refresh(); });
+      this.$("#evx-go").textContent = t("送られたレシピで eval");
+    } else {
+      rc.textContent = r && r.units.length ? t("レシピ {name}({n} ユニット)", { name: r.name || "—", n: r.units.length }) : t("レシピが空です");
+      this.$("#evx-go").textContent = t("今のレシピで eval");
+    }
+    this.$("#evx-go").disabled = !this.sent && !(r && r.units.length);
     const hasKeyed = !!(r && r.keyed && r.keyed().length);            // CHANGE-07: keyed の選択性の欄はレシピに keyed があるときだけ
     this.$("#evx-kx").classList.toggle("hidden", !hasKeyed);
     if (hasKeyed && !this.contrastsLoaded) {
@@ -153,10 +171,21 @@ export class EvalView {
     this.render();
   }
 
-  run() {
+  // ほかの画面から「評価へ送る」: レシピ(ファイル)と、強さ・比べる用の数を欄に入れる。始めるのはこの画面の「eval」を押したとき
+  send({ recipe, doses = null, random_controls = null, label = null }) {
+    this.sent = { recipe, label };
+    if (doses) this.$("#evx-doses").value = doses.join(",");
+    if (random_controls !== null) this.$("#evx-rc-n").value = String(random_controls);
+    this.$("#evx-status").textContent = t("送られたレシピを評価します。強さ・比べる用の数を確かめて「eval」を押してください");
+    if (this.steps) this.steps.select("main");
+    this.refresh();
+  }
+
+  async run() {
     const doses = this.$("#evx-doses").value.split(",").map((x) => +x.trim()).filter((x) => Number.isFinite(x));
     if (!doses.length) return;
-    const p = { units: this.recipe.specs(), doses, when: this.$("#evx-when").value };
+    const sent = this.sent;
+    const p = sent ? { recipe: sent.recipe, doses, when: this.$("#evx-when").value } : { units: this.recipe.specs(), doses, when: this.$("#evx-when").value };
     const nc = Math.max(0, Math.floor(+this.$("#evx-rc-n").value || 0));
     if (nc) p.random_controls = nc;
     const react = this.$("#evx-react").value.trim(), hc = Math.max(0, Math.floor(+this.$("#evx-hc-n").value || 0));
@@ -166,7 +195,7 @@ export class EvalView {
       const dmn = Math.max(0, Math.floor(+this.$("#evx-dm-n").value || 0));
       if (dmn !== 64) p.dir_max_examples = dmn || null;                 // 0 = 全部の質問
     }
-    if (this.recipe.keyed && this.recipe.keyed().length) {          // CHANGE-07 E: keyed の選択性
+    if (!sent && this.recipe.keyed && this.recipe.keyed().length) {          // keyed の選択性(今のレシピのとき)
       p.keyed_metrics = this.$("#evx-km").checked;
       if (p.keyed_metrics) {
         const kc = this.$("#evx-kc").value, ks = this.$("#evx-ks").value;
@@ -177,8 +206,12 @@ export class EvalView {
         p.keyed_match = this.$("#evx-kmatch").checked;
       }
     }
-    if (this.recipe.name) p.name = this.recipe.name;
-    this.onRun(p);
+    if (!sent && this.recipe.name) p.name = this.recipe.name;
+    const st = this.$("#evx-status");
+    st.textContent = t("ジョブを投げています…");
+    const j = await this.onRun(p);
+    st.textContent = j ? t("eval を投げました(進み具合と「止める」は下の帯。終わるとここに出ます)") : t("やめました");
+    if (j && sent) { this.sent = null; this.refresh(); }
   }
 
   render() {
@@ -186,7 +219,7 @@ export class EvalView {
     const d = this.data;
     this.cv = null;
     this.nh = null;
-    if (!d) { body.innerHTML = `<p class="muted note">${t("eval がまだありません。上の「今のレシピで eval」で作ります(gne eval / MCP の eval でも)。")}</p>`; return; }
+    if (!d) { body.innerHTML = `${noteHTML(t("eval がまだありません。上の「今のレシピで eval」で作ります(gne eval / MCP の eval でも)。"), "muted note")}`; return; }
     const kind = kindOf(d);
     if (kind === "compare-methods") { this.renderMethods(body, d); return; }
     if (kind === "nheads") { this.renderNheads(body, d); return; }
@@ -232,10 +265,10 @@ export class EvalView {
     const kCells = (r) => (hasK ? `<td>${r.keyed ? fmt(r.keyed.selectivity, 2) : "—"}</td><td>${r.keyed ? fmt(r.keyed.b_norm, 2) : "—"}</td>${
       kctrl ? (r.keyed && r.keyed.null_pct !== undefined ? `<td class="muted">${fmt(r.keyed.ctrl_p95, 2)}</td>${nullTd(r.keyed.null_pct)}` : "<td></td><td></td>") : ""}` : "");
     const kHead = hasK ? `<th class="wrap" title="${t("eval の選択性: 目的の層の残差の変化の r̂ 方向の成分の、書き込みたい位置 − 書き込みたくない位置(書く向きにそろえた値。大きいほど書き込みたい位置だけを動かす)。key-check の選択性とは別の量")}">${t("eval の選択性")}</th><th class="wrap" title="${t("書き込みたくない位置の残差の変化の大きさ ‖Δ‖")}">${t("書き込みたくない位置の ‖Δ‖")}</th>${
-      kctrl ? `<th class="wrap" title="${t("鍵を比較用の鍵に替えた対照の eval の選択性の 95% 点")}">${t("比較用の鍵の p95")}</th><th title="${t("eval の選択性が、比較用の鍵の対照の何割より大きいか(0.95 未満は鍵が状態を選んでいるとは言えない)")}">null</th>` : ""}` : "";
+      kctrl ? `<th class="wrap" title="${t("鍵を比較用の鍵に替えた対照の eval の選択性の 95% 点")}">${t("比較用の鍵の p95")}</th><th title="${t("eval の選択性が、比較用の鍵の対照の何割より大きいか(0.95 未満は鍵が状態を選んでいるとは言えない)")}">${t("対照超え")}</th>` : ""}` : "";
     const notes = [...(d.notes || [])];
     const ok = d.rows.filter((r) => r.shippable && r.dose > 0).map((r) => r.dose);
-    const rows = d.rows.map((r) => `<tr class="${r.dose === this.dose ? "on" : ""}" data-dose="${r.dose}">
+    const rows = d.rows.map((r) => `<tr class="pick${r.dose === this.dose ? " on" : ""}" data-dose="${r.dose}">
         <td>${fmt(r.dose, 2)}</td><td>${pct(r.capability)}</td><td>${fmt(r.capability_drop_pt, 1)}</td>
         <td>${fmt(r.ppl_mean, 2)}</td><td>${r.ppl_worse_pct >= 0 ? "+" : ""}${fmt(r.ppl_worse_pct, 1)}%</td>
         <td>${pct(r.mix_zh + r.mix_other, 2)}</td><td>${fmt(r.persona.novelty, 2)}</td><td>${fmt(r.persona.distinct4, 2)}</td>
@@ -253,9 +286,9 @@ export class EvalView {
       <div class="evx-legend note">${series(d).map((s) => `<span><i style="background:${s.color}${s.thin ? ";opacity:.45;height:1px" : ""}"></i>${esc(s.label)}</span>`).join("")}
         <span><i class="dot" style="background:${C.ok}"></i>${t("配布可")}</span></div>
       <canvas id="evx-canvas"></canvas>
-      <div class="evx-scroll"><table class="evx mono"><thead><tr><th>${t("倍率")}</th><th>${t("能力")}</th><th>${t("低下pt")}</th><th>ppl</th><th>${t("悪化")}</th><th>${t("混入")}</th>
-        <th title="${t("無介入の出力に無い語の割合(プロンプトごとの平均)")}">${t("新語")}</th><th title="distinct-4">d4</th><th title="${t("max_tokens で打ち切られた割合")}">${t("打切")}</th>${d.judge ? "<th>judge</th>" : ""}${d.random_controls ? `<th title="${t("同じ大きさのランダムな向きの対照レシピの新語の 95% 点")}">${t("対照p95")}</th><th title="${t("新語が対照の何割より多いか(0.95 未満は対照と区別できない)")}">null</th><th title="${t("対照の能力の低下(中央値、pt)")}">${t("対照低下")}</th><th title="${t("対照の ppl の悪化(中央値)")}">${t("対照悪化")}</th>` : ""}${rx ? `<th title="${t("トリガーありのプロンプトで性格の判定(validate.match)に当たった割合")}">${t("あり")}</th><th title="${t("トリガーなしのプロンプトで判定に当たった割合")}">${t("なし")}</th><th title="${t("反応性 = あり − なし({n} 対)", { n: rx.n_pairs })}">${t("反応性")}</th>${
-          hc ? `<th title="${t("レシピのヘッドを同じ k のランダムなヘッドに替えた対照の反応性の 95% 点")}">${t("対照p95")}</th><th title="${t("反応性が対照の何割より大きいか(0.95 未満は対照と区別できない)")}">null</th>` : ""}` : ""}${dirHead}${kHead}<th></th></tr></thead>
+      <div class="evx-scroll"><table class="evx mono"><thead><tr><th>${t("強さ")}</th><th>${t("能力")}</th><th>${t("低下pt")}</th><th>ppl</th><th>${t("悪化")}</th><th>${t("混入")}</th>
+        <th title="${t("無介入の出力に無い語の割合(プロンプトごとの平均)")}">${t("新語")}</th><th title="distinct-4">d4</th><th title="${t("max_tokens で打ち切られた割合")}">${t("打切")}</th>${d.judge ? "<th>judge</th>" : ""}${d.random_controls ? `<th title="${t("同じ大きさのランダムな向きの対照レシピの新語の 95% 点")}">${t("対照p95")}</th><th title="${t("新語が対照の何割より多いか(0.95 未満は対照と区別できない)")}">${t("対照超え")}</th><th title="${t("対照の能力の低下(中央値、pt)")}">${t("対照低下")}</th><th title="${t("対照の ppl の悪化(中央値)")}">${t("対照悪化")}</th>` : ""}${rx ? `<th title="${t("トリガーありのプロンプトで性格の判定(validate.match)に当たった割合")}">${t("あり")}</th><th title="${t("トリガーなしのプロンプトで判定に当たった割合")}">${t("なし")}</th><th title="${t("反応性 = あり − なし({n} 対)", { n: rx.n_pairs })}">${t("反応性")}</th>${
+          hc ? `<th title="${t("レシピのヘッドを同じ k のランダムなヘッドに替えた対照の反応性の 95% 点")}">${t("対照p95")}</th><th title="${t("反応性が対照の何割より大きいか(0.95 未満は対照と区別できない)")}">${t("対照超え")}</th>` : ""}` : ""}${dirHead}${kHead}<th></th></tr></thead>
         <tbody>${rows}</tbody></table></div>
       ${d.keyed ? this.keyedBlock(d.keyed) : ""}
       <div id="evx-sample"></div>`;
@@ -283,7 +316,7 @@ export class EvalView {
       : `<tr class="${m.method === "keyed" ? "best" : ""}"><td class="l">${esc(label(m.method))}</td><td class="desc">${esc(m.desc || "")}</td>
           <td>${fmt(m.beta, 3)}</td><td>${m.matched === true ? `<span class="ok">○</span>` : m.matched === false ? `<span class="ng" title="${t("書き込みたい位置の変化を ±10% でそろえられなかった(b_over_a で比べる)")}">×</span>` : "—"}</td>
           <td>${sg(m.a_par)}</td><td>${sg(m.b_par)}</td><td>${fmt(m.b_norm, 3)}</td><td>${fmt(m.dt_norm, 3)}</td><td>${sg(m.selectivity)}</td><td>${fmt(m.b_over_a, 3)}</td>
-          <td>${m.recipe && (m.method === "keyed" || m.method === "proj") ? `<button class="small" data-krc="${i}" title="${t("この方式のレシピを recipe タブに読み込む")}">${t("レシピに")}</button>` : ""}</td></tr>`)).join("");
+          <td>${m.recipe && (m.method === "keyed" || m.method === "proj") ? `<button class="small" data-krc="${i}" title="${t("この方式のレシピでレシピを置き換える")}">${t("レシピを置き換える")}</button>` : ""}</td></tr>`)).join("");
     const cmp = k.compare || {};
     const ratio = (o) => Object.entries(o || {}).map(([m, v]) => `${esc(label(m))} ${fmt(v, 2)}`).join(" · ");
     const p = k.pseudo;
@@ -294,7 +327,7 @@ export class EvalView {
         t("書き込みたくない位置")} <span class="muted">${esc(k.positions_b || "")}</span> ${t("{e} 例 {p} 位置", { e: cb.examples ?? 0, p: cb.positions ?? 0 })}${
         dts.map((g) => ` / ${esc(g.slice(3))} ${t("{e} 例 {p} 位置", { e: c[g].examples, p: c[g].positions })}`).join("")}${
         k.cost ? `<span class="muted"> · prefill ${k.cost.prefills} · ${fmt(k.cost.seconds, 0)} s</span>` : ""}</p>
-      <p class="muted note">${t("同じ方向を方式ごとに当て、目的の層の残差の変化を位置の群ごとに比べる。書き込みたい位置の r̂ = そこでの r̂ 方向の変化、書き込みたくない位置の ‖Δ‖・dont_touch の ‖Δ‖ = そこでの変化の大きさ、eval の選択性 = 書く向きにそろえた、書き込みたい位置 − 書き込みたくない位置の r̂ 方向の変化、b_over_a = 書き込みたい位置を 1 押すあたりの書き込みたくない位置の乱れ(小さいほど選択的)。β = 書き込みたい位置の変化を keyed にそろえた強さ(○ = ±10% でそろった)。")}</p>
+      ${noteHTML(t("同じ方向を方式ごとに当て、目的の層の残差の変化を位置の群ごとに比べる。書き込みたい位置の r̂ = そこでの r̂ 方向の変化、書き込みたくない位置の ‖Δ‖・dont_touch の ‖Δ‖ = そこでの変化の大きさ、eval の選択性 = 書く向きにそろえた、書き込みたい位置 − 書き込みたくない位置の r̂ 方向の変化、b_over_a = 書き込みたい位置を 1 押すあたりの書き込みたくない位置の乱れ(小さいほど選択的)。β = 書き込みたい位置の変化を keyed にそろえた強さ(○ = ±10% でそろった)。"), "muted note")}
       <div class="evx-scroll"><table class="evx mono evx-kx-tab"><thead><tr><th class="l">${t("方式")}</th><th class="l">${t("説明")}</th><th>β</th><th title="${t("書き込みたい位置の変化を keyed に ±10% でそろえられたか")}">${t("そろった")}</th>
         <th title="${t("書き込みたい位置での r̂ 方向の変化(par)")}">${t("書き込みたい位置の r̂")}</th><th title="${t("書き込みたくない位置での r̂ 方向の変化(par)")}">${t("書き込みたくない位置の r̂")}</th><th title="${t("書き込みたくない位置の残差の変化の大きさ")}">${t("書き込みたくない位置の ‖Δ‖")}</th>
         <th title="${t("dont_touch の群の残差の変化の大きさ(群の平均)")}">${t("dont_touch の ‖Δ‖")}</th><th title="${t("書く向きにそろえた、書き込みたい位置 − 書き込みたくない位置の r̂ 方向の変化。key-check の選択性(鍵の反応の強さの差)とは別の量")}">${t("eval の選択性")}</th><th title="${t("書き込みたくない位置の ‖Δ‖ ÷ |書き込みたい位置の r̂ 方向の変化|")}">b_over_a</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
@@ -341,12 +374,12 @@ export class EvalView {
       : `<tr class="${r === best ? "best" : ""}"><td class="l">${esc(label(r.method))}</td><td class="desc">${esc(r.desc || "")}</td><td>${fmt(r.alpha, 3)}</td><td>${fmt(r.score_a, 2)}</td>
           <td>${fmt(r.drift_orth_b, 3)}</td><td>${fmt(r.capability_drop_pt, 1)}</td><td>${r.ppl_worse_pct >= 0 ? "+" : ""}${fmt(r.ppl_worse_pct, 1)}%</td><td>${pct(r.mix_increase, 2)}</td>${
           hasRate ? `<td>${pct(r.rate, 0)}</td><td>${pct(r.rate_drop, 0)}</td>` : ""}<td class="${r.shippable ? "ok" : "ng"}">${r.shippable ? t("配布可") : "×"}${
-          r.recipe ? ` <button class="small" data-rc="${i}" title="${t("この方式のレシピを recipe タブに読み込む")}">${t("レシピに")}</button>` : ""}</td></tr>`)).join("");
+          r.recipe ? ` <button class="small" data-rc="${i}" title="${t("この方式のレシピでレシピを置き換える")}">${t("レシピを置き換える")}</button>` : ""}</td></tr>`)).join("");
     body.innerHTML = `
       <p class="note mono">${t("方式の比較")} · ${t("方向 {d}", { d: esc(d.direction || "—") })} · ${t("射影の値を測る層 L{L}", { L: d.score_layer ?? "—" })} · ${
         t("目標の A 側の射影の値 {v}({src})", { v: fmt(d.target, 2), src: d.target_from === "match_effect" ? "--match-effect" : t("このレシピの水準") })} · ${
         t("無介入 A {a} / B {b}", { a: fmt(d.base_score_a, 2), b: fmt(d.base_score_b, 2) })}${d.base_rate !== undefined && d.base_rate !== null ? ` · ${t("判定の一致率(無介入 {p})", { p: pct(d.base_rate, 0) })}` : ""}<span class="muted"> · ${fmt(d.seconds, 0)} s</span></p>
-      <p class="muted note">${t("同じ方向を、方式ごとに強さ α を合わせて A 側の射影の値を目標までそろえ、副作用を比べる。B ⊥ = 関係のない入力(B 側)の残差の、方向に直交する成分のずれ(小さいほど他を壊さない)。緑の行 = B ⊥ が最も小さい方式。")}</p>
+      ${noteHTML(t("同じ方向を、方式ごとに強さ α を合わせて A 側の射影の値を目標までそろえ、副作用を比べる。B ⊥ = 関係のない入力(B 側)の残差の、方向に直交する成分のずれ(小さいほど他を壊さない)。緑の行 = B ⊥ が最も小さい方式。"), "muted note")}
       <div class="evx-scroll"><table class="evx mono evx-methods"><thead><tr><th class="l">${t("方式")}</th><th class="l">${t("説明")}</th><th title="${t("目標にそろえた強さ")}">α</th><th title="${t("A 側の射影の値(測る層)")}">A</th>
         <th title="${t("B 側の残差の直交成分のずれ")}">B ⊥</th><th>${t("低下pt")}</th><th>${t("悪化")}</th><th title="${t("混入の増加")}">${t("混入")}</th>${
         hasRate ? `<th>${t("一致率")}</th><th>${t("一致減")}</th>` : ""}<th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -361,14 +394,14 @@ export class EvalView {
         <td>${fmt(r.s_max, 2)}</td><td>${r.remain ?? "—"}</td><td>${fmt(r.capability_drop_pt, 1)}</td><td>${r.ppl_worse_pct >= 0 ? "+" : ""}${fmt(r.ppl_worse_pct, 1)}%</td>
         <td>${pct(r.mix_increase, 2)}</td><td>${fmt(r.dir_drop_a, 2)}</td><td>${fmt(r.drift_orth_b, 3)}</td><td>${pct(r.rate, 0)}</td>
         <td class="${r.shippable ? "ok" : r.shippable === false ? "ng" : ""}">${r.shippable ? t("配布可") : r.shippable === false ? "×" : ""}</td>
-        <td class="units">${esc((r.units || []).join(" "))}</td><td>${(r.units || []).length ? `<button class="small" data-nh="${i}" title="${t("この組(proj のユニット)で今のレシピを置き換える")}">${t("レシピに")}</button>` : ""}</td></tr>`).join("");
+        <td class="units">${esc((r.units || []).join(" "))}</td><td>${(r.units || []).length ? `<button class="small" data-nh="${i}" title="${t("この組(proj のユニット)で今のレシピを置き換える")}">${t("レシピを置き換える")}</button>` : ""}</td></tr>`).join("");
     const notes = rows.flatMap((r) => (r.notes || []).map((x) => `${t("{n} ヘッド", { n: r.n_heads })}: ${x}`));
     body.innerHTML = `
       <p class="note mono">${t("ヘッド数の曲線")} · ${t("方向 {d}", { d: esc(d.direction || "—") })} · ${t("配分 {a}", { a: esc(String(d.alloc || "").split("/").pop()) })}${
         d.score_layer !== undefined ? ` · ${t("L{L} の射影の値を {v} まで", { L: d.score_layer, v: fmt(d.target, 2) })}` : ""}${rec ? ` · ${t("推奨 {n} ヘッド", { n: rec.n_heads })}` : ""}${
         d.random_controls ? ` · ${t("対照 {n} 本", { n: d.random_controls })}` : ""}<span class="muted"> · ${fmt(d.seconds, 0)} s</span></p>
       ${notes.length ? `<ul class="evx-notes">${notes.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
-      <p class="muted note">${t("x = ヘッドの数(gne heads allocate の組)。少ないヘッドほど 1 ヘッドの s が大きくなる。残り = 目標に届かず残った効きにくい例の数。白の破線 = 推奨の組。")}</p>
+      ${noteHTML(t("x = ヘッドの数(gne heads allocate の組)。少ないヘッドほど 1 ヘッドの s が大きくなる。残り = 目標に届かず残った効きにくい例の数。白の破線 = 推奨の組。"), "muted note")}
       <canvas id="evx-nh"></canvas>
       <div class="evx-scroll"><table class="evx mono"><thead><tr><th>${t("ヘッド数")}</th><th>s max</th><th title="${t("目標に届かず残った例の数")}">${t("残り")}</th><th>${t("低下pt")}</th><th>${t("悪化")}</th><th>${t("混入")}</th>
         <th title="${t("A 側の射影の値の下がり方")}">${t("A 下がり")}</th><th title="${t("B 側の残差の直交成分のずれ")}">B ⊥</th><th>${t("一致率")}</th><th></th><th class="l">${t("ユニット")}</th><th></th></tr></thead><tbody>${tr}</tbody></table></div>`;

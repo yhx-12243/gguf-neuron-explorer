@@ -2,7 +2,8 @@
 // CHANGE-05 G: MoE の層のニューロン(通し番号 = 専門家 × 幅 + n)は L12 E37 N511 の住所で出し、レシピには L:Ee:Nn で足す
 // (add = 書き込み方向の押し、×0 / ×2 = 選ばれたときだけ効く gain)。connections(Web)は MoE の層では使えない。
 import { getJSON, postJSON } from "./api.js";
-import { t } from "./i18n.js";
+import { t, tl } from "./i18n.js";
+import { plainEnter, noteHTML } from "./ui.js";
 
 export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 // 質問(文字列か、会話の履歴 [{role, content}, …])→ 1 行の文字列 / 役割つきの HTML
@@ -43,10 +44,10 @@ export class RankList {
       <div class="list-head mono" id="rank-head"></div>
       <div class="list-tools">
         <input id="rank-filter" placeholder="${t("語・番号で絞り込み")}" spellcheck="false">
-        <label class="muted"><input type="checkbox" id="rank-random"> random</label>
+        <label class="muted" title="${t("ランダムな方向の対照(sweep で比べるために押した方向)も表に出す")}"><input type="checkbox" id="rank-random"> ${t("対照も出す")}</label>
       </div>
       <div class="rank-wrap"><table class="rank mono"><thead><tr>
-        <th data-k="rank">#</th><th data-k="neuron">N</th><th data-k="mass">mass</th><th data-k="null_pct">null</th>
+        <th data-k="rank" title="${t("sweep の順位")}">#</th><th data-k="neuron" title="${t("ニューロンの番号")}">${t("番号")}</th><th data-k="mass" title="${t("押したときに増えた上位 5 語の z の和(sweep の mass)")}">mass</th><th data-k="null_pct" title="${t("mass がランダムな方向の対照の何割より大きいか(null_pct。1 = 全部の対照より上)")}">${t("対照超え")}</th>
         <th data-k="words">${t("語")}</th></tr></thead><tbody></tbody></table></div>
       <p class="muted note" id="rank-empty"></p>`;
     root.querySelector("#rank-filter").addEventListener("input", () => this.render());
@@ -177,7 +178,7 @@ export class NeuronPanel {
     const id = rnd ? `L${d.layer} random ${d.neuron}` : moe ? d.address || `L${d.layer} E${d.expert} N${d.expert_neuron}` : `L${d.layer} N${d.neuron}`;
     const noWeb = rnd || moe || !this.hasConnections();
     const webWhy = moe ? t("MoE の層は connections の対象外") : rnd ? t("ランダム方向の対照には connections がありません") : t("connections が要ります(層の右クリック →「connections」)");
-    const stats = s ? `${s.rank ? `#${s.rank}/${s.n_ranked} · ` : ""}mass ${fmt(s.mass, 1)} · null ${s.null_pct === null ? "—" : pct(s.null_pct)} · z ${fmt(s.z, 2)}`
+    const stats = s ? `${s.rank ? `#${s.rank}/${s.n_ranked} · ` : ""}mass ${fmt(s.mass, 1)} · ${t("対照超え")} ${s.null_pct === null ? "—" : pct(s.null_pct)} · z ${fmt(s.z, 2)}`
       : t("sweep なし");
     this.root.innerHTML = `
       <div class="n-head">
@@ -188,12 +189,12 @@ export class NeuronPanel {
         ${rnd ? `<p class="muted note">${t("ランダム方向の対照(名前は付けられません)")}</p>` : `
         <div class="n-row"><input class="n-name" placeholder="${t("名前(入力して Enter か欄の外で保存)")}" value="${esc(d.name || "")}" spellcheck="false">
           ${this.recipeButtons(d)}</div>`}
-        ${moe ? `<div class="n-row n-moe">${this.gainButtons(d)}<button class="small" id="n-expert" title="${t("この専門家(L{L} E{e})を EXPERT パネルで開く", { L: d.layer, e: d.expert })}">${t("EXPERT パネルで開く")}</button></div>
+        ${moe ? `<div class="n-row n-moe">${this.gainButtons(d)}<button class="small" id="n-expert" title="${t("この専門家(L{L} E{e})を開く", { L: d.layer, e: d.expert })}">${t("専門家を開く")}</button></div>
         <p class="muted note n-moe-note">${document.body.dataset.cvec === "off" ? t("MoE の専門家のニューロン。×k は、この専門家が選ばれたときだけ効く gain です") : t("MoE の専門家のニューロン。+ / − は方向押し(専門家が選ばれたかに関係なく、全トークンでこのニューロンの書き込み方向を足す)。×0 / ×2 の gain は専門家が選ばれたときだけ効く本当のニューロン押し。")}</p>` : ""}
       </div>
       <div class="tabs">
-        <button data-tab="examples">Examples</button><button data-tab="chat"${rnd ? ` disabled title="${t("ランダム方向の対照ではチャットできません")}"` : ""}>Chat</button>
-        <button data-tab="details">Details</button><button data-tab="web"${noWeb ? ` disabled title="${webWhy}"` : ""}>Web</button>
+        <button data-tab="examples">${tl("例", "Examples", "示例")}</button><button data-tab="chat"${rnd ? ` disabled title="${t("ランダム方向の対照ではチャットできません")}"` : ""}>${tl("チャット", "Chat", "聊天")}</button>
+        <button data-tab="details">${tl("くわしく", "Details", "详情")}</button><button data-tab="web"${noWeb ? ` disabled title="${webWhy}"` : ""}>${tl("配線", "Web", "接线")}</button>
       </div>
       <div class="n-tab" id="n-tab"></div>`;
     for (const b of this.root.querySelectorAll(".tabs button")) {
@@ -210,7 +211,7 @@ export class NeuronPanel {
         setTimeout(() => name.classList.remove("saved"), 800);
         this.onNamed(r.names);
       };
-      name.addEventListener("keydown", (ev) => { if (ev.key === "Enter") save(); });
+      name.addEventListener("keydown", (ev) => { if (plainEnter(ev)) save(); });
       name.addEventListener("blur", save);
     }
     for (const b of this.root.querySelectorAll("[data-rc]")) {
@@ -248,7 +249,7 @@ export class NeuronPanel {
       <table class="kv mono links">${head(t("押す向き"), t("相手がこのとき書く語(押される側の極)"))}${rows(lk.down, true)}</table>
       <h4>${t("駆動するもの(上流 {n})", { n: lk.up.length })}</h4>
       <table class="kv mono links">${head(t("押す向き"), t("相手が + に光ったときに書く語"))}${rows(lk.up, false)}</table>
-      <p class="muted note">${t("押す向き = 相手(下流)を、またはこのニューロン(上流)を + / − のどちらへ押すか。z = その相手が、すべての層の候補の中でどれだけ飛び抜けているか。重みだけからの近似(SwiGLU の gate·up)。上流の語は、相手が + 側に光ると仮定したもの(2 次の近似なので、押す向きは相手の光る向きによらない)。")}</p>`;
+      ${noteHTML(t("押す向き = 相手(下流)を、またはこのニューロン(上流)を + / − のどちらへ押すか。z = その相手が、すべての層の候補の中でどれだけ飛び抜けているか。重みだけからの近似(SwiGLU の gate·up)。上流の語は、相手が + 側に光ると仮定したもの(2 次の近似なので、押す向きは相手の光る向きによらない)。"), "muted note")}`;
   }
 
   // Web タブ(§5.6): 多段の web の要約。toward = 下流が書く語、away = 抑える語、fed_by / held_by = 上流で + / − に駆動する語
@@ -262,7 +263,7 @@ export class NeuronPanel {
         <span class="grp"><span class="muted">${t("1 段目の本数")}</span><input id="wb-first" type="number" min="1" max="24" value="${p.first}"></span>
         <span class="grp"><span class="muted">${t("2 段目以降の本数")}</span><input id="wb-k" type="number" min="1" max="24" value="${p.k}"></span>
         <span class="grp"><span class="muted">z ≥</span><input id="wb-zmin" type="number" step="0.5" value="${p.zmin}"></span><button class="small" id="wb-run">${t("更新")}</button></div>
-      <p class="muted note">${t("開いたニューロンから下流・上流へたどった配線(header の「線」を web にすると地図に出る)。ここでの符号は経路で掛け合わせたもの(下流の 2 段目以降は途中のニューロンが、上流は相手が、+ 側で光ると仮定)。数字 = その語を lens に持つニューロンの数。並びは、層の中でその語を持つニューロンの割合から見た期待に対する比(lift)の順で、2 ニューロン以上の語が先。大文字・語頭の空白の違いはまとめる。± = toward と away の両方に出る語。")}</p>
+      ${noteHTML(t("開いたニューロンから下流・上流へたどった配線(地図の上の「線」を多段にすると地図に出る)。ここでの符号は経路で掛け合わせたもの(下流の 2 段目以降は途中のニューロンが、上流は相手が、+ 側で光ると仮定)。数字 = その語を lens に持つニューロンの数。並びは、層の中でその語を持つニューロンの割合から見た期待に対する比(lift)の順で、2 ニューロン以上の語が先。大文字・語頭の空白の違いはまとめる。± = toward と away の両方に出る語。"), "muted note")}
       ${s ? `<p class="muted note mono">${t("{n} ニューロン · {e} 本", { n: s.n_neurons, e: s.n_edges })}</p>
       <h4>${t("toward(下流が書く語)")}</h4><div class="chips">${words(s.toward)}</div>
       <h4>${t("away(下流で抑えられる語)")}</h4><div class="chips">${words(s.away)}</div>
@@ -289,9 +290,9 @@ export class NeuronPanel {
     const cur = this.inRecipe(d.layer, d.neuron);
     const on = (sign) => cur !== null && Math.sign(cur) === sign;
     const b = (sign, label) => `<button data-rc="${sign}" class="${on(sign) ? `on ${sign > 0 ? "plus" : "minus"}` : ""}"
-      title="${on(sign) ? t("もう一度押すとレシピから外す") : t("レシピに dose {d} で足す(dose は recipe タブで変えられる)", { d: sign > 0 ? "+1" : "−1" })}">${
+      title="${on(sign) ? t("もう一度押すとレシピから外す") : t("強さ {d} でレシピに足す(強さはレシピのパネルで変えられる)", { d: sign > 0 ? "+1" : "−1" })}">${
         on(sign) ? `${t("レシピ")} ${cur > 0 ? "+" : "−"}${Math.abs(cur).toFixed(2)}` : label}</button>`;
-    return `${b(1, t("+ レシピ"))}${b(-1, t("− レシピ"))}`;
+    return `${b(1, t("レシピに足す(+)"))}${b(-1, t("レシピに足す(−)"))}`;
   }
 
   // MoE のニューロンの gain(×0 で消す、×2 で倍)。選ばれたときだけ効く。同じ倍率でもう一度押すと外す
@@ -300,7 +301,7 @@ export class NeuronPanel {
     const b = (k) => {
       const on = cur !== null && cur === k;
       return `<button data-gk="${k}" class="small${on ? ` on ${k < 1 ? "minus" : "plus"}` : ""}" title="${on ? t("もう一度押すとレシピから外す")
-        : t("レシピに gain ×{k} で足す(専門家が選ばれたときだけ効く。倍率は recipe タブで変えられる)", { k })}">${on ? `${t("レシピ")} ×${k}` : t("×{k} レシピ", { k })}</button>`;
+        : t("強さ ×{k} でレシピに足す(専門家が選ばれたときだけ効く。強さはレシピのパネルで変えられる)", { k })}">${on ? `${t("レシピ")} ×${k}` : t("レシピに足す(×{k})", { k })}</button>`;
     };
     const other = cur !== null && cur !== 0 && cur !== 2 ? `<span class="muted mono h-cur">${t("レシピ")} ×${fmt(cur, 2)}</span>` : "";
     return `${b(0)}${b(2)}${other}`;
@@ -335,7 +336,7 @@ export class NeuronPanel {
     if (s) {
       out.push(`<h4>${t("語(sweep の z の順。数字 = 出現 rollout 数、マウスを当てると z とプロンプト)")}</h4><div class="chips">${s.words.map(([w, c, z, ps]) =>
         `<span class="chip" title="${c} rollout · z ${fmt(z, 2)} · ${esc(ps.join(", "))}">${esc(w)}<i>${c}</i></span>`).join("")}</div>`);
-      out.push(`<h4>${t("dose ごと")}</h4><table class="kv mono"><tr><th>dose</th><th>rel_push</th><th>distinct-4</th><th title="${t("max_tokens で打ち切られた割合")}">${t("打ち切り")}</th><th>logprob</th></tr>${
+      out.push(`<h4>${t("強さごと")}</h4><table class="kv mono"><tr><th>${t("強さ")}</th><th>rel_push</th><th>distinct-4</th><th title="${t("max_tokens で打ち切られた割合")}">${t("打ち切り")}</th><th>logprob</th></tr>${
         s.dose_table.map((r) => `<tr><td>${esc(r.dose)}</td><td>${String(r.dose).startsWith("-") ? "−" : ""}${fmt(r.rel_push)}</td><td>${fmt(r.distinct4, 3)}</td><td>${pct(r.capped)}</td><td>${fmt(r.logprob, 3)}</td></tr>`).join("")}</table>`);
     }
     const sl = d.steer_lens;
@@ -393,9 +394,9 @@ export class SearchList {
         <td class="${sign}">${esc(w)}${b.pos ? ` #${b.pos}` : ""}</td><td class="w">${b.where === "name" ? `<b>${esc(nm || "")}</b>` : tokHTML(b.token)}</td></tr>`;
     }).join("");
     this.root.innerHTML = `
-      <div class="list-head"><span>${t("「{q}」({m}){n} 件", { q: esc(r.q), m: esc(r.mode), n: r.n_hits })}${r.hits.length < r.n_hits ? t("・先頭 {n}", { n: r.hits.length }) : ""}</span>
-        <button id="search-close" class="small">${t("閉じる")}</button></div>
-      <p class="muted note">${t("並び: steer+ → logit+ → steer− → logit−、それぞれ lens の中の順位(#)の順。words は sweep の語の z の順")}</p>
+      <div class="list-head"><span>${t("「{q}」({m}){n} 件", { q: esc(r.q), m: esc({ lens: tl("lens の語", "lens words", "lens 词"), words: t("sweep の語"), name: t("名前") }[r.mode] || r.mode), n: r.n_hits })}${r.hits.length < r.n_hits ? t("・先頭 {n}", { n: r.hits.length }) : ""}</span>
+        <button id="search-close" class="small quiet">${t("閉じる")}</button></div>
+      ${noteHTML(t("並び: steer+ → logit+ → steer− → logit−、それぞれ lens の中の順位(#)の順。sweep の語で探したときは z の順"), "muted note")}
       <div class="rank-wrap"><table class="rank mono"><tbody>${rows}</tbody></table></div>`;
     this.root.querySelector("#search-close").addEventListener("click", () => this.onClose());
     this.root.querySelector("tbody").addEventListener("click", (ev) => {

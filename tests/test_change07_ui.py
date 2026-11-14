@@ -216,6 +216,54 @@ def _free_port() -> int:
         so.bind(("127.0.0.1", 0))
         return so.getsockname()[1]
 
+def _recipe_tab(pg, tab="units"):
+    """右のレシピのパネルを開いて、タブを選ぶ(units 中身 / try 試す / out 書き出す)。中身は保存したレシピの一覧も取り直す。"""
+    if pg.evaluate("document.querySelector('#recipe').classList.contains('collapsed')"):
+        pg.click("#recipe .toggle")
+    pg.click(f"#recipe-tabs button[data-rtab={tab}]")
+
+_STEP_ROOT = {"fish": "#dv-fish", "keys": "#dv-key", "chips": "#dv-pipe", "eval": "#eval-view"}
+
+_ASK_JS = """([answer, once]) => {
+  window.__asked = window.__asked || [];
+  window.__askAns = window.__askAns || [];
+  window.__askAns.push({ answer, once });
+  window.gneAsk = (msg) => {
+    const h = window.__askAns[window.__askAns.length - 1];
+    window.__asked.push(msg);
+    if (h && h.once) window.__askAns.pop();
+    return !!h && h.answer === "accept";
+  };
+}"""
+
+
+def _dialogs(pg, answer="accept", once=False):
+    """確かめる窓に答える(accept = はい、dismiss = やめる。ページの window.gneAsk で、窓を出さずに答える)。once なら次の 1 回だけ。once でなければ、
+    読み直したページでも答える。出た文は _asked で読む。"""
+    if not once:
+        pg.add_init_script(f"addEventListener('DOMContentLoaded', () => ({_ASK_JS})(['{answer}', false]))")
+    pg.evaluate(_ASK_JS, [answer, once])
+
+
+def _asked(pg, clear=False):
+    """確かめる窓に出た文(_dialogs が答えたもの)。clear なら空にする。"""
+    return pg.evaluate("(c) => { if (c) window.__asked = []; return [...(window.__asked || [])]; }", clear)
+
+
+def _step(pg, screen, step):
+    """作る画面の左の手順(作業の一覧)を開く(開いていれば何もしない)。step が shared なら、共通の設定が見える手順にする。"""
+    pg.evaluate("""([root, step]) => {
+      const nav = document.querySelector(`${root} .steps`);
+      if (!nav) return;
+      if (step === "shared") {
+        const sh = document.querySelector(`${root} .stage-shared`);
+        if (!sh || !sh.hidden) return;
+        step = nav.querySelector("[role=tab]").dataset.step;
+      }
+      const b = nav.querySelector(`[role=tab][data-step="${step}"]`);
+      if (b && b.getAttribute("aria-selected") !== "true") b.click();
+    }""", [_STEP_ROOT[screen], step])
+
 
 @pytest.fixture(scope="module")
 def ui_server(tmp_path_factory):
@@ -271,7 +319,7 @@ def _open(browser, url, lang):
     pg = browser.new_page(viewport={"width": 1600, "height": 1100}, locale="ja-JP")
     errors = []
     pg.on("pageerror", lambda e: errors.append(str(e)))
-    pg.on("dialog", lambda dl: dl.accept())
+    _dialogs(pg)
     pg.goto(url + f"/?lang={lang}")
     pg.wait_for_function("window.gne && window.gne.recipe && window.gne.arch", timeout=120000)
     return pg, errors
@@ -287,31 +335,42 @@ def test_key_panel_and_recipe_in_browser(ui_server, browser):
     pg.evaluate("window.gne.recipe.clear()")
     pg.click("#views button[data-view=direction]")
     pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode", timeout=60000)
-    pg.click("#dv-mode button[data-m=key]")
+    pg.click("#views button[data-view=keys]")
     pg.wait_for_function("document.querySelector('#kx-contrast option') && window.gne.directionView.key.loaded", timeout=30000)
     # before:<re> の対照集合(一覧で最初のもの)が既定。before:<re> のものは複数あるので、この先で使う NAME を選び直す
     assert pg.evaluate("document.querySelector('#kx-contrast').selectedOptions[0].textContent").endswith(" · before")
     zpath = pg.evaluate(f"[...document.querySelectorAll('#kx-contrast option')].map(o => o.value).find(v => v.endsWith('{NAME}.yaml'))")
+    _step(pg, "keys", "shared")
     pg.select_option("#kx-contrast", zpath)
     assert "before" in pg.evaluate("document.querySelector('#kx-cinfo').textContent") or "(b)" in pg.evaluate(
         "document.querySelector('#kx-cinfo').textContent")
     assert "まだありません" in pg.evaluate("document.querySelector('#kx-keys').textContent")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-name", "zk_web")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-layers", "8,14")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-pseudo", "8")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-mt", "24")
+    _step(pg, "keys", "shared")
     pg.click(".kx-adv summary")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-replies", ui_server["replies"])
+    _step(pg, "keys", "make")
     pg.click("#kx-go")
+    _step(pg, "keys", "make")
     pg.wait_for_selector("#kx-build table.kx-tab tbody tr", timeout=600000)
     rows = pg.evaluate("[...document.querySelectorAll('#kx-build table.kx-tab tbody tr')].map(tr => tr.cells[0].textContent)")
     assert rows == ["L8", "L14"]
     assert pg.evaluate("document.querySelector('#kx-dir').value") == NAME                 # 対照集合と同じ名前の方向を選んでおく
     assert "zk_web" in pg.evaluate("document.querySelector('#kx-keys').textContent")
     _shot(pg, "keyed_build.png")
-    # この鍵で key-check(対照集合・返事・反対側の subset を入れて回す)
+    # この鍵で key-check(対照集合・返事・反対側の質問を入れて回す)
+    _step(pg, "keys", "make")
     pg.click("#kx-build [data-kcheck]")
     assert pg.evaluate("document.querySelector('#kc-subset').value") == "odd"
+    _step(pg, "keys", "check")
     pg.wait_for_selector("#kc-res table.kx-check tbody tr", timeout=600000)
     chk = pg.evaluate("[...document.querySelectorAll('#kc-res table.kx-check tbody tr')].map(tr => tr.cells[0].textContent.trim())")
     assert [x.replace(" ★", "") for x in chk] == ["L8", "L14"]
@@ -323,13 +382,14 @@ def test_key_panel_and_recipe_in_browser(ui_server, browser):
     pg.evaluate("document.querySelector('#kc-res .kx-hists').scrollIntoView()")
     _shot(pg, "keyed_check.png")
     # 「+ レシピ」で L14 の keyed をレシピへ(方向 zundamon_endings、鍵 zk_web、α 1)
+    _step(pg, "keys", "make")
     pg.click("#kx-build [data-kadd='14']")
     u = pg.evaluate("window.gne.recipe.keyed()")
     assert u == [{"layer": 14, "kind": "ffn", "mode": "keyed", "alpha": 1, "direction": NAME, "key": "zk_web"}]
     pg.wait_for_selector("#recipe-list tr.rc-keyed", timeout=10000)
     # レシピのタブ: 既定の鍵を使う行を足す(L8、鍵は「既定」)。既定の鍵を zk_web に
     pg.evaluate("window.gne.recipe.addKeyed({layer: 8, kind: 'ffn', alpha: 0.5, direction: null, key: null})")
-    pg.click("#list-tabs button[data-tab=recipe]")
+    _recipe_tab(pg)
     pg.wait_for_selector("#rc-kdk", timeout=10000)
     assert pg.evaluate("document.querySelectorAll('#recipe-list tr.rc-keyed .badge.warn').length") >= 1   # 鍵・方向が無い行に印
     pg.select_option("#rc-kdk", "zk_web")
@@ -348,6 +408,7 @@ def test_key_panel_and_recipe_in_browser(ui_server, browser):
     assert saved["default_key"] == "zk_web" and saved["default_direction"] == NAME
     assert {"layer": 8, "kind": "ffn", "mode": "keyed", "alpha": 0.5} in saved["units"]
     # LoRA・焼き込みの欄: keyed だけなら既定の名前は -keyed、焼き込みの型の既定は auto(Q8_0 は元のまま、ほかは F16)
+    _recipe_tab(pg, "out")
     pg.click("#rc-lora")
     pg.wait_for_selector(".rc-lx", timeout=5000)
     assert pg.evaluate("document.querySelector('#lx-file').placeholder") == "zk_web_r-keyed"
@@ -359,7 +420,7 @@ def test_key_panel_and_recipe_in_browser(ui_server, browser):
     pg.reload()
     pg.wait_for_function("window.gne && window.gne.recipe && window.gne.arch", timeout=120000)
     pg.evaluate("document.querySelector('#list').classList.remove('collapsed')")
-    pg.click("#list-tabs button[data-tab=recipe]")
+    _recipe_tab(pg)
     pg.wait_for_function("[...document.querySelectorAll('#rc-load option')].some(o => o.value === 'zk_web_r')", timeout=30000)
     pg.select_option("#rc-load", "zk_web_r")
     pg.wait_for_function("document.querySelectorAll('#recipe-list tr.rc-keyed').length === 2", timeout=10000)
@@ -380,7 +441,7 @@ def test_key_panel_in_english(ui_server, browser):
     pg.evaluate(f"window.gne.recipe.clear(); window.gne.recipe.addKeyed({{layer: 14, kind: 'ffn', alpha: 1, direction: '{NAME}', key: 'nope'}})")
     pg.click("#views button[data-view=direction]")
     pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode", timeout=60000)
-    pg.click("#dv-mode button[data-m=key]")
+    pg.click("#views button[data-view=keys]")
     pg.wait_for_function("window.gne.directionView.key.loaded", timeout=30000)
     assert pg.evaluate("!!window.gne.directionView.key")
     # 保存した結果の形で key-check を描く(ジョブは回さない)
@@ -396,9 +457,10 @@ def test_key_panel_in_english(ui_server, browser):
     assert pg.evaluate("document.querySelectorAll('#kc-res svg.kx-hist').length") == 1
     assert "Overlaps the build examples" in pg.evaluate("document.querySelector('#kc-res').textContent")
     pg.evaluate("document.querySelector('#list').classList.remove('collapsed')")
-    pg.click("#list-tabs button[data-tab=recipe]")
+    _recipe_tab(pg)
     pg.wait_for_selector("#recipe-list tr.rc-keyed", timeout=10000)
     assert "key nope not found" in pg.evaluate("document.querySelector('#recipe-list tr.rc-keyed').textContent")
+    _recipe_tab(pg, "out")
     pg.click("#rc-lora")
     pg.check("input[name=lx-kind][value=bake]")
     pg.click("#views button[data-view=eval]")
@@ -473,10 +535,15 @@ def test_eval_keyed_params_and_block_in_browser(ui_server, browser):
         pg.wait_for_function("window.gne.evalView && !document.querySelector('#evx-kx').classList.contains('hidden')", timeout=30000)
         pg.wait_for_function("document.querySelectorAll('#evx-kc option').length > 1", timeout=10000)
         zpath = pg.evaluate(f"[...document.querySelectorAll('#evx-kc option')].map(o => o.value).find(v => v.endsWith('{NAME}.yaml'))")
+        _step(pg, "eval", "main")
         pg.select_option("#evx-kc", zpath)
+        _step(pg, "eval", "main")
         pg.select_option("#evx-ks", "even")
+        _step(pg, "eval", "main")
         pg.fill("#evx-kp", "4")
+        _step(pg, "eval", "main")
         pg.uncheck("#evx-kmatch")
+        _step(pg, "eval", "main")
         pg.click("#evx-go")
         for _ in range(100):                     # ルートの処理は Playwright が待っている間に走る(time.sleep では進まない)
             if posts:
@@ -486,7 +553,9 @@ def test_eval_keyed_params_and_block_in_browser(ui_server, browser):
         assert posts[0]["kind"] == "eval" and p["units"] == [f"14:ffn:keyed:a1@{NAME}#zk_web"]          # 既定の鍵を埋めて送る
         assert (p["keyed_metrics"], p["keyed_contrast"], p["keyed_subset"], p["keyed_examples"], p["keyed_pseudo"], p["keyed_match"]) \
             == (True, zpath, "even", 8, 4, False)
+        _step(pg, "eval", "main")
         pg.uncheck("#evx-km")
+        _step(pg, "eval", "main")
         pg.click("#evx-go")
         for _ in range(100):
             if len(posts) > 1:
@@ -508,8 +577,11 @@ def test_eval_keyed_params_and_block_in_browser(ui_server, browser):
         if lang == "ja":
             pg.evaluate("document.querySelector('#evx-body .evx-kx').scrollIntoView()")
             _shot(pg, "keyed_eval.png")
-        pg.click("#evx-body [data-krc='0']")                                                # keyed の方式のレシピを recipe タブへ
-        assert pg.evaluate("window.gne.recipe.keyed().length") == 1 and pg.evaluate("window.gne.recipe.keyed()[0].key") == "zk_web"
+        _asked(pg, clear=True)
+        _dialogs(pg, "accept", once=True)           # いまのレシピを置き換える前に確かめる
+        _step(pg, "eval", "main")
+        pg.click("#evx-body [data-krc='0']")                                                # keyed の方式のレシピでレシピを置き換える
+        assert _asked(pg) and pg.evaluate("window.gne.recipe.keyed().length") == 1 and pg.evaluate("window.gne.recipe.keyed()[0].key") == "zk_web"
         # 測っていない(対照集合が分からない)
         skipped = {"skipped": "鍵の対照集合が分かりません", "hint": "--keyed-contrast で渡してください"}
         pg.evaluate(f"(() => {{ const v = window.gne.evalView; v.data = {json.dumps(_fake_eval(skipped))}; v.render(); }})()")
@@ -527,7 +599,7 @@ def test_eval_keyed_params_and_block_in_browser(ui_server, browser):
 def _key_tab(pg):
     pg.click("#views button[data-view=direction]")
     pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode", timeout=60000)
-    pg.click("#dv-mode button[data-m=key]")
+    pg.click("#views button[data-view=keys]")
     pg.wait_for_function("window.gne.directionView.key.loaded && document.querySelector(\"#kx-tpl-sel option[value='sentence_endings.json']\")",
                          timeout=30000)
 
@@ -541,51 +613,67 @@ def test_key_panel_template_pipeline_and_verify_in_browser(ui_server, browser):
     「key-verify」で V30 の表。ジョブのバーの名前。"""
     url, s = ui_server["url"], ui_server["session"]
     pg, errors = _open(browser, url, "ja")
-    dialogs = []
-    pg.on("dialog", lambda dl: dialogs.append(dl.message))                  # _open が受け入れる。ここでは数えるだけ
+    _asked(pg, clear=True)                  # _open が受け入れる。ここでは数えるだけ
     _key_tab(pg)
     assert not pg.evaluate("document.querySelector('#kx-src-file').classList.contains('hidden')")         # 既定はファイルを選ぶ
+    _step(pg, "keys", "shared")
     pg.select_option("#kx-tpl-sel", "sentence_endings.json")
     assert pg.evaluate("document.querySelector('#kx-src-file').classList.contains('hidden')")             # JSON を書くに替わる
-    assert '"noda_endings"' in pg.input_value("#kx-text") and dialogs == []
+    assert '"noda_endings"' in pg.input_value("#kx-text") and _asked(pg) == []
     assert "「です。」「ます。」を書く直前" in pg.evaluate("document.querySelector('#kx-tpl-about').textContent")
     jc = pg.evaluate("document.querySelector('#kx-jcheck').textContent")
     assert "noda_endings" in jc and "質問 16 個" in jc and "作り方 (b)" in jc and "english 4 問" in jc
     assert "まだありません" in pg.evaluate("document.querySelector('#kx-dirinfo').textContent")
     assert pg.evaluate("document.querySelector('#kx-name').placeholder") == "noda_endings"
     # 手で直す → 別のひな形を選ぶと確かめる(受け入れる)。(a) の例の keyed.alpha −1 が「+ レシピ」の α に入る
+    _step(pg, "keys", "shared")
     pg.fill("#kx-text", pg.input_value("#kx-text").replace('"noda_endings"', '"noda_web"'))
     assert "noda_web" in pg.evaluate("document.querySelector('#kx-jcheck').textContent")
+    _step(pg, "keys", "shared")
     pg.select_option("#kx-tpl-sel", "system_state.json")
-    assert len(dialogs) == 1 and '"polite_state"' in pg.input_value("#kx-text")
+    assert len(_asked(pg)) == 1 and '"polite_state"' in pg.input_value("#kx-text")
     assert "作り方 (a)" in pg.evaluate("document.querySelector('#kx-jcheck').textContent")
     pg.evaluate("(() => { const k = window.gne.directionView.key; k.built = {kind: 'saved', r: {name: 'tmp', target: 'ffn', layers: [8], kn: {8: 0.5}, info: {}}}; k.renderBuilt(); })()")
     assert pg.input_value("#kx-alpha") == "-1"
+    _step(pg, "keys", "shared")
     pg.select_option("#kx-tpl-sel", "sentence_endings.json")                # 書き換えていないので確かめない
-    assert len(dialogs) == 1 and '"noda_endings"' in pg.input_value("#kx-text")
+    assert len(_asked(pg)) == 1 and '"noda_endings"' in pg.input_value("#kx-text")
     # 読めない JSON: エラーを出し、ボタンを押してもジョブを投げない
     good = pg.input_value("#kx-text")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-text", good.replace('"name": "noda_endings"', '"name": "a/b"'))
     assert pg.evaluate("document.querySelectorAll('#kx-jcheck .err').length") == 1
+    _step(pg, "keys", "make")
     pg.click("#kx-pipe-go")
     assert "直すところ" in pg.evaluate("document.querySelector('#kx-status').textContent")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-text", good)
     # 書き込む方向に別の方向を選んでおく(一括の後は作ったばかりの方向に替わる)
     pg.evaluate("(() => { const k = window.gne.directionView.key; k.renderBuilt(); })()")
+    _step(pg, "keys", "make")
     pg.select_option("#kx-dir", NAME)
+    _step(pg, "keys", "shared")
     pg.fill("#kx-layers", "8,14")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-pseudo", "8")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-mt", "24")
+    _step(pg, "keys", "shared")
     pg.click(".kx-adv summary")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-replies", ui_server["replies"])
+    _step(pg, "keys", "shared")
     pg.fill("#kx-rt", "16")
+    _step(pg, "keys", "make")
     pg.click("#kx-pipe-go")
+    _step(pg, "keys", "make")                                                         # 一括の結果は「鍵を作る」の下に 1 か所で出る
     pg.wait_for_selector("#kc-res table.kx-check tbody tr", timeout=600000)
+    assert pg.evaluate("document.querySelector('#kc-res').closest('[data-anchor]').dataset.anchor") == "make"
     pg.wait_for_selector("#kx-build table.kx-tab tbody tr", timeout=10000)
     rows = pg.evaluate("[...document.querySelectorAll('#kx-build table.kx-tab tbody tr')].map(tr => tr.cells[0].textContent)")
     assert rows == ["L8", "L14"]
     pipe = pg.evaluate("document.querySelector('#kx-pipe').textContent")
-    assert "noda_endings" in pipe and "作りました" in pipe and "subset odd" in pipe
+    assert "noda_endings" in pipe and "作りました" in pipe and "使う質問 奇数番目" in pipe
     assert pg.input_value("#kx-dir") == "noda_endings" and pg.input_value("#kx-alpha") == "1"
     assert pg.input_value("#kc-key") == "noda_endings" and pg.input_value("#kc-subset") == "odd"
     assert pg.input_value("#kc-contrast").endswith("/contrasts/noda_endings.yaml")
@@ -597,7 +685,9 @@ def test_key_panel_template_pipeline_and_verify_in_browser(ui_server, browser):
     assert "about" not in y and y["positions"] == "before:(です|ます)。"
     _shot(pg, "keyed_pipeline.png")
     # key-verify(L14、書き込む方向 noda_endings)
+    _step(pg, "keys", "make")
     pg.click("#kx-build [data-kverify='14']")
+    _step(pg, "keys", "make")
     pg.wait_for_selector("#kx-vres table.kx-verify tbody tr", timeout=300000)
     assert pg.evaluate("document.querySelectorAll('#kx-vres table.kx-verify tbody tr').length") == 2
     assert "合格(V30)" in pg.evaluate("document.querySelector('#kx-verify').textContent")
@@ -634,24 +724,30 @@ def test_key_panel_experts_verify_in_english(ui_server, browser):
     pg, errors = _open(browser, url, "en")
     _key_tab(pg)
     assert pg.evaluate("document.querySelector('#kx-exp-go').classList.contains('hidden')")              # Qwen3-0.6B は dense
+    _step(pg, "keys", "shared")
     pg.select_option("#kx-tpl-sel", "one_scene.json")
     assert "starts" in pg.evaluate("document.querySelector('#kx-tpl-about').textContent")
     assert "tsundere_scene" in pg.evaluate("document.querySelector('#kx-jcheck').textContent")
     txt = pg.input_value("#kx-text")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-text", txt.replace('"positions": "before:', '"positions": "bogus:'))
     assert "must be response" in pg.evaluate("document.querySelector('#kx-jcheck').textContent")
     spec = json.loads(txt)
     spec.pop("dont_touch")
     spec["user_prompts"] = spec["user_prompts"][:6]
     spec["keyed"] = {"nope": 1}
+    _step(pg, "keys", "shared")
     pg.fill("#kx-text", json.dumps(spec, ensure_ascii=False))
     jc = pg.evaluate("document.querySelector('#kx-jcheck').textContent")
     assert "No dont_touch" in jc and "Only 6 questions" in jc and "keyed cannot contain nope" in jc
     spec.pop("keyed")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-text", json.dumps(spec, ensure_ascii=False))
     # 専門家: MoE の層を与えてボタンを出す。層の欄に MoE の層が無ければ投げない
     pg.evaluate("(() => { const k = window.gne.directionView.key; k.moe = new Set([3]); k.$('#kx-exp-go').classList.remove('hidden'); })()")
+    _step(pg, "keys", "shared")
     pg.fill("#kx-layers", "1")
+    _step(pg, "keys", "make")
     pg.click("#kx-exp-go")
     assert "no MoE layer" in pg.evaluate("document.querySelector('#kx-estatus').textContent")
     pg.evaluate(f"(() => {{ const k = window.gne.directionView.key; k.experts = {json.dumps(EXPERTS)}; k.renderExperts(); }})()")
@@ -659,6 +755,7 @@ def test_key_panel_experts_verify_in_english(ui_server, browser):
     assert head[:7] == ["expert", "rate_a", "rate_b", "diff", "lift", "weight", "expected rows"]
     cells = pg.evaluate("[...document.querySelectorAll('#kx-eres table.kx-exps tbody tr')][0].textContent")
     assert "E5" in cells and "100%" in cells and "32%" in cells and "3.10×" in cells and "15.0" in cells
+    _step(pg, "keys", "make")
     pg.click("#kx-eres [data-kexp='3:5']")
     assert pg.input_value("#kx-target") == "expert" and pg.input_value("#kx-expert") == "5" and pg.input_value("#kx-layers") == "3"
     assert pg.input_value("#kx-name") == "tsundere_scene_L3E5"
@@ -675,10 +772,12 @@ def test_key_panel_experts_verify_in_english(ui_server, browser):
     pg.evaluate("(() => { const k = window.gne.directionView.key; k.dirs = [...k.dirs, {name: 'tsundere_scene', positions: 'last'}]; k.dirInfo(); })()")
     di = pg.evaluate("document.querySelector('#kx-dirinfo').textContent")
     assert "will be reused" in di and "built with positions last" in di
+    _step(pg, "keys", "make")
     pg.check("#kx-rebuild")
     assert "will be rebuilt" in pg.evaluate("document.querySelector('#kx-dirinfo').textContent")
     names = pg.evaluate("import('/jobs.js').then((m) => [m.KIND.direction_key_experts, m.KIND.direction_key_verify, m.KIND.direction_key_pipeline])")
     assert names == ["expert usage", "LoRA check (key-verify)", "Direction to key-check"]
+    _step(pg, "keys", "shared")
     pg.click("#kx-src button[data-src=file]")
     assert not pg.evaluate("document.querySelector('#kx-src-file').classList.contains('hidden')")
     missing = pg.evaluate("[...window.gneI18n.missing]")
@@ -802,13 +901,16 @@ def test_key_view_late_load_does_not_overwrite(ui_server, browser):
     pg, errors = _open(browser, url, "ja")
     pg.route("**/api/keys**", on_keys)
     _key_tab(pg)
+    _step(pg, "keys", "saved")
     pg.wait_for_selector("#kx-keys [data-kview=kview_b]", timeout=10000)
+    _step(pg, "keys", "saved")
     pg.click("#kx-keys [data-kview=kview_a]")
     for _ in range(400):
         if held:
             break
         pg.wait_for_timeout(25)
     assert held
+    _step(pg, "keys", "saved")
     pg.click("#kx-keys [data-kview=kview_b]")
     pg.wait_for_function("window.gne.directionView.key.built && window.gne.directionView.key.built.r.name === 'kview_b'", timeout=10000)
     with pg.expect_response("**/api/keys/kview_a"):
@@ -817,5 +919,8 @@ def test_key_view_late_load_does_not_overwrite(ui_server, browser):
     assert pg.evaluate("window.gne.directionView.key.built.r.name") == "kview_b"
     head = pg.evaluate("document.querySelector('#kx-build .kx-res p.note').textContent")
     assert "kview_b" in head and "kview_a" not in head
+    # 「見る」の結果は、保存した鍵の一覧のすぐ下に出る(作るの区画ではなく)。作業の一覧の印は替わらない
+    assert pg.evaluate("document.querySelector('#kx-build').closest('[data-anchor]').dataset.anchor") == "saved"
+    assert pg.evaluate("document.querySelector('#kx-build').offsetParent !== null")
     assert not errors, errors
     pg.close()
