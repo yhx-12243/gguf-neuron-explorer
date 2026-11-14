@@ -2722,12 +2722,16 @@ class Session:
     # --- 鍵つきの書き込み(CHANGE-07)--------------------------------------------------------------------
 
     def direction_key(self, contrast: str | Path, **kw) -> dict:
-        """対照集合から keyed の鍵を作る(gne direction key)。中身は gne/keyed_build.py の build_keys。"""
+        """从对照集创建 keyed 的键（gne direction key）。内部使用 gne/keyed_build.py 的 build_keys。
+        key_fit="ridge"（以及 key_c）会用最小二乘法创建 FiSH 的位置键（target mlpin、positions pos:<范围>）（gne/keyed_ridge.py）。"""
         role = kw.pop("role", None)
         if role in ("scene", "one"):                     # 計算で作るニューロン用の、場面の鍵・ほぼ 1 を返す鍵(target mlpin)
             from .nwrite import build_role_key
             if str(kw.pop("target", "mlpin") or "mlpin") != "mlpin":
                 raise GneError("BAD_ARGS", "role scene / one 的键只能使用 target mlpin")
+            if kw.pop("key_fit", None) not in (None, "mean") or kw.pop("key_c", None) is not None:
+                raise GneError("BAD_ARGS", "最小二乘键（key_fit ridge、key_c）只能用于位置键",
+                               "场景键（scene）和几乎返回 1 的键（one）只有一种构建方式")
             keep = ("layers", "name", "subset", "max_tokens", "pseudo", "iv", "seed", "q_energy", "progress", "gen_cache")
             extra = sorted(k for k, v in kw.items() if k not in keep and v not in (None, False))
             if extra:

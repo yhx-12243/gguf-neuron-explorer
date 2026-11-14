@@ -1883,6 +1883,12 @@ def _replies_text(replies: dict | None) -> str:
     return "、回复 " + "、".join(f"{g} {_REPLY_KIND.get(v, "无")}" for g, v in replies.items())
 
 
+_KEY_FIT = ("键的构建方式：mean（默认。现有做法 = 从目标位置状态的平均值中，去除不希望写入位置也会出现的成分）/ "
+            "ridge（最小二乘键。把每个位置分别作为一行，用闭式解求出在目标写入位置返回 1、在不希望写入位置返回 0 的键。"
+            "不希望写入位置的权重按“场景组 × 位置分段”的每个单元格相同。仅适用于 FiSH 的位置键 = --target mlpin --positions pos:<范围>）")
+_KEY_C = "--key-fit ridge 的正则化强度（矩阵对角线平均值的多少倍。例如 1）。省略时，只用建键问题按问题为单位做 5 折交叉验证，从 0.01、0.1、1、10、100 中决定"
+
+
 @gne_command(direction_app, "key", "direction key")
 def direction_key(c: Common, holder: dict,
                   contrast: Path = typer.Option(..., "--contrast", help="对照集 YAML(system_a、system_b 与问题，可选 dont_touch、positions、replies。例 configs/contrast/zundamon_endings.yaml)"),
@@ -1905,10 +1911,13 @@ def direction_key(c: Common, holder: dict,
                   target: str = typer.Option("ffn", "--target", help=("写入目标: mlpin(用于计算生成的神经元。dense 的 MLP 输入 = 归一化后的空间。回复位置的键写成 --positions pos:1-3)/ ffn(dense 的 ffn_down 输入)/ attn(attn_output、ssm_out 的输入 = 注意力头输出的拼接)/ "
         "shared(MoE 层的 shared expert 的 ffn_down_shexp 输入)/ expert:e(ffn_down_exps 中专家 e "
         "的输入。仅在专家 e 被选中的位置创建) ")),
-                  dont_touch_start: Optional[bool] = typer.Option(None, "--dont-touch-start/--no-dont-touch-start", help="dont_touch 各群问题的、开始写回复紧前方的位置也加入 Q(默认为对照集的 dont_touch_start，没有则加入)。不希望写入侧问题的此位置不加入")):
-    """keyed write の鍵 κ_L を作る(CHANGE-07)。書き込みたい位置の活性の平均 μ_L を、書き込みたくない位置と dont_touch の
-    活性が張る空間 Q_L に直交させ、κ_Lᵀμ_L = 1 に正規化して保存する(方向とは別のファイル)。鍵は無介入で作る(--iv は重ねるときだけ)。
-    作ったら gne direction key-check で、作成に使っていない例(既定 subset odd)で分離を確かめる。"""
+                  dont_touch_start: Optional[bool] = typer.Option(None, "--dont-touch-start/--no-dont-touch-start", help="dont_touch 各群问题的、开始写回复紧前方的位置也加入 Q(默认为对照集的 dont_touch_start，没有则加入)。不希望写入侧问题的此位置不加入"),
+                  key_fit: str = typer.Option("mean", "--key-fit", help=_KEY_FIT),
+                  key_c: Optional[float] = typer.Option(None, "--key-c", help=_KEY_C)):
+    """创建 keyed write 的键 κ_L（CHANGE-07）。将目标写入位置的激活平均值 μ_L 与不希望写入位置及 dont_touch 的
+    激活所张成的空间 Q_L 正交，归一化为 κ_Lᵀμ_L = 1 后保存（与方向分开的文件）。键在无干预状态下创建（--iv 仅用于叠加）。
+    创建后，用 gne direction key-check 在未用于创建的示例（默认 subset odd）上确认分离效果。
+    --key-fit ridge 会用最小二乘法创建 FiSH 的位置键（--target mlpin --positions pos:<范围>）（docs/fish.md §3。不能用于 keyed write 的键）。"""
     Ls = parse_layers(layers)
     if not Ls:
         raise GneError("BAD_ARGS", "请在 --layers 中指定层(不能使用 all)", "例 --layers 8,14,20")
@@ -1917,13 +1926,14 @@ def direction_key(c: Common, holder: dict,
                         max_tokens=max_tokens, q_mode=q_mode, q_energy=q_energy, q_max_rank=q_max_rank,
                         q_max_samples=q_max_samples, subset=subset, pseudo=pseudo, replies_a=replies_a,
                         replies_b=replies_b, iv=_iv_arg(iv), target=target, seed=c.seed, dont_touch_start=dont_touch_start,
-                        progress=s.progress)
+                        progress=s.progress, key_fit=key_fit, key_c=key_c)
     d.pop("warnings", None)                        # 警告はエンベロープの warnings に入っている
     n = d["counts"]
     moe = any("rows_a" in r for r in d["layers"])            # 書き込み先 shared・expert:e の鍵(層ごとの行の数を出す)
     how = "与推理时相同上下文的回复" if d["mode"] == "same" else "system、recipe 的上下文"
     lines = [f"{d['path']}(键 {d['name']}、写入目标 {d['target']}、写入位置为{how}(mode {d['mode']})、{d['seconds']:.1f} 秒)",
-             f"  位置: 写入位置 {d['positions']}、不希望写入位置 {d['positions_b']}、skip {d['skip']}、subset {d['subset']}、q_mode {d['q_mode']}、比较用键 {d['n_pseudo']} 个",
+             f"  位置: 写入位置 {d['positions']}、不希望写入位置 {d['positions_b']}、skip {d['skip']}、subset {d['subset']}、"
+             + ("键的构建方式 ridge（最小二乘，按单元格加权）" if d.get("key_fit") == "ridge" else f"q_mode {d['q_mode']}") + f"、比较用键 {d['n_pseudo']} 个",
              f"  示例: 写入侧 {n['a']} 个({n['rows_a']} 位置，包含写入位置的样本 {d['matched']['A']}/{d['matched']['of']})、不希望写入侧 {n['b']} 个({n['rows_b']} 位置)" + (f"、dont_touch {n['dt']} 个({n['rows_dt']} 位置)" if n.get("dt") else "")
              + _replies_text(d.get("replies"))]
     ds_ = d.get("dont_touch_start")
@@ -1941,10 +1951,11 @@ def direction_key(c: Common, holder: dict,
     lines += [f"  {'层':>4} {'kn':>6} {'放大率':>7} {'q_rank':>6} {'创建时AUC':>9}"
              + (f" {'rows_a':>6} {'rows_b':>6} {'gate_a':>7}" if moe else "")]
     for r in d["layers"]:
-        lines.append(f"  {r['layer']:>4} {r['kn']:>6.3f} {r['gain']:>7.2f} {r['q_rank']:>6} {_fc(r['build_auc'], '>9.3f')}"
+        lines.append(f"  {r['layer']:>4} {r['kn']:>6.3f} {r['gain']:>7.2f} {'—' if r['q_rank'] is None else r['q_rank']:>6} {_fc(r['build_auc'], '>9.3f')}"
                      + (f" {r['rows_a']:>6} {r['rows_b']:>6} {_fc(r.get('gate_a'), '>7.3f')}" if moe else "")
                      + ("  ← 弱(kn < 0.05，容易泄漏到不希望写入的位置)" if r["weak"] else ""))
-    lines.append("  kn = ‖k‖/‖μ‖(越接近 1，写入位置的平均越位于不希望写入位置子空间之外)、放大率 = 1/kn"
+    lines.append(("  kn = 1/(‖κ‖‖μ‖)、放大率 = 1/kn（最小二乘键没有 Q，因此不显示 q_rank）" if d.get("key_fit") == "ridge" else
+                  "  kn = ‖k‖/‖μ‖（越接近 1，目标写入位置的平均值越位于不希望写入位置子空间之外）、放大率 = 1/kn")
                  + ("。rows_a、rows_b = 该层中存在写入目标行的写入位置、不希望写入位置的数量(专家仅为被选中的位置)，gate_a = 写入位置处 gate、router 权重的平均(LoRA 的 B 除以此值)" if moe else ""))
     for x in d["dropped"]:
         lines.append(f"  L{x['layer']}: 已排除({x['error']})")
@@ -3020,18 +3031,39 @@ def nw_neurons(c: Common, holder: dict,
 def nw_key(c: Common, holder: dict,
            contrast: Path = typer.Option(..., "--contrast", help="对照集(user_prompts = 目标场景的问题、dont_touch = 不希望其产生反应的问题组)"),
            layers: str = typer.Option(..., "--layers", help="创建键的层(例 11-23 或 11,18,23)"),
-           role: str = typer.Option("scene", "--role", help="scene(对目标场景问题的回复全程都反应的键)/ one(在任意位置都几乎返回 1 的键。用于带上限的形式)"),
+           role: str = typer.Option("scene", "--role", help="scene（对目标场景问题的回复全程都反应的键）/ one（在任意位置都几乎返回 1 的键。用于带上限的形式）/ position（在回复位置分段处反应的位置键。与 --positions pos:<范围> 一起使用。等同于 gne direction key --target mlpin）"),
+           positions: Optional[str] = typer.Option(None, "--positions", help="--role position 时：键所反应的回复位置（pos:0 / pos:1-3 / pos:4-。位置 0 = 开始写回复之前）"),
+           key_fit: str = typer.Option("mean", "--key-fit", help=_KEY_FIT + "。仅用于 --role position"),
+           key_c: Optional[float] = typer.Option(None, "--key-c", help=_KEY_C),
            name: Optional[str] = typer.Option(None, "--name", help="键的名称(默认 <对照集的 name>_<role>)"),
            subset: str = typer.Option("even", "--subset", help="使用的问题: even(默认)/ odd / all"),
            max_tokens: int = typer.Option(96, "--max-tokens", help="生成回复时的长度"),
            pseudo: int = typer.Option(16, "--pseudo", help="比较用键(打乱问题标签后按相同步骤创建的键)的数量(仅 scene)"),
            iv: Optional[list[str]] = typer.Option(None, "--iv", help="用应用此干预(配方名称或路径，或单元的写法)后的回复和激活创建")):
-    """创建计算生成神经元的“场景键”和“几乎返回 1 的键”(MLP 输入空间、target mlpin)。
-    按回复位置分段反应的“位置键”用 gne direction key --target mlpin --positions pos:1-3 创建。"""
+    """创建计算生成神经元的“场景键”和“几乎返回 1 的键”（MLP 输入空间、target mlpin）。
+    在回复位置分段处反应的“位置键”使用 --role position --positions pos:1-3（等同于 gne direction key --target mlpin --positions pos:1-3）。
+    位置键可通过 --key-fit ridge 改为最小二乘键（按单元格加权。docs/fish.md §3）。若要一次创建各分段的键，
+    请使用 gne nw pipeline --key-fit ridge（所有键共用同一个正则化强度）。"""
+    from .keyed_ridge import check_key_fit
     Ls = parse_layers(layers)
     if not Ls:
         raise GneError("BAD_ARGS", "请在 --layers 中指定层", "例 --layers 11-23")
+    kf = check_key_fit(key_fit)
+    if role != "position" and (kf != "mean" or key_c is not None or positions is not None):
+        raise GneError("BAD_ARGS", "--key-fit ridge、--key-c、--positions 只能用于位置键（--role position）",
+                       "场景键（scene）和几乎返回 1 的键（one）只有一种构建方式")
     s = holder["session"] = c.session()
+    if role == "position":
+        if not positions or not positions.strip().startswith("pos:"):
+            raise GneError("BAD_ARGS", "--role position 需要 --positions pos:<范围>", "例如 --positions pos:1-3")
+        d = s.direction_key(contrast, name=name, layers=Ls, positions=positions, subset=subset, max_tokens=max_tokens, pseudo=pseudo,
+                            iv=_iv_arg(iv), seed=c.seed, target="mlpin", progress=s.progress, key_fit=kf, key_c=key_c)
+        d.pop("warnings", None)
+        lines = [f"{d['path']}（键 {d['name']}、位置键 {d['positions']}、MLP 输入空间、键的构建方式 {d['key_fit']}、{d['seconds']:.1f} 秒）"]
+        for r in d["layers"]:
+            lines.append(f"  L{r['layer']}: kn {r['kn']:.3f}、创建所用示例上的 AUC {_fc(r['build_auc'], '.3f')}")
+        lines += [f"注: {n}" for n in d["notes"]]
+        return {**d, "role": "position"}, "\n".join(lines), 0
     d = s.direction_key(contrast, role=role, name=name, layers=Ls, subset=subset, max_tokens=max_tokens, pseudo=pseudo,
                         iv=_iv_arg(iv), seed=c.seed, progress=s.progress)
     lines = [f"{d['path']}(键 {d['name']}、{d['role']}、MLP 输入空间、{d['seconds']:.1f} 秒)"]
@@ -3075,6 +3107,7 @@ def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
              max_tokens: int = typer.Option(96, "--max-tokens"),
              n_pos: int = typer.Option(8, "--positions", help="从位置 0 起逐位置输出到第几个(之后合并显示)"),
              low: float = typer.Option(0.4, "--low", help="逐题数值：某区间写入量（目标量 = 1）低于此值的问题计为“几乎未写入”"),
+             leak: float = typer.Option(0.2, "--leak", help="逐题数值：在不希望写入的场景中，若某分段位置全部单元的写入量合计绝对值达到此值，就把该问题计为“误写入”（按组的泄漏表也使用同一阈值）"),
              over: float = typer.Option(1.2, "--over", help="逐题数值：某区间各位置全部单元写入量合计超过此值的问题计为“超过目标量”"),
              top: int = typer.Option(5, "--top", help="按写入量从小到大显示多少个未充分写入的问题"),
              name: Optional[str] = typer.Option(None, "--name", help="结果文件名（<root>/behave/<model_id>/<名称>_check.json，包含逐题记录）。省略时使用配方名"),
@@ -3084,15 +3117,18 @@ def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
     在不希望写入的场景中偏离 0 的位置，以及为负(反向)的位置。
     平均值表之后会输出逐题数值摘要：按区间（单元负责的回复位置范围）显示几乎未写入的问题数、超过目标量的问题数，
     以及未充分写入问题的排名（问题与回复开头）。平均值会掩盖部分问题完全未写入的情况。
-    逐题记录会进入 --json 和结果文件。"""
+    逐题记录会进入 --json 和结果文件。
+    最后，输出不希望写入的场景按组的泄漏表：按组、按分段显示写入目标量 --leak（默认 0.2）以上的问题数和平均写入量。
+    还会显示仅位置 0（开始写回复之前）的数量。第一行显示单元的键由哪种方式（mean / ridge）构建。"""
     import re as _re
-    from .nwrite import question_lines
+    from .nwrite import key_fit_line, question_lines
     s = holder["session"] = c.session()
     r = s.recipe(units=unit, path=recipe, default_direction=direction, default_key=key)
     save = name or (r.name if r.name and _re.fullmatch(r"[\w.\-]+", r.name) else "recipe")
     d = s.nw_check(r, contrast, subset=subset, max_tokens=max_tokens, replies=replies, n_pos=n_pos, iv=_iv_arg(iv), low=low, over=over,
-                   top=top, save=save)
-    lines = [f"对照集 {d['contrast']}(subset {d['subset']}、回复 {d['replies']}、{d['seconds']:.0f} 秒)。值为写入量的平均值(α·d 为 1。括号内为最小～最大)"]
+                   leak=leak, top=top, save=save)
+    lines = [f"对照集 {d['contrast']}(subset {d['subset']}、回复 {d['replies']}、{d['seconds']:.0f} 秒)。值为写入量的平均值(α·d 为 1。括号内为最小～最大)",
+             key_fit_line(d.get("key_fit"))]
     for g, x in d["groups"].items():
         lines.append(f"[{g}] {x['n']} 个问题、循环 {x['loops']}")
         for u in x["units"]:
@@ -3163,6 +3199,8 @@ def nw_pipeline(c: Common, holder: dict,
                 stack: Optional[bool] = typer.Option(None, "--stack/--no-stack", help="让上层方向使用写入下层后的剩余部分（默认使用。耗时随层数增加）"),
                 stack_fast: Optional[bool] = typer.Option(None, "--stack-fast/--no-stack-fast", help="在创建方向的阶段，把逐层重读改为快速读取（对连续分段的范围一次读取。默认关闭）。大型模型上创建方向会快得多，但方向会略有变化（与默认读取创建的方向 cos 不低于 0.999）。适合比较层与强度的探索；制作要分发的成品时不要开启。与 --direction 一起传入时不会生效（会给出提示）"),
                 rekey: Optional[bool] = typer.Option(None, "--rekey/--no-rekey", help="在应用生成的单元的状态下重建键（默认重建）"),
+                key_fit: Optional[str] = typer.Option(None, "--key-fit", help="位置键的构建方式：mean（默认。现有做法）/ ridge（最小二乘键。将每个位置分别作为一行，用闭式解求出在目标写入位置返回 1、在不希望写入位置返回 0 的键。不希望写入位置的权重按“场景组（dont_touch 的组的 name 与目标场景的其他区间）× 位置分段（--segments）”的每个单元格相同）。应用配方后重建键的阶段也使用相同构建方式。键计算在 CPU 上进行，层和问题较多时需要数分钟（会计入估算）。已在 1 个模型、1 个性格上验证（docs/fish.md §3）"),
+                key_c: Optional[float] = typer.Option(None, "--key-c", help=_KEY_C),
                 pseudo: Optional[int] = typer.Option(None, "--pseudo", help="比较用键的数量（默认 4）"),
                 max_tokens: Optional[int] = typer.Option(None, "--max-tokens", help="用键与写入量生成回复的长度（默认 96）"),
                 response_tokens: Optional[int] = typer.Option(None, "--response-tokens", help="用方向生成回复的长度（默认 96）"),
@@ -3175,7 +3213,10 @@ def nw_pipeline(c: Common, holder: dict,
     （若要重新选择，请查看 gne nw neurons 的表并编写配方）。输出为简短摘要（是否符合公式、单元和神经元数量、写入量、
     逐题数值数量、配方保存位置）。加上 --save 后会写出配方，可直接传给 gne nw verify / check / export 的 --recipe。
     使用 --direction NAME 可直接使用已有方向而不重建。使用 --cap 可按分段设置带上限形式的阈值。
-    --stack-fast 只把创建方向的阶段改为快速读取（适合探索。方向会略有变化。摘要会显示使用了哪种读取方式创建的方向）。"""
+    --stack-fast 只把创建方向的阶段改为快速读取（适合探索。方向会略有变化。摘要会显示使用了哪种读取方式创建的方向）。
+    --key-fit ridge 会把位置键改为最小二乘键（按单元格加权；默认为现有做法）。不希望写入的场景（dont_touch）中，
+    除了问题，还应把非问题发言（近况汇报、邀请、问候、请求、自言自语）按类型分组加入。摘要会显示键的构建方式，
+    以及不希望写入场景按组的泄漏表。"""
     from . import fish
     from .jobs import _fish_pipeline
     if not parse_layers(layers):
@@ -3184,12 +3225,19 @@ def nw_pipeline(c: Common, holder: dict,
     p = {"contrast": str(contrast), "layers": layers, "alpha": alpha, "cap": cap, "direction": direction, "segments": segments,
          "form": form, "name": name, "save": save,
          "same_reply": same_reply, "stack": stack, "stack_fast": stack_fast, "rekey": rekey, "pseudo": pseudo,
-         "max_tokens": max_tokens, "response_tokens": response_tokens, "top": top, "iv": _iv_arg(iv)}
+         "max_tokens": max_tokens, "response_tokens": response_tokens, "top": top, "iv": _iv_arg(iv), "key_fit": key_fit, "key_c": key_c}
     p = {k: v for k, v in p.items() if v is not None}
     if save is not None:
         fish.recipe_file(s, save)                    # 保存先が読めなければ、見積もりの前に止める
     if cap is not None:                              # しきい値が読めなければ、見積もりの前に止める
         fish.caps_of(cap, len(fish._segments(segments)), form or fish.DEFAULTS["form"])
+    from .keyed_ridge import check_c, check_key_fit
+    kf = check_key_fit(key_fit)                      # 鍵の作り方・強さが読めなければ、見積もりの前に止める
+    if check_c(key_c) is not None and kf != "ridge":
+        raise GneError("BAD_ARGS", "--key-c（正则化强度）只能与 --key-fit ridge 一起使用")
+    if kf == "ridge" and fish.before_mode(fish._segments(segments)):
+        raise GneError("BAD_ARGS", "最小二乘键（--key-fit ridge）只能用于回复位置分段（0,1-3,4- 等）的键",
+                       "写入位置为 before:<正则表达式> 时，请使用现有做法（--key-fit mean）创建")
     _gate(s, "fish_pipeline", p, yes, None)
     d = _fish_pipeline(s, **p)
     out = d if full else {**d["summary"], "units": d["units"], "contrast_path": d["contrast_path"]}

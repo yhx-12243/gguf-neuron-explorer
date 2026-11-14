@@ -796,7 +796,8 @@ def gen_key(convs, max_tokens: int, vecs, lora) -> str:
 def collect_acts(session, convs, *, layers, positions="response", skip: int = 0, max_tokens: int = 96,
                  replies: Sequence[str] | None = None, iv=None, target: str = "ffn", samples: int = 0,
                  project: Mapping[int, np.ndarray] | None = None, rms_groups: Sequence[str] = ("A",), seed: int = 0,
-                 start: int = 0, tick: Callable[[str], None] | None = None, gen_cache: dict | None = None) -> dict:
+                 start: int = 0, tick: Callable[[str], None] | None = None, gen_cache: dict | None = None,
+                 rows_sink: Callable | None = None) -> dict:
     """会話 convs(メッセージのリストか、1 ターンの質問の文字列)を読み、指定した層の書き込み先の入力活性を位置で選んで集める。
     gen_cache(dict)を渡すと、生成した返事(トークン列と文面)をそこに覚え、同じ会話の組・同じ長さ・同じ介入の 2 回目からは
     生成し直さずに使う(同じ返事から何本も鍵を作るとき。gen_key)。
@@ -818,7 +819,9 @@ def collect_acts(session, convs, *, layers, positions="response", skip: int = 0,
     x @ project[L].T)]}(project のとき)} を入れる。鍵の作成は側 A が書き出しに偏っていないかを、key-check は側 B・dont_touch の
     書き出しで鍵が合っていないかを見る。
     target は書き込み先の文字列(ffn / attn / shared / expert:e)か、TargetCapture(層は呼ぶ側が確かめたもの)。
-    tick(msg) は会話 1 本(と生成 1 回)ごとに呼ぶ。"""
+    tick(msg) は会話 1 本(と生成 1 回)ごとに呼ぶ。
+    rows_sink(会話の番号, プロンプトのトークン数, 返事のトークン数, rows_of) を渡すと、読んだ会話 1 本ごとに呼ぶ。rows_of(層, 列の番号の
+    並び) がその位置の行を返す(位置 1 つずつの行を使う鍵の計算用。keyed_ridge.RowStore.add)。"""
     t0 = time.perf_counter()
     e, w = session.engine, session.weights
     Ls = sorted({int(L) for L in layers})
@@ -911,6 +914,8 @@ def collect_acts(session, convs, *, layers, positions="response", skip: int = 0,
                 got[nm] = tc.token_rows(nm, got[nm], len(ids))
                 if got[nm].shape[0] != len(ids):
                     raise GneError("ARCH_UNSUPPORTED", f"{nm} 的行数 {got[nm].shape[0]} 与列长度 {len(ids)} 不一致（最终层等会抽稀行的层不能用于键）")
+            if rows_sink is not None:
+                rows_sink(i, len(pids[i]), len(resp[i]), lambda L, at, got=got: tc.rows(got, L, np.asarray(at, dtype=np.int64))[0])
             for g, s in sel.items():
                 if not s.size:
                     continue
@@ -1086,9 +1091,9 @@ def _plan(session, spec: KeySpec, mode: str, pos_a: Positions, pos_b: Positions,
 
 def _run_plan(session, sets: list[_Set], *, layers, target, skip, max_tokens, samples, project=None, seed=0,
               rms_groups: Sequence[str] = ("A",), progress: Progress | None = None, extra_steps: int = 0,
-              start: int = 0, gen_cache: dict | None = None) -> dict:
+              start: int = 0, gen_cache: dict | None = None, rows=None) -> dict:
     """_plan の会話の組を順に捕捉して、群 → collect_acts の群(と、群の例のハッシュ hashes)にまとめる。start は
-    collect_acts の返事の書き出しの位置の数(0 なら見ない)。"""
+    collect_acts の返事の書き出しの位置の数(0 なら見ない)。rows(keyed_ridge.RowStore)を渡すと、位置 1 つずつの行もためる。"""
     def gen_steps(s: _Set) -> int:
         return int(s.replies is None and any(parse_positions(p).needs_reply for p in s.groups.values()))
     total = sum(len(s.convs) + gen_steps(s) for s in sets) + extra_steps
@@ -1105,9 +1110,12 @@ def _run_plan(session, sets: list[_Set], *, layers, target, skip, max_tokens, sa
     for s in sets:
         if not s.convs:
             continue
+        if rows is not None:
+            rows.begin(s.label, len(s.convs))
         r = collect_acts(session, s.convs, layers=layers, positions=s.groups, skip=skip, max_tokens=max_tokens,
                          replies=s.replies, iv=s.iv, target=target, samples=samples, project=project, seed=seed,
-                         rms_groups=rms_groups, start=start, tick=tick, gen_cache=gen_cache)
+                         rms_groups=rms_groups, start=start, tick=tick, gen_cache=gen_cache,
+                         rows_sink=None if rows is None else rows.add)
         for g, d in r["groups"].items():
             d["hashes"] = [s.hashes[i] for i in d["index"]]
             d["n_examples"] = len(s.convs)
@@ -1230,7 +1238,7 @@ def build_keys(session, contrast, *, name: str | None = None, layers, positions:
                q_energy: float = 0.99, q_max_rank: int | None = None, q_max_samples: int = 4096, subset: str = "even",
                pseudo: int = 16, replies_a=None, replies_b=None, iv=None, target: str = "ffn", seed: int = 0,
                dont_touch_start: bool | None = None, progress: Progress | None = None,
-               gen_cache: dict | None = None) -> dict:
+               gen_cache: dict | None = None, key_fit: str | None = None, key_c: float | None = None) -> dict:
     """対照集合(contrast: パス・ContrastSet・KeySpec)から層ごとの鍵 κ を作り、<root>/keys/<model_id>/<name>.npz に保存する。
 
     positions(側 A の位置。省くと対照集合の positions、無ければ response)が before:<re> なら mode same(推論時と同じ文脈の
@@ -1248,12 +1256,14 @@ def build_keys(session, contrast, *, name: str | None = None, layers, positions:
     rows_l。expert_usage で側 A の位置でよく選ばれる専門家を選ぶ)。
     μ・Q が鍵にならない層(keyed.make_key の BAD_KEY)は警告して外す。戻り値は層ごとの kn・gain・q_rank・作成に使った例での
     AUC などの要約と path。gen_cache は collect_acts の、生成した返事の覚え書き(同じ返事から続けて鍵を作るとき)。
-    同じ返事の違う位置から何本も作るなら build_keys_multi(返事を 1 回だけ作って読む)。"""
+    同じ返事の違う位置から何本も作るなら build_keys_multi(返事を 1 回だけ作って読む)。
+    key_fit(鍵の作り方): mean(既定。いまの作り方 = μ から Q の成分を取り除く)/ ridge(最小二乗の鍵、ますごとの重み。target mlpin・
+    positions pos:<範囲> の鍵だけ。keyed_ridge)。key_c は ridge の正則化の強さ(省くと質問単位の 5 分割で決める)。"""
     return build_keys_multi(session, contrast, [(name, positions)], layers=layers, positions_b=positions_b, skip=skip,
                             max_tokens=max_tokens, q_mode=q_mode, q_energy=q_energy, q_max_rank=q_max_rank,
                             q_max_samples=q_max_samples, subset=subset, pseudo=pseudo, replies_a=replies_a, replies_b=replies_b,
                             iv=iv, target=target, seed=seed, dont_touch_start=dont_touch_start, progress=progress,
-                            gen_cache=gen_cache)[0]
+                            gen_cache=gen_cache, key_fit=key_fit, key_c=key_c)[0]
 
 
 
@@ -1261,15 +1271,25 @@ def build_keys_multi(session, contrast, entries, *, layers, positions_b: str | N
                      max_tokens: int = 96, q_mode: str = "examples", q_energy: float = 0.99, q_max_rank: int | None = None,
                      q_max_samples: int = 4096, subset: str = "even", pseudo: int = 16, replies_a=None, replies_b=None,
                      iv=None, target: str = "ffn", seed: int = 0, dont_touch_start: bool | None = None,
-                     progress: Progress | None = None, gen_cache: dict | None = None) -> list[dict]:
+                     progress: Progress | None = None, gen_cache: dict | None = None, key_fit: str | None = None,
+                     key_c: float | None = None) -> list[dict]:
     """同じ対照集合・同じ設定で、書き込みたい位置だけが違う鍵を何本か作る。entries は [(鍵の名前, positions), …]。
     戻り値は build_keys の結果のリスト(entries の順)。build_keys はこれを 1 本で呼ぶ。
     何本かのとき、返事の生成と読み取り(活性の捕捉)は 1 回だけ行い、同じ読み取りから全部の鍵を計算する(返事の位置の区切り
     0 / 1-3 / 4- ごとの鍵のように、同じ返事の違う位置から作る鍵)。1 本ずつ作ったときと同じ返事・同じ活性の行を使うので、
     できる鍵は同じ(tests/test_nwrite.py の test_keys_from_one_read で、鍵・比較用の鍵とも一致することを確かめている)。
     まとめて読めない組み合わせ(q_mode samples = 行の間引きが群の順番で決まる、位置の種類が混ざっている)は 1 本ずつ作る
-    (そのときも gen_cache があれば返事は使い回す)。"""
+    (そのときも gen_cache があれば返事は使い回す)。
+    key_fit = "ridge"(最小二乗の鍵。keyed_ridge): 同じ読み取りから、位置 1 つずつの行(返事ごとに位置 0〜15 は全部、以降は 8 位置)を
+    ためて、全部の鍵を一緒に解く。書き込みたくない位置の重みは「場面の群(dont_touch の群と、狙う場面のほかの区間)× 位置の区分
+    (entries の区間)」のますごとに合計が同じ。正則化の強さは key_c(省くと、全部の鍵・全部の層で 1 つを、質問単位の 5 分割で決める)。
+    target mlpin・positions pos:<範囲> の鍵だけ(ほかは BAD_ARGS)。q_mode・q_energy などの Q の設定は使わない。"""
+    from . import keyed_ridge as KR
     t0 = time.perf_counter()
+    kf = KR.check_key_fit(key_fit)
+    key_c = KR.check_c(key_c)
+    if key_c is not None and kf != "ridge":
+        raise GneError("BAD_ARGS", "正则化强度（key_c）只能用于最小二乘键（key_fit ridge）")
     entries = [(n, p) for n, p in entries]
     if not entries:
         raise GneError("BAD_ARGS", "没有要创建的键")
@@ -1293,7 +1313,7 @@ def build_keys_multi(session, contrast, entries, *, layers, positions_b: str | N
     skip = int(skip if skip is not None else (spec.skip or 0))
     dts_on = bool(dont_touch_start if dont_touch_start is not None else
                   (spec.dont_touch_start if spec.dont_touch_start is not None else True))
-    samples = q_max_samples if q_mode == "samples" else 0
+    samples = q_max_samples if q_mode == "samples" and kf != "ridge" else 0
     multi = len(entries) > 1
     plans = []
     vecs0 = lora0 = iv_desc = None
@@ -1316,9 +1336,17 @@ def build_keys_multi(session, contrast, entries, *, layers, positions_b: str | N
                       "warnings": warnings, "warn": warn})
     if len({p["name"] for p in plans}) != len(plans):
         raise GneError("BAD_ARGS", "键名重复（每把键请使用不同名称）")
+    if kf == "ridge":
+        bad = [p["pos_a"].text for p in plans if p["pos_a"].kind != "pos"]
+        if kind != K.MLPIN or bad:
+            raise GneError("BAD_ARGS", "最小二乘键（key_fit ridge）只能用于 FiSH 的位置键（target mlpin、positions pos:<范围>）"
+                                       + (f"（target {target}）" if kind != K.MLPIN else f"（positions {bad[0]}）"),
+                           "keyed write 的键和 before:<正则表达式> 的位置键请使用现有做法（key_fit mean）创建")
+        KR.bins_of([(p["pos_a"].lo, p["pos_a"].hi) for p in plans])           # 区間が重なっていれば、読む前に止める
     common = dict(layers=Ls, positions_b=positions_b, skip=skip, max_tokens=max_tokens, q_mode=q_mode, q_energy=q_energy,
                   q_max_rank=q_max_rank, q_max_samples=q_max_samples, subset=subset, pseudo=pseudo, replies_a=replies_a,
-                  replies_b=replies_b, iv=iv, target=target, seed=seed, dont_touch_start=dont_touch_start, progress=progress)
+                  replies_b=replies_b, iv=iv, target=target, seed=seed, dont_touch_start=dont_touch_start, progress=progress,
+                  key_fit=key_fit, key_c=key_c)
     # まとめて読む: 同じ会話の組(同じ文脈・同じ返事)ごとに、全部の鍵の群を 1 回の読み取りに入れる。位置が同じ群(dont_touch の
     # 返事の全部の位置など)は 1 つにまとめる
     merged: dict[str, _Set] = {}
@@ -1339,24 +1367,40 @@ def build_keys_multi(session, contrast, entries, *, layers, positions_b: str | N
                     m.groups[canon] = pos
                 al[g] = canon
         alias.append(al)
+    if not ok and kf == "ridge":
+        raise GneError("BAD_ARGS", "无法在此组合中一起创建最小二乘键（key_fit ridge）（各键读取的对话或回复不同）")
     if not ok:                                                # まとめて読めない: 1 本ずつ(返事は覚えておいて使い回す)
         cache = gen_cache if gen_cache is not None else {}
         return [build_keys(session, contrast, name=n, positions=p, gen_cache=cache, **common) for n, p in entries]
     mode = plans[0]["mode"]
     rms = tuple(c for m in merged.values() for c in m.groups if c.split("\x1f")[0] == "A")
+    store = KR.RowStore(Ls, seed) if kf == "ridge" else None
+    n_ps = int(pseudo) if kf == "ridge" else 0
+    fit_steps = len(Ls) * (1 + (1 if n_ps and key_c is None else 0)) if kf == "ridge" else 0
     run = _run_plan(session, list(merged.values()), layers=Ls, target=target, skip=skip, max_tokens=max_tokens,
-                    samples=samples, seed=seed, progress=progress, extra_steps=len(Ls) * len(plans),
-                    start=START_TOKENS if mode == "same" else 0, gen_cache=gen_cache, rms_groups=rms)
+                    samples=samples, seed=seed, progress=progress, extra_steps=len(Ls) * len(plans) + fit_steps,
+                    start=START_TOKENS if mode == "same" else 0, gen_cache=gen_cache, rms_groups=rms, rows=store)
     read_s = time.perf_counter() - t0
+    fitted = None
+    if store is not None:                                     # 最小二乗の鍵: 全部の鍵を一緒に解く(c は全部の鍵・層で 1 つ)
+        if not store.n_rows or store.groups[:1] != ["AB"]:
+            raise GneError("BAD_CONTRAST", "没有要写入的位置（无法读取目标场景的回复）")
+        fitted = KR.fit(store.take, Ls, store.table(), [(p["pos_a"].lo, p["pos_a"].hi) for p in plans], c=key_c, seed=seed,
+                        pseudo=n_ps, group_names=["scene"] + [g[3:] for g in store.groups[1:]],
+                        tick=lambda msg: run["tick"](f"最小二乘 {msg}"))
+        fitted["info"]["acts"] = "float32" if store.wide else "float16"
+        read_s += fitted["info"]["seconds"]
     out = []
-    for pl, al in zip(plans, alias, strict=True):
+    for k, (pl, al) in enumerate(zip(plans, alias, strict=True)):
         t1 = time.perf_counter()
         G = {g: run["groups"][c] for g, c in al.items() if c in run["groups"]}
         r = _keys_from_groups(session, spec, G, run, name=pl["name"], Ls=Ls, kind=kind, expert=expert, mode=mode,
                               pos_a=pl["pos_a"], pos_b=pl["pos_b"], skip=skip, max_tokens=max_tokens, q_mode=q_mode,
                               q_energy=q_energy, q_max_rank=q_max_rank, q_max_samples=q_max_samples, samples=samples,
                               subset=subset, pseudo=pseudo, seed=seed, dts_on=dts_on, pinfo=pl["pinfo"], iv_desc=iv_desc,
-                              warnings=pl["warnings"], warn=pl["warn"])
+                              warnings=pl["warnings"], warn=pl["warn"],
+                              ridge=None if fitted is None else {"kappa": fitted["kappa"][k], "mu": fitted["mu"][k],
+                                                                 "ctrl": fitted["ctrl"][k], "info": fitted["info"]})
         r["seconds"] = read_s / len(plans) + (time.perf_counter() - t1)
         if multi:
             r["shared_read"] = {"keys": len(plans), "seconds": read_s}     # 返事の生成と読み取りは、この本数の鍵で 1 回
@@ -1366,8 +1410,10 @@ def build_keys_multi(session, contrast, entries, *, layers, positions_b: str | N
 
 def _keys_from_groups(session, spec: KeySpec, G: dict, run: dict, *, name, Ls, kind, expert, mode, pos_a, pos_b, skip,
                       max_tokens, q_mode, q_energy, q_max_rank, q_max_samples, samples, subset, pseudo, seed, dts_on, pinfo,
-                      iv_desc, warnings, warn) -> dict:
-    """読み取った群 G(collect_acts の群。"A"・"B"・"dt:<名前>"・"dts:<名前>")から鍵 1 本を計算して保存する(build_keys の後半)。"""
+                      iv_desc, warnings, warn, ridge: dict | None = None) -> dict:
+    """読み取った群 G(collect_acts の群。"A"・"B"・"dt:<名前>"・"dts:<名前>")から鍵 1 本を計算して保存する(build_keys の後半)。
+    ridge(keyed_ridge.fit の、この鍵の分: kappa・mu・ctrl・info)を渡すと、κ・μ・比較用の鍵はそれを使う(最小二乗の鍵)。例ごとの
+    平均(exa・exb)と作成に使った例での AUC は、いまの作り方と同じに残す。"""
     cs = spec.contrast
     ga, gb = G.get("A"), G.get("B")
     dt_keys = [g for g in G if g.startswith("dt:")]
@@ -1392,7 +1438,7 @@ def _keys_from_groups(session, spec: KeySpec, G: dict, run: dict, *, name, Ls, k
         else:
             warn(msg)
     rng = np.random.default_rng(seed)
-    perms = [balanced_split(rng, n_a, n_b) for _ in range(pseudo)] if n_b else []   # 層をまたいで同じ並べ替え
+    perms = [balanced_split(rng, n_a, n_b) for _ in range(pseudo)] if n_b and ridge is None else []   # 層をまたいで同じ並べ替え
     if pseudo and not n_b:
         warn("不希望写入侧没有示例（只有 dont_touch），因此不创建比较用键")
 
@@ -1416,7 +1462,7 @@ def _keys_from_groups(session, spec: KeySpec, G: dict, run: dict, *, name, Ls, k
                                     where=f"L{L}（仅包含选中专家 {expert} 的位置）："))
         if same_n:
             perms_l = perms
-        elif nb and pseudo:                                     # 層ごとの例の数で並べ替え(層 L ごとに決まった乱数)
+        elif nb and pseudo and ridge is None:                   # 層ごとの例の数で並べ替え(層 L ごとに決まった乱数)。最小二乗の鍵の比較用の鍵は解いたもの
             rng_l = np.random.default_rng([seed, L])
             perms_l = [balanced_split(rng_l, na, nb) for _ in range(pseudo)]
         else:
@@ -1426,22 +1472,31 @@ def _keys_from_groups(session, spec: KeySpec, G: dict, run: dict, *, name, Ls, k
         DTm = [G[g]["means"][L] for g in dt_keys + dts_keys]
         SB = gb["samples"][L] if (samples and gb) else np.zeros((0, EA.shape[1]), np.float32)
         DTs = [G[g]["samples"][L] for g in dt_keys + dts_keys] if samples else []
-        m = EA.mean(axis=0)
-        X = _q_rows(q_mode, EB, DTm, SB, DTs, q_max_samples, np.random.default_rng(seed + 1 + L))
-        try:
-            Q = _basis(q_mode, X, q_energy, q_max_rank)
-            kap, info = K.make_key(m, Q, warn=warn, label=f"L{L}")
-        except GneError as ex:
-            if ex.code != "BAD_KEY":
-                raise
-            dropped[L] = ex.message
-            warn(f"L{L} 不能作为键，已移除：{ex.message}")
-            run["tick"](f"L{L}")
-            continue
-        kappa[L], mu[L], kn[L], gain[L], qrank[L] = kap, m, info["kn"], info["gain"], info["q_rank"]
-        rows_q[L] = int(X.shape[0])
-        if info["weak"]:
-            weak.append(L)
+        if ridge is not None:                                   # 最小二乗の鍵: κ・μ(書き込みたい位置の重みつき平均)は解いたもの
+            kap = np.asarray(ridge["kappa"][L], dtype=np.float64)
+            m = np.asarray(ridge["mu"][L], dtype=np.float64)
+            knv = 1.0 / (float(np.linalg.norm(kap)) * float(np.linalg.norm(m)))
+            kappa[L], mu[L], kn[L], gain[L] = kap, m, knv, 1.0 / knv
+            rows_q[L] = int(ridge["info"]["rows"])
+            if ridge["ctrl"].get(L) is not None:
+                ctrl[L] = np.asarray(ridge["ctrl"][L], dtype=np.float32)
+        else:
+            m = EA.mean(axis=0)
+            X = _q_rows(q_mode, EB, DTm, SB, DTs, q_max_samples, np.random.default_rng(seed + 1 + L))
+            try:
+                Q = _basis(q_mode, X, q_energy, q_max_rank)
+                kap, info = K.make_key(m, Q, warn=warn, label=f"L{L}")
+            except GneError as ex:
+                if ex.code != "BAD_KEY":
+                    raise
+                dropped[L] = ex.message
+                warn(f"L{L} 不能作为键，已移除：{ex.message}")
+                run["tick"](f"L{L}")
+                continue
+            kappa[L], mu[L], kn[L], gain[L], qrank[L] = kap, m, info["kn"], info["gain"], info["q_rank"]
+            rows_q[L] = int(X.shape[0])
+            if info["weak"]:
+                weak.append(L)
         exa[L] = EA.astype(np.float32)
         if nb:
             exb[L] = EB.astype(np.float32)
@@ -1488,7 +1543,8 @@ def _keys_from_groups(session, spec: KeySpec, G: dict, run: dict, *, name, Ls, k
         counts["rows_a_start"] = int(starts_info["rows"])
     counts["rows_dt_start"] = int(dt_start_rec["rows"])     # dont_touch の質問の返事の冒頭として Q に入れた行(切れば 0)
     info = {"mode": mode, "positions_b": pos_b.text, "q_energy": q_energy, "q_max_rank": q_max_rank,
-            "q_max_samples": q_max_samples, "pseudo": len(perms), "pseudo_method": "balanced", "seed": seed,
+            "q_max_samples": q_max_samples, "pseudo": len(perms) if ridge is None else min((int(v.shape[0]) for v in ctrl.values()), default=0),
+            "pseudo_method": "balanced", "seed": seed,
             "contrast": cs.name,
             "replies": run["replies"], "dont_touch": pinfo["dont_touch"], "iv": iv_desc,
             "dropped": {str(L): v for L, v in dropped.items()}, "weak": weak,
@@ -1499,6 +1555,21 @@ def _keys_from_groups(session, spec: KeySpec, G: dict, run: dict, *, name, Ls, k
     if starts_info is not None:                             # mode same: 側 A のうち返事の書き出しにある位置
         info["reply_start"] = starts_info
     info["dont_touch_start"] = dt_start_rec                 # これが無い鍵は、返事の冒頭を自動で入れる前に作ったもの
+    notes_fit = []
+    if ridge is not None:                                   # key_fit の記録が無い鍵は、いまの作り方(mean)で作ったもの
+        ri = {k: v for k, v in ridge["info"].items() if k != "seconds"}
+        info["key_fit"] = "ridge"
+        info["ridge"] = ri
+        notes_fit.append(f"最小二乘键（按单元格加权）：行 {ri['rows']}、单元格数 {ri['cells']}、正则化强度 c = {ri['c']:g}"
+                         + (f"（以问题为单位做 {ri['folds']} 折交叉验证决定。候选 {', '.join(f'{x:g}' for x in ri['cs'])}）" if ri["cv"] else "（传入值）"))
+        if ri["edge"]:
+            notes_fit.append(f"选中的正则化强度 c = {ri['c']:g} 位于候选边界（更{'小' if ri['c'] == ri['cs'][0] else '大'}的值可能更合适。"
+                             "可通过 key_c 直接传入数值进行比较）")
+        if len(spec.dont_touch) == 1:
+            notes_fit.append(f"不希望写入的场景（dont_touch）只有 1 个组（{spec.dont_touch[0].name}），因此已把整体作为一个组加权。"
+                             "按发言类型分组后，数量较少的类型也会以相同的权重计入")
+        elif not spec.dont_touch:
+            notes_fit.append("没有不希望写入的场景（dont_touch）。不希望写入的位置只有目标场景回复中的其他区间")
     if kind == "expert":                                    # 専門家の鍵: 層ごとの行(専門家 e が選ばれた位置)の数
         info["rows_l"] = {str(L): {"a": int(ga["rows_l"][L]), "b": int(gb["rows_l"][L]) if gb else 0,
                                    "of_a": int(ga["rows"]), "of_b": int(gb["rows"]) if gb else 0} for L in Ls}
@@ -1509,7 +1580,7 @@ def _keys_from_groups(session, spec: KeySpec, G: dict, run: dict, *, name, Ls, k
     path = ks.save(K.key_dir(session) / f"{name}.npz")
     rows = []
     for L in ks.layers:
-        row = {"layer": L, "kn": kn[L], "gain": gain[L], "q_rank": qrank[L], "q_rows": rows_q[L], "weak": L in weak,
+        row = {"layer": L, "kn": kn[L], "gain": gain[L], "q_rank": qrank.get(L), "q_rows": rows_q[L], "weak": L in weak,
                "kappa_mu": float(np.asarray(kappa[L], dtype=np.float64) @ mu[L]),
                "build_auc": build_auc[L], "rms_a": rms_a.get(L)}
         if kind in ("shared", "expert"):                   # MoE: ゲートの平均と、層ごとの行・例の数(ffn・attn の形は変えない)
@@ -1523,12 +1594,13 @@ def _keys_from_groups(session, spec: KeySpec, G: dict, run: dict, *, name, Ls, k
     sample_side = "AB" if mode == "same" else "A"
     return {"name": name, "path": str(path), "target": ks.target, "mode": mode, "positions": pos_a.text,
             "positions_b": pos_b.text, "skip": skip, "max_tokens": int(max_tokens), "subset": subset, "q_mode": q_mode,
-            "contrast": cs.name, "contrast_sha": cs.sha, "layers": rows,
+            "contrast": cs.name, "contrast_sha": cs.sha, "layers": rows, "key_fit": "mean" if ridge is None else "ridge",
+            "ridge": None if ridge is None else dict(ridge["info"]),
             "dropped": [{"layer": L, "error": v} for L, v in dropped.items()], "counts": counts,
             "n_pseudo": ks.n_pseudo, "replies": run["replies"], "dont_touch": pinfo["dont_touch"], "iv": iv_desc,
             "matched": {"A": n_a, "of": int(ga["n_examples"])}, "reply_start": starts_info, "dont_touch_start": dt_start_rec,
             "samples": [t[:240] for t in texts.get(sample_side, [])[:4]],
-            "notes": pinfo["notes"] + ["build_auc 是创建用示例上的值（偏乐观）。请用保留集（subset odd 或另一个对照集）运行 key-check"],
+            "notes": pinfo["notes"] + notes_fit + ["build_auc 是创建用示例上的值（偏乐观）。请用保留集（subset odd 或另一个对照集）运行 key-check"],
             "warnings": warnings, "sha": ks.sha, "seconds": 0.0}
 
 

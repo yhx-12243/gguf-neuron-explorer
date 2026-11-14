@@ -109,7 +109,14 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    stack_fast=True 可改用快速读取（大型模型上约快 10 倍），但方向会略有变化（cos 不低于 0.999），尚未测量
    该读取方式下的语气与正确答案。比较层与强度的探索可用快速读取，制作要分发的成品时使用默认读取。使用哪种
    读取方式创建的方向会记录在方向文件（stack_read）和结果（stack_fast、direction_stack_fast）中。
-
+   不要把不希望改变的场景只局限在问题上：也要把与目标场景形式相同的非问题发言（近况汇报、邀请、问候、请求、自言自语）
+   按类型分组加入 dont_touch（每类建议准备数十个问题）。如果只放问题，键也会对非问题发言产生反应（Qwen3.5-4B 的傲娇示例中，
+   在键未见过的 105 条非问题发言里有 81 条发生写入，14 条回复语气改变）。fish_pipeline 和 direction_key 的
+   key_fit="ridge" 会把位置键改为最小二乘键（把每个位置分别作为一行，用闭式解求出在目标写入位置返回 1、不希望写入位置返回 0
+   的键。不希望写入位置的权重按“场景组 × 位置分段”的每个单元格相同）。在同样的 105 条发言中，发生写入的从
+   81 降到 1，语气改变的回复从 14 降到 0，目标场景的语气没有减少（57 → 70。陷入重复的回复按机械计数从 1 增加到 4）。默认仍为
+   现有做法（mean）。新方法仅在 1 个模型、1 个性格上验证（docs/fish.md §3）。可用 nw_check 的 leaks（不希望写入的场景按组、
+   按分段统计的误写入问题数与平均写入量，以及仅位置 0 的数量）按组检查泄漏。
 """
 
 
@@ -382,7 +389,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         """将注意力头的对照分析作为任务提交（用 job_status 查看结果）。用有人格（system_a）与中立（system_b）
         运行对照集（configs/contrast/ 的名称或路径）的会话，逐注意力头测量 trigger_mass（对触发词关注比例的差异，
         需要对照集的 triggers）・pattern_shift（关注分布的 JS）・out_shift（输出差异）・dir_cos（输出差异写到方向 r_L 的
-        cos，存在 direction 或同名方向时），并以中立对中立的差异为の p95 を基準値按 z 排序。"""
+        cos，存在 direction 或同名方向时），并以中立对中立的差异的 p95 为基准按 z 排序。"""
         from .cli import parse_layers
         try:
             params = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
@@ -599,7 +606,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                             q_max_samples: int = 4096, subset: str = "even", pseudo: int = 16,
                             replies_a: str | list[str] | None = None, replies_b: str | list[str] | None = None,
                             iv: str | list[str] | None = None, target: str = "ffn", seed: int = 0,
-                            dont_touch_start: bool | None = None, role: str | None = None) -> dict:
+                            dont_touch_start: bool | None = None, role: str | None = None, key_fit: str | None = None,
+                            key_c: float | None = None) -> dict:
         """提交创建键控写入所用键 κ 的作业（CHANGE-07，用 job_status 查看结果）。将对照集合（configs/contrast/ 中的名称或路径）
         在目标写入位置的平均激活 μ，与不希望写入位置及 dont_touch 激活张成的空间正交，使 κᵀμ = 1，并保存到
         <root>/keys/<model_id>/<name>.npz。必须指定 layers（例 [8, 14, 20]）。positions（省略时使用对照集合的值）为
@@ -620,17 +628,29 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         FiSH（计算生成的神经元，mode nw）的键使用 target="mlpin"（dense MLP 的输入空间）。对回复位置区段响应的键使用
         positions="pos:1-3"（位置 0 = 开始写回复之前，"pos:4-" 表示 4 及之后）。role="scene" 会在目标场景问题（user_prompts）的
         整段回复中响应，且不会对 dont_touch 问题响应；role="one" 是任意位置都返回接近 1 的键（用于带上限的形式）。
-        传入 role 时 target 固定为 mlpin，且不使用 positions、q_mode 等。"""
+        传入 role 时 target 固定为 mlpin，且不使用 positions、q_mode 等。
+        key_fit（键的构建方式。默认 "mean" = 上述做法）："ridge" 表示最小二乘键（把每个位置分别作为一行，用带正则化的闭式解
+        求出在目标写入位置返回 1、不希望写入位置返回 0 的键。不希望写入位置的权重按“场景组（dont_touch 的组与目标场景的其他
+        位置）× 位置分段”的每个单元格相同）。仅适用于 FiSH 的位置键（target="mlpin"、positions="pos:<范围>"），不能用于
+        keyed write 的键（BAD_ARGS）。key_c 是正则化强度（省略时，只用建键问题按问题为单位做 5 折交叉验证，从 0.01～100 的
+        5 个候选中决定。选中的值和是否位于候选边界见结果的 ridge 与 notes）。若要一次创建各分段的键，请用 fish_pipeline
+        （所有键共用一个正则化强度）。结果中的 key_fit 表示键由哪种方式构建。"""
         from .jobs import _layers
         try:
             if not _layers(layers):
                 raise GneError("BAD_ARGS", "请在 layers 中指定要创建键的层（例如 [8, 14, 20]）")
+            from .keyed_ridge import check_c, check_key_fit
+            check_key_fit(key_fit)                     # 作り方・強さが読めなければ、ジョブを投げる前に止める
+            check_c(key_c)
             p = {"contrast": str(_contrast_path(session, contrast, None, None, None, None)), "layers": layers, "name": name,
                  "positions": positions, "positions_b": positions_b, "skip": skip, "max_tokens": max_tokens,
                  "q_mode": q_mode, "q_energy": q_energy, "q_max_rank": q_max_rank, "q_max_samples": q_max_samples,
                  "subset": subset, "pseudo": pseudo, "replies_a": replies_a, "replies_b": replies_b, "iv": iv,
-                 "target": target, "seed": seed, "dont_touch_start": dont_touch_start}
+                 "target": target, "seed": seed, "dont_touch_start": dont_touch_start, "key_fit": key_fit, "key_c": key_c}
             if role in ("scene", "one"):
+                if key_fit not in (None, "mean") or key_c is not None:
+                    raise GneError("BAD_ARGS", "key_fit=\"ridge\"、key_c 只能用于位置键（不传 role 或 role 为 position）",
+                                   "场景键（scene）和几乎返回 1 的键（one）只有一种构建方式")
                 p = {"contrast": p["contrast"], "layers": layers, "name": name, "max_tokens": max_tokens, "subset": subset,
                      "pseudo": pseudo, "iv": iv, "seed": seed, "role": role}
             elif role not in (None, "position"):
@@ -671,7 +691,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def nw_check(contrast: str, units: list[str] | None = None, recipe: str | None = None, subset: str = "odd",
                        replies: str = "own", max_tokens: int = 96, n_pos: int = 8, iv: str | list[str] | None = None,
-                       low: float = 0.4, over: float = 1.2, top: int = 5, save: str | None = None) -> dict:
+                       low: float = 0.4, over: float = 1.2, top: int = 5, save: str | None = None, leak: float = 0.2) -> dict:
         """提交测量 nw 配方在不同位置类型下的键响应与实际写入量的作业（以 α·d 为 1，用 job_status 查看结果）。
         对对照集合的问题（目标场景 = groups.scene）和 dont_touch 组（不希望写入的场景），按回复位置 0（开始写回复之前）～
         n_pos−1 及之后，为每个单元给出 amount、rho_gate、rho_up 的平均、最小、最大。replies="own" 表示应用配方
@@ -682,14 +702,18 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         （目标量 = 1）、total = 全部单元合计、rho = 键响应）。groups.<名称>.by_question 是各区间计数（目标场景中
         low = amount 低于 low 的问题、over = total 超过 over 的问题；不希望写入的场景中 leak = 误写入的问题）。
         question_summary.worst 是几乎未写入问题中按写入量排序的前 top 个。若这些问题集中在某种回复开头方式
-        （例如以引号开头），请增加建键问题。传入 save（名称）还会写入 <root>/behave/<model_id>/<名称>_check.json。"""
+        （例如以引号开头），请增加建键问题。传入 save（名称）还会写入 <root>/behave/<model_id>/<名称>_check.json。
+        leaks 是不希望写入的场景按组的泄漏表：groups 的每一行包含 n（问题数）、any（任一分段中合计写入量达到 leak
+        （默认 0.2）以上的问题数）、segments.<分段> 的 leak（该数量）与 total_mean（平均写入量）、pos0（仅位置 0 = 开始写
+        回复之前统计的相同数量）。all 是合并所有组的行。请按组检查，确认是否只泄漏到与目标场景形式相同的发言组，以及泄漏是否
+        只是从某个分段转移到了位置 0。key_fit 表示单元的键由哪种方式构建（fit: mean / ridge / mixed；keys: 每个键）。"""
         try:
             if bool(recipe) == bool(units):
                 raise GneError("BAD_ARGS", "请通过 recipe（已保存配方的名称）或 units 之一传入")
             r = str(session.recipe_path(recipe)) if recipe else session.recipe(units=units)
             return jobs.start("nw_check", {"recipe": r, "contrast": str(_contrast_path(session, contrast, None, None, None, None)),
                                            "subset": subset, "replies": replies, "max_tokens": max_tokens, "n_pos": n_pos,
-                                           "low": low, "over": over, "top": top, **({"save": save} if save else {}),
+                                           "low": low, "over": over, "leak": leak, "top": top, **({"save": save} if save else {}),
                                            **({"iv": iv} if iv is not None else {})}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -715,7 +739,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                             pseudo: int | None = None, max_tokens: int | None = None, response_tokens: int | None = None,
                             iv: str | list[str] | None = None, neurons: dict[str, list[int]] | None = None, top: int = 20,
                             save: str | None = None, summary: bool = False, direction: str | None = None,
-                            cap: str | list[str] | None = None, stack_fast: bool | None = None) -> dict:
+                            cap: str | list[str] | None = None, stack_fast: bool | None = None, key_fit: str | None = None,
+                            key_c: float | None = None) -> dict:
         """用一次作业从头到尾创建 FiSH（用 job_status 查看结果。与 UI 的 FiSH 标签页“全部构建”相同）：方向 → 神经元表 →
         键 → 单元 → 在应用这些单元的状态下重建键 → 是否符合公式 → 写入量。contrast 可以是对照集的表（包含 name、system_a、
         user_prompts、dont_touch 以及 fish 设置），也可以是 configs/contrast/ 的名称或路径、configs/fish/ 的模板名称。
@@ -739,15 +764,30 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         notes 中会给出提示。结果/摘要的 direction_stack_fast 会显示使用了哪种读取方式创建的方向（使用已有方向时也会从方向文件
         的记录中得出）。
         键只生成一次回复并读取，用一次读取创建所有分段。建键问题在目标场景和不希望改变的场景中都应多准备一些
-        （目标场景建议 100 个以上）。"""
+        （目标场景建议 100 个以上）。
+        不希望写入的场景（dont_touch）中，除了问题，还应把与目标场景形式相同的非问题发言（近况汇报、邀请、问候、请求、
+        自言自语）按类型分组加入（每类建议准备数十个问题）。
+        key_fit（键的构建方式。默认 "mean" = 现有做法。也可在表中的 fish.key_fit 设置）："ridge" 会把各分段的位置键改为
+        最小二乘键（用闭式解求出在目标写入位置返回 1、不希望写入位置返回 0 的键。不希望写入位置的权重按“场景组
+        （dont_touch 的组的 name 与目标场景的其他区间）× 位置分段（segments）”的每个单元格相同）。应用配方后重建键的阶段也
+        使用相同构建方式。key_c 是正则化强度（省略时，只用建键问题按问题为单位做 5 折交叉验证决定）。结果与摘要的 key_fit 和
+        ridge（各阶段的 c、是否位于候选边界 edge、行数与单元格数）会保留这些信息。键计算在 CPU 上进行，Qwen3.5-4B 的 13 层、
+        576 个问题时每阶段需要数分钟（会计入估算）。写入位置为 before:<正则表达式> 的键不能使用。Qwen3.5-4B 的傲娇示例中，
+        键未见过的 105 条非问题发言里发生写入的从 81 降到 1，语气改变的回复从 14 降到 0，目标场景的语气没有减少（陷入重复
+        的回复按机械计数在 100 个问题中从 1 增加到 4）。仅在 1 个模型、1 个性格上验证（docs/fish.md §3）。
+        摘要中的 leaks 是不希望写入的场景按组的泄漏表（与 nw_check 的 leaks 相同）。"""
         from .jobs import _layers
         try:
             if not _layers(layers):
                 raise GneError("BAD_ARGS", "请在 layers 中指定层（例 [11, 18, 23] 或 \"11-23\"）")
+            from .keyed_ridge import check_c, check_key_fit
+            check_key_fit(key_fit)                     # 作り方・強さが読めなければ、ジョブを投げる前に止める
+            check_c(key_c)
             p = {**_fish_contrast(contrast), "layers": layers, "alpha": alpha, "segments": segments, "form": form, "name": name,
                  "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
                  "response_tokens": response_tokens, "iv": iv, "neurons": neurons, "top": top, "save": save,
-                 "direction": direction, "cap": cap, "stack_fast": stack_fast, "summary": True if summary else None}
+                 "direction": direction, "cap": cap, "stack_fast": stack_fast, "key_fit": key_fit, "key_c": key_c,
+                 "summary": True if summary else None}
             return jobs.start("fish_pipeline", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1048,7 +1088,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                                layers: str | None = None, max_tokens: int = 48) -> dict:
         """将专家对照分析作为任务提交（用 job_status 查看结果）。分别用带人格（system_a）和中立（system_b）
         读取对照集中的同一回复，逐 MoE 层专家测量 usage_shift（选中比例差）、weight_shift（有效权重差）、
-        contrib_cos（贡献差与该层状态方向的 cos）、contrib_norm，并以中立对中立的の p95 を基準値为基准按 z 排序。数秒至数十秒。"""
+        contrib_cos（贡献差与该层状态方向的 cos）、contrib_norm，并以中立对中立的差异的 p95 为基准按 z 排序。数秒至数十秒。"""
         from .cli import parse_layers
         try:
             params = {"contrast": str(_contrast_path(session, contrast, None, None, None, name)), "name": name,
