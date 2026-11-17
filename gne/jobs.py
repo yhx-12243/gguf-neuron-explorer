@@ -310,10 +310,12 @@ def _fish_keys(s, contrast=None, spec: dict | None = None, with_units=None, **p)
     return {**d, "contrast_path": path, "with_units": bool(with_units)}
 
 
-def _fish_verify(s, units, iv=None, texts=None) -> dict:
-    """FiSH のユニットの LoRA が式どおりか(gne nw verify)。"""
+def _fish_verify(s, units, iv=None, texts=None, contrast=None, spec: dict | None = None) -> dict:
+    """FiSH のユニットの LoRA が式どおりか(gne nw verify)。contrast か spec(対照集合)を渡すと、鍵が開く文で確かめる。"""
     from . import fish
-    return fish.verify_step(s, list(units), iv=iv or None, texts=texts)
+    if spec is not None or contrast is not None:
+        contrast = fish.resolve(s, contrast, spec)[0]
+    return fish.verify_step(s, list(units), iv=iv or None, texts=texts, contrast=contrast)
 
 
 def _fish_check(s, units, contrast=None, spec: dict | None = None, **p) -> dict:
@@ -359,6 +361,60 @@ def _fish_pipeline(s, contrast=None, spec: dict | None = None, summary: bool = F
         q["neurons"] = {int(k): v for k, v in q["neurons"].items()}
     d = fish.pipeline(s, path, name=q.pop("name", None) or cname, **q)
     return {**d["summary"], "units": d["units"], "contrast_path": d["contrast_path"]} if summary else d
+
+
+def _neuron_pairs(x) -> dict[int, list[int]] | None:
+    """nw heads のニューロンの指定: {層: [番号, 番号]} か "8:101,102 12:201,202"(空白・改行・; 区切り)→ {層: [番号, 番号]}。"""
+    if x is None or x == "" or x == {}:
+        return None
+    if isinstance(x, str):
+        out: dict[int, list[int]] = {}
+        for part in x.replace(";", " ").split():
+            L, sep, js = part.partition(":")
+            try:
+                out[int(L)] = [int(v) for v in js.split(",") if v.strip()]
+            except ValueError as e:
+                raise GneError("BAD_ARGS", f"神经元请按 层:编号,编号 的格式书写（{part!r}）", "例如 8:101,102 12:201,202") from e
+            if not sep:
+                raise GneError("BAD_ARGS", f"神经元请按 层:编号,编号 的格式书写（{part!r}）", "例如 8:101,102 12:201,202")
+        x = out
+    if not isinstance(x, dict):
+        raise GneError("BAD_ARGS", "neurons 必须是 {层: [编号, 编号]} 或 \"8:101,102 12:201,202\"")
+    out = {int(k): [int(v) for v in vs] for k, vs in x.items()}
+    bad = [L for L, vs in out.items() if len(vs) != 2 or vs[0] == vs[1]]
+    if bad:
+        raise GneError("BAD_ARGS", f"第 {bad} 层的神经元请每层使用 2 个不同编号（带上限的 2 个一组）")
+    return out
+
+
+def _fish_heads(s, recipe: str | None = None, contrast=None, spec: dict | None = None, *, name: str | None = None,
+                scene_key: str | None = None, one_key: str | None = None, neurons=None, subset: str = "even", max_tokens: int = 96,
+                save: str | None = None) -> dict:
+    """CHiPS のヘッドの分を、場面を選んで取り除くユニットを作る(gne nw heads、headgate.build)。recipe は CHiPS のレシピ(proj の
+    ユニット)の名前かパス、contrast は対照集合のパスか spec(UI の入力欄の表。fish の設定は使わない)、scene_key・one_key は場面の鍵と
+    ほぼ 1 を返す鍵(mlpin、CHiPS のヘッドの層を含む)。neurons は {層: [番号, 番号]} か "8:101,102 12:201,202"(省くと働きの
+    小さい順の上 2 個。渡すなら CHiPS のヘッドの層を全部)。save を渡すと、できたユニットをレシピに書く(結果の recipe_path)。
+    結果は headgate.build と同じ(層ごとの R²・CHiPS との一致・ユニット)に、chips と contrast_path を足したもの。"""
+    from . import fish
+    from .headgate import build
+    from .headproj import proj_heads
+    lack = [k for k, v in (("recipe", recipe), ("name", name), ("scene_key", scene_key), ("one_key", one_key)) if not v]
+    if lack:
+        raise GneError("BAD_ARGS", f"请指定 {', '.join(lack)}（CHiPS 配方、名称、场景键、接近 1 的键）")
+    if subset not in ("even", "odd", "all"):
+        raise GneError("BAD_ARGS", f"subset 必须是 even / odd / all（{subset!r}）")
+    path = fish.resolve(s, contrast, spec)[0]
+    nmap = _neuron_pairs(neurons)
+    if nmap is not None:
+        cr = s.recipe(path=s.recipe_path(recipe))
+        need = sorted({int(p.layer) for p in proj_heads(cr) if p.s})
+        miss = [L for L in need if L not in nmap]
+        if miss:
+            raise GneError("BAD_ARGS", f"若指定神经元，请写全 CHiPS 注意力头的所有层 {need}（缺少的层 {miss}）")
+    pr = s.progress
+    d = build(s, str(recipe), path, name=name, scene_key=scene_key, one_key=one_key, neurons=nmap, subset=subset,
+              max_tokens=int(max_tokens), save=save or None, progress=(lambda st, i, n: pr(i, n, st)) if pr else None)
+    return {**d, "recipe_path": str(d["recipe_path"]) if d.get("recipe_path") else None, "chips": str(recipe), "contrast_path": path}
 
 
 def compact_key_causal(d: dict) -> dict:
@@ -469,6 +525,7 @@ def standard_kinds() -> dict[str, Callable[..., dict]]:
         "fish_behave": _fish_behave,                                                    # FiSH: レシピを当てた返事を読む
         "fish_try": _fish_try,                                                          # FiSH: 重みに入れる前に試す(層の出力に直接足す)
         "fish_pipeline": _fish_pipeline,                                                # FiSH: 最初から最後まで
+        "fish_heads": _fish_heads,                                                      # FiSH: CHiPS のヘッドの分を場面で取り除く(nw heads)
     }
 
 

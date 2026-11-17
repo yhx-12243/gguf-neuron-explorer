@@ -370,6 +370,10 @@ gne nw neurons --layers 11-23                          # 活跃度最低的神�
 gne direction key --contrast C --target mlpin --layers 11-23 --positions pos:1-3 --name k_p1   # “此场景、回复位置 1～3”的键
 gne nw key --contrast C --layers 11-23 --role scene    # 在这种场景的整段回复中持续反应的键
 gne nw verify --unit 11:N2045:nw:a1@NAME.seg1#k_scene\&k_p1   # LoRA 是否按公式工作？
+gne nw verify --recipe R --contrast C                  # 同上，但在键打开的目标问题与回复上验证（量化舍入会在这里显现；单元加 !kauto 可避开）
+gne nw heads --recipe CHIPS --contrast C --name hg --scene-key K --one-key K1 --save hg_r   # 只在场景键打开处移除 CHiPS 注意力头写入的量
+gne heads tf --contrast C --direction NAME --target 'ahoy|matey' --layers 1-27   # 按层、再按注意力头做 teacher forcing 筛查（也能检查 gne heads pipeline 无法看到的基准层之后的注意力头）
+gne steer --recipe R --prompt "..." --lora-when reply  # 仅对生成的 token 应用 LoRA（nw/proj/keyed/gain）；prompt = 仅在读取提示词期间
 gne nw check  --recipe R --contrast C                  # 按位置和场景种类显示键响应与实际写入量，随后显示逐题数值
 gne nw export --recipe R -o R-nw.lora.gguf             # 仅导出 LoRA（不烧录）；含 proj/keyed 单元时，gne headproj export 会把它们放进同一个文件
 gne nw pipeline --contrast C --layers 11-23 --alpha 1,1,0.8 --save R.yaml   # 或一次运行全部构建步骤；--save 会写出上述命令可用的配方
@@ -555,7 +559,8 @@ python -m pytest -q
 - MoE 测试使用 `GNE_TEST_MOE`（默认 `models/granite-3.1-1b-a400m-instruct-Q8_0.gguf`）；路由器偏置测试使用 `GNE_TEST_MOE_BIAS`（默认 `models/LFM2-8B-A1B-Q4_K_M.gguf`）。
 - 真实音频测试需要 `GNE_TEST_OMNI`（一个 LFM3-Omni GGUF 及其旁边的 mmproj）和 `GNE_TEST_AUDIO`（语音 wav）。其他音频测试使用默认模型。
 - 键控写入测试还会使用 `GNE_TEST_MOE` 测试专家键，并且只有设置以下变量时才运行另外两部分：`GNE_TEST_MOE_SHARED`（带共享专家的 MoE，例如 Qwen1.5-MoE-A2.7B）和 `GNE_TEST_HYBRID_MODEL`（带线性注意力的模型，例如 Qwen3.5-0.8B）。
-- 缺少模型或浏览器的测试会被跳过。
+- 缺少模型或浏览器的测试会被跳过。若默认 MoE 模型存在但想跳过 MoE 测试，可将变量指向不存在的文件（例如 `GNE_TEST_MOE=/nonexistent GNE_TEST_MOE_BIAS=/nonexistent`）。
+- 临时文件写入 `TMPDIR`。MoE 测试运行期间会把模型复制到临时文件夹（默认模型分别复制 1.4 GB 和 5 GB；测试会话关闭时会删除副本），`gne verify` 也会在那里写入重新量化的模型。完整运行可能填满 `/dev/shm` 这类小型 tmpfs（8 GB）；请使用至少有约 10 GB 可用空间的文件夹。
 
 ## 文档
 

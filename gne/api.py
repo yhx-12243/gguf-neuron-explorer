@@ -291,7 +291,9 @@ class Session:
             self._check_keyed(r)
         if r.nw_units:                                              # 計算で作るニューロン: 層の形・鍵・方向・ニューロンの重なり
             from .nwrite import nw_plan
-            nw_plan(self.weights, r, self._key_of, self.direction_set)
+            # 形だけを確かめる(kscale auto・remove の大きさは、ここでは測らない。当てるとき・書き出すときに測る)
+            nw_plan(self.weights, r, self._key_of, self.direction_set,
+                    lambda L, up: {"block_max_median": 1.0, "m": 1.0, "b_up": 0.0, "uh_q90": 1.0})
         if r.when != "all":                                         # レビュー P3: LoRA は位置で切り替えられない
             lora_kinds = [k for k, us in (("keyed", r.keyed_units), ("gain", r.gain_units), ("proj", r.proj_units),
                                           ("nw", r.nw_units)) if us]
@@ -407,20 +409,21 @@ class Session:
         return ([{"role": "system", "content": system}] if system else []) + [user]
 
     def generate(self, vectors: dict[int, np.ndarray] | None, messages: list[dict], *, max_tokens: int = 128,
-                 when: str = "all", lora: list[tuple[str, float]] | None = None, sampling=None) -> dict:
+                 when: str = "all", lora: list[tuple[str, float]] | None = None, sampling=None, lora_when: str = "all") -> dict:
         """单条生成（确保结果不随批处理组合方式变化，F2）。默认 greedy，可用 sampling（engine.Sampling）采样。
-        when 是 §6.15 的位置别 steering，lora 是 gain（§6.16）的 LoRA 适配器。"""
+        when 是 §6.15 的位置别 steering，lora 是 gain（§6.16）的 LoRA 适配器。
+        lora_when は LoRA を当てる位置: all(既定)/ prompt(プロンプトを読む間だけ)/ reply(生成するトークンだけ)。"""
         from .when import generate_when
         e = self.engine
         r, info = generate_when(e, e.steer_ctx(), messages, vectors, when, max_tokens=max_tokens, lora=lora,
-                                sampling=sampling)
+                                sampling=sampling, lora_when=lora_when)
         return {"text": r.text, "finish": r.finish, "n_gen": r.n_gen, "token_ids": r.token_ids, "when": info}
 
     # --- steer ----------------------------------------------------------------------------------
 
     def steer(self, recipe: Recipe | list[str], *, prompt: str | None = None, messages: list[dict] | None = None,
               system: str | None = None, max_tokens: int = 128, compare: bool = True, when: str | None = None,
-              sampling=None, audio: list[str | Path] | None = None) -> dict:
+              sampling=None, audio: list[str | Path] | None = None, lora_when: str = "all") -> dict:
         """传入 sampling（engine.Sampling）时，无干预与干预使用相同 seed 采样（差异只来自干预）。
         audio：将音频文件作为用户发言（需要 mmproj）。"""
         recipe = self._as_recipe(recipe)
@@ -429,7 +432,8 @@ class Session:
         base = self.generate(None, msgs, max_tokens=max_tokens, sampling=sampling) if compare else None
         lora = self.lora_for(recipe)
         with self.patched(self.patches_for(recipe)):           # 専門家全体の gain・route(作業用コピーで読み直す)
-            st = self.generate(vecs, msgs, max_tokens=max_tokens, when=when or recipe.when, lora=lora, sampling=sampling)
+            st = self.generate(vecs, msgs, max_tokens=max_tokens, when=when or recipe.when, lora=lora, sampling=sampling,
+                               lora_when=lora_when)
         return {"messages": msgs, "recipe": recipe.to_dict(), "units": details, "layer_norms": self._norms(vecs),
                 "when": when or recipe.when, "sampling": None if sampling is None else sampling.to_dict(),
                 "baseline": base, "steered": st, "differs": None if base is None else base["token_ids"] != st["token_ids"]}
@@ -567,7 +571,7 @@ class Session:
         nr = recipe.like([u for u in recipe.nw_units if u.k])
         if not nr.units:
             raise GneError("BAD_RECIPE", "没有 nw 单元（α 不为 0。例 --unit 11:N2045:nw:a1@NAME#KEY）")
-        rows = nw_plan(self.weights, nr, self._key_of, self.direction_set)
+        rows = nw_plan(self.weights, nr, self._key_of, self.direction_set, self.nw_stats)
         tens = nw_tensors(self.weights, rows)
         d = self.store.key_dir(self.meta.model_id) / "lora"
         d.mkdir(parents=True, exist_ok=True)
@@ -586,11 +590,17 @@ class Session:
         from .nwrite import export_nw_lora
         r = recipe if isinstance(recipe, Recipe) else self.recipe(path=self.recipe_path(recipe))
         others = sorted({u.mode for u in r.units if u.mode != "nw"})
-        rep = export_nw_lora(self.weights, r, out, self._key_of, self.direction_set, strip_meta=strip_meta, name=name)
+        rep = export_nw_lora(self.weights, r, out, self._key_of, self.direction_set, strip_meta=strip_meta, name=name,
+                             stats_of=self.nw_stats)
         if others or r.ablate is not None:
             self.warn(f"此文件只包含 nw 单元（配方的其他干预 {'、'.join(others + (['ablate'] if r.ablate else []))} 不会写入。"
                       "若要和 proj、keyed、gain 合并为一个 LoRA，请使用 gne headproj export）")
         return {**rep, "recipe": r.name, "warnings": list(self.warnings)}
+
+    def nw_stats(self, layer: int, up_dir=None) -> dict:
+        """層の活性・残差の大きさ(中立の文で測る。kscale auto と成分を取り除く形が使う。gne/nwrite.layer_stats)。"""
+        from .nwrite import layer_stats
+        return layer_stats(self, int(layer), up_dir)
 
     def nw_neurons(self, layers, **kw) -> dict:
         """各ニューロンのふだんの働きを測り、働きの小さい順の表を返す(gne nw neurons)。"""
@@ -728,7 +738,7 @@ class Session:
             from .nwrite import nw_meta, nw_plan, nw_tensors
             if into is not None:
                 raise GneError("BAD_ARGS", "nw 单元不能与 --into 一起导出（需要从应用目标模型读取要替换的原始行、列）")
-            nrows = nw_plan(W, recipe.like([u for u in recipe.nw_units if u.k]), self._key_of, self.direction_set)
+            nrows = nw_plan(W, recipe.like([u for u in recipe.nw_units if u.k]), self._key_of, self.direction_set, self.nw_stats)
             clash = sorted({u.layer for u in recipe.gain_units if u.kind == "neuron"} & {r["layer"] for r in nrows})
             if clash:
                 raise GneError("BAD_RECIPE", f"层 {', '.join(map(str, clash))} 同时存在神经元 gain 和 nw（两者都会修改 ffn_up，"
@@ -1404,13 +1414,14 @@ class Session:
         return q
 
     def chat(self, columns, prompts: list[str], *, system: str | None = None, max_tokens: int = 256,
-             on_text=None, on_column=None, when: str | None = None, sampling=None) -> dict:
+             on_text=None, on_column=None, when: str | None = None, sampling=None, lora_when: str = "all") -> dict:
         from .chat import ChatState, chat_turn
         state = ChatState(columns, system)
         turns = []
         for u in prompts:
             turns.append({"user": u, "replies": chat_turn(self, state, u, max_tokens=max_tokens, on_text=on_text,
-                                                          on_column=on_column, when_override=when, sampling=sampling)})
+                                                          on_column=on_column, when_override=when, sampling=sampling,
+                                                          lora_when=lora_when)})
         return {"columns": [{"label": c.label, "recipe": c.recipe.to_dict() if c.recipe else None} for c in columns],
                 "system": system, "turns": turns}
 
@@ -1612,7 +1623,7 @@ class Session:
     # --- eval(§6.14)---------------------------------------------------------------------------
 
     def eval(self, recipe: Recipe | list[str], *, doses=(0, 0.25, 0.5, 0.75, 1.0), suite: str | Path | None = None,
-             when: str | None = None, judge_model: str | Path | None = None, judge_target: str | None = None,
+             when: str | None = None, lora_when: str = "all", judge_model: str | Path | None = None, judge_target: str | None = None,
              name: str | None = None, random_controls: int = 0, reactivity: str | Path | None = None,
              head_controls: int = 0, control_pool: str = "before", direction_metrics: bool = True,
              dir_max_examples: int | None = 64, keyed_contrast: str | Path | None = None, keyed_metrics: bool = True,
@@ -1649,7 +1660,7 @@ class Session:
             keyed_contrast = self._contrast_file(keyed_contrast)
         judge = Judge(judge_model, judge_target) if judge_model else None
         try:
-            d = evaluate(self, recipe, doses=doses, suite=suite, when=when, judge=judge,
+            d = evaluate(self, recipe, doses=doses, suite=suite, when=when, judge=judge, lora_when=lora_when,
                          random_controls=random_controls, reactivity=reactivity, head_controls=head_controls,
                          control_pool=control_pool, direction_metrics=direction_metrics,
                          dir_max_examples=dir_max_examples, keyed_contrast=keyed_contrast,

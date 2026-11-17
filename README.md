@@ -370,6 +370,10 @@ gne nw neurons --layers 11-23                          # table of the least acti
 gne direction key --contrast C --target mlpin --layers 11-23 --positions pos:1-3 --name k_p1   # key for "this scene, reply positions 1–3"
 gne nw key --contrast C --layers 11-23 --role scene    # key that stays on for the whole reply in this kind of scene
 gne nw verify --unit 11:N2045:nw:a1@NAME.seg1#k_scene\&k_p1   # does the LoRA do what the formula says?
+gne nw verify --recipe R --contrast C                  # the same, on the target questions and replies where the keys open (quantization rounding shows here; !kauto on a unit avoids it)
+gne nw heads --recipe CHIPS --contrast C --name hg --scene-key K --one-key K1 --save hg_r   # remove what CHiPS heads write, only where the scene key opens
+gne heads tf --contrast C --direction NAME --target 'ahoy|matey' --layers 1-27   # teacher-forcing screen by layer, then by head (also after the base layer that gne heads pipeline cannot see)
+gne steer --recipe R --prompt "..." --lora-when reply  # apply the LoRA (nw/proj/keyed/gain) only to generated tokens; prompt = only while reading the prompt
 gne nw check  --recipe R --contrast C                  # key responses and amounts written, by position and kind of scene, then per question
 gne nw export --recipe R -o R-nw.lora.gguf             # LoRA only (no baking); with proj/keyed units, gne headproj export puts them in one file
 gne nw pipeline --contrast C --layers 11-23 --alpha 1,1,0.8 --save R.yaml   # or all of the building steps in one go; --save writes the recipe for the commands above
@@ -557,7 +561,8 @@ python -m pytest -q
 - MoE tests use `GNE_TEST_MOE` (default `models/granite-3.1-1b-a400m-instruct-Q8_0.gguf`) and, for router bias, `GNE_TEST_MOE_BIAS` (default `models/LFM2-8B-A1B-Q4_K_M.gguf`).
 - The real-audio test needs `GNE_TEST_OMNI` (an LFM3-Omni GGUF with its mmproj next to it) and `GNE_TEST_AUDIO` (a wav of speech). The other audio tests use the default model.
 - The keyed-write tests also use `GNE_TEST_MOE` for expert keys, and run two more parts only when they are set: `GNE_TEST_MOE_SHARED` (a MoE with a shared expert, such as Qwen1.5-MoE-A2.7B) and `GNE_TEST_HYBRID_MODEL` (a model with linear attention, such as Qwen3.5-0.8B).
-- Tests whose model or browser is missing are skipped.
+- Tests whose model or browser is missing are skipped. To skip the MoE tests while the default MoE models are present, point the variables at a missing file (for example `GNE_TEST_MOE=/nonexistent GNE_TEST_MOE_BIAS=/nonexistent`).
+- Temporary files go to `TMPDIR`. The MoE tests copy their model into a temporary folder while they run (1.4 GB and 5 GB for the default models; the copy is removed when the test's session closes), and `gne verify` writes re-quantized models there. A small tmpfs such as `/dev/shm` (8 GB) can fill up during a full run; use a folder with at least about 10 GB free.
 
 ## Documentation
 

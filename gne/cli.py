@@ -527,6 +527,7 @@ _BUDGET = typer.Option(None, "--budget", help="时间预算（30m、2h、90s）�
 _DOSE_UNIT = typer.Option(None, "--dose-unit", help="rel / absmax / raw（默认使用配方值；指定 --unit 时为 rel）")
 _SCALE = typer.Option(1.0, "--scale", help="乘以所有单元 dose 的系数")
 _ABLATE = typer.Option(None, "--ablate", help="方向投影消除（§6.17）：NAME、NAME@层、NAME:倍率（例 evil@10:0.5）。以 LoRA 应用")
+_LORA_WHEN = typer.Option("all", "--lora-when", help="应用 LoRA（gain、proj、keyed、nw 等）的位置：all（默认，所有位置）/ prompt（仅在读取提示词期间）/ reply（仅生成的 token）")
 _WHEN = typer.Option(None, "--when", help="施加位置（§6.15）：all / gen / assistant / after:<字符串> / ramp:<a>-<b>。默认使用配方值（没有则为 all）")
 _TEMP = typer.Option(None, "--temperature", help="采样温度。指定任一采样值，或配方含 sampling 时启用采样"
                                                  "（缺少的值取配方 sampling，否则取 llama-server 默认值）。仅设为 0 时使用 greedy")
@@ -583,7 +584,8 @@ def steer(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optio
           contrast_seeds: int = typer.Option(4, "--contrast-seeds", help="--contrast-sample：每个提示词的数量"),
           contrast_tokens: int = typer.Option(64, "--contrast-tokens", help="--contrast：生成长度"),
           contrast_prompts: Optional[Path] = typer.Option(None, "--contrast-prompts", help="--contrast：替换验证提示词的 YAML（字符串列表；若为对照集，也可用 reactivity 的 with 或 user_prompts）"),
-          audio: Optional[list[Path]] = typer.Option(None, "--audio", help="将音频文件（wav / mp3 / flac）作为用户发言。若指定 --prompt，会在音频后追加文字。需要 mmproj")):
+          audio: Optional[list[Path]] = typer.Option(None, "--audio", help="将音频文件（wav / mp3 / flac）作为用户发言。若指定 --prompt，会在音频后追加文字。需要 mmproj"),
+          lora_when: str = _LORA_WHEN):
     """用配方或单次指定回答提示词（默认 greedy，逐条生成）。"""
     s = holder["session"] = c.session()
     r = s.recipe(units=unit, path=recipe, dose_unit=dose_unit, scale=scale, when=when, ablate=ablate)
@@ -591,7 +593,7 @@ def steer(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optio
     if prompt is None and contrast is None and not audio:
         raise GneError("BAD_ARGS", "需要 --prompt 或 --audio 或 --contrast")
     if prompt is not None or audio:
-        d = s.steer(r, prompt=prompt, system=system, max_tokens=max_tokens, compare=compare, sampling=sp,
+        d = s.steer(r, prompt=prompt, system=system, max_tokens=max_tokens, compare=compare, sampling=sp, lora_when=lora_when,
                     audio=audio)
     else:                                       # --contrast だけ: 生成はせず、対照集合での効果だけを測る
         vecs, details = s.vectors(r)
@@ -790,7 +792,7 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
              dose_unit: Optional[str] = _DOSE_UNIT,
              doses: str = typer.Option("0,0.25,0.5,0.75,1", "--doses", help="作用于整个配方的倍率（必定包含 0 = 无干预）"),
              suite: Optional[Path] = typer.Option(None, "--suite", help="任务集 YAML（默认 configs/eval/default.yaml）"),
-             when: Optional[str] = _WHEN,
+             when: Optional[str] = _WHEN, lora_when: str = _LORA_WHEN,
              judge_model: Optional[Path] = typer.Option(None, "--judge-model", help="用于人格评分的另一个 GGUF（可选）"),
              judge_target: Optional[str] = typer.Option(None, "--judge-target", help="要评分的目的人格（例 'a yandere anime girl'）"),
              name: Optional[str] = typer.Option(None, "--name", help="保存名称（默认使用配方名）"),
@@ -871,7 +873,7 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
                       "recipe": r, "keyed_metrics": keyed, "keyed_contrast": keyed_contrast,      # keyed の選択性の分も見積もる
                       "keyed_examples": keyed_examples or None, "keyed_pseudo": keyed_pseudo, "keyed_match": keyed_match,
                       "keyed_subset": keyed_subset}, yes, None)
-    d = s.eval(r, doses=_doses(doses), suite=suite, when=when, judge_model=judge_model, judge_target=judge_target,
+    d = s.eval(r, doses=_doses(doses), suite=suite, when=when, lora_when=lora_when, judge_model=judge_model, judge_target=judge_target,
                name=name, random_controls=random_controls, reactivity=reactivity, head_controls=head_controls,
                control_pool=control_pool, direction_metrics=direction_metrics, dir_max_examples=dir_max_examples or None,
                keyed_contrast=keyed_contrast, keyed_metrics=keyed, keyed_examples=keyed_examples or None,
@@ -1279,7 +1281,7 @@ def chat(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
          when: Optional[str] = _WHEN, ablate: Optional[str] = _ABLATE,
          temperature: Optional[float] = _TEMP, top_k: Optional[int] = _TOP_K, top_p: Optional[float] = _TOP_P,
          min_p: Optional[float] = _MIN_P, presence_penalty: Optional[float] = _PRES,
-         sample_seed: Optional[int] = _SSEED, greedy: bool = _GREEDY):
+         sample_seed: Optional[int] = _SSEED, greedy: bool = _GREEDY, lora_when: str = _LORA_WHEN):
     """−/0/+ 三列对比聊天（共享用户输入，逐列回复）。采样时三列使用相同 seed。"""
     from .chat import ChatState, chat_turn, make_columns
     s = holder["session"] = c.session()
@@ -1307,7 +1309,7 @@ def chat(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
             turns.append({"user": user, "replies": chat_turn(s, state, user, max_tokens=max_tokens,
                                                              on_text=on_text if live else None,
                                                              on_column=on_column if live else None,
-                                                             when_override=when, sampling=sp)})
+                                                             when_override=when, sampling=sp, lora_when=lora_when)})
         d = {"columns": [{"label": col.label, "recipe": col.recipe.to_dict() if col.recipe else None} for col in cols],
              "system": system, "turns": turns, "sampling": None if sp is None else sp.to_dict()}
         if live:
@@ -1338,7 +1340,8 @@ def chat(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
         if not user.strip():
             continue
         replies = chat_turn(s, state, user, max_tokens=max_tokens, on_text=on_text if stream else None,
-                            on_column=on_column if stream else None, when_override=when, sampling=sp)
+                            on_column=on_column if stream else None, when_override=when, sampling=sp,
+                             lora_when=lora_when)
         if not stream:
             for col, rep in zip(cols, replies, strict=True):
                 print(f"── {col.label} ──\n{rep['text']}")
@@ -1601,6 +1604,33 @@ def experts_show(c: Common, holder: dict, layer: int = typer.Argument(..., help=
     lines.append("神经元（按写入大小 q999 × ‖W_down[:, n]‖ 排序）：" +
                  ", ".join(f"N{x['neuron']}" for x in d["neurons"][:12]))
     return d, "\n".join(lines), 0
+
+
+@gne_command(heads_app, "tf", "heads tf")
+def heads_tf(c: Common, holder: dict,
+             contrast: Path = typer.Option(..., "--contrast", help="对照集（用于生成回复的问题）"),
+             direction: str = typer.Option(..., "--direction", help="要削弱的方向（gne direction 的名称）"),
+             target: str = typer.Option(..., "--target", help="用于查找目标句子的正则表达式（包含匹配文字的句子为目标）"),
+             layers: Optional[str] = typer.Option(None, "--layers", help="按层测量的层（例 1-29。省略时为 1～最后一层的前一层）"),
+             layers_heads: Optional[str] = typer.Option(None, "--heads-layers", help="按注意力头测量的层。省略时为层 (a) 为正且不低于中位数的层"),
+             s: float = typer.Option(10.0, "--s", help="削弱强度（proj 的 s）"),
+             direction_layer: str = typer.Option("own", "--direction-layer", help="own（该注意力头所在层的方向）/ base（基准层的方向）"),
+             side: str = typer.Option("a", "--side", help="生成回复的一侧：a（system_a / user_prompts。默认）/ b"),
+             subset: str = typer.Option("all", "--subset", help="问题：all / even / odd"),
+             span: str = typer.Option("sentence", "--span", help="目标：sentence（包含匹配的句子）/ match（仅匹配的文字）"),
+             max_tokens: int = typer.Option(256, "--max-tokens", help="回复长度上限（只使用完成的回复）"),
+             others: int = typer.Option(64, "--others", help="每条回复中其他 token 的数量"),
+             name: Optional[str] = typer.Option(None, "--name", help="将结果写入 <root>/heads/<model_id>/<名称>.tf.json"),
+             lora_when: str = _LORA_WHEN):
+    """teacher forcing の目安で、層ごと → ヘッドごとに、方向成分を弱めたときの (a) 対象の文のトークンの対数確率の下がり方
+    (それ以外のトークンの変化を引いたもの)、(b) それ以外のトークンの変化の絶対値、返事の終わりのトークンの変化を測る。
+    gne heads pipeline の因果の確かめは基準層での射影で測るので、基準層より後ろのヘッドはこちらで確かめる。返事は生成しない。"""
+    from .heads_tf import screen, summary_lines
+    sess = holder["session"] = c.session()
+    d = screen(sess, str(contrast), direction=direction, target=target, layers=layers, layers_heads=layers_heads, s=s,
+               direction_layer=direction_layer, side=side, subset=subset, span=span, max_tokens=max_tokens, others=others, name=name,
+               lora_when=lora_when)
+    return d, "\n".join(summary_lines(d)), 0
 
 
 @gne_command(heads_app, "attention", "heads attention")
@@ -3000,6 +3030,33 @@ def fieldtest_cmd(c: Common, holder: dict,
 
 # --- 计算生成的神经元(mode: nw)------------------------------------------------------------------------------
 
+@gne_command(nw_app, "heads", "nw heads")
+def nw_heads(c: Common, holder: dict,
+             recipe: Path = typer.Option(..., "--recipe", help="CHiPS 配方（proj 单元 L:Hh:sS@方向。名称或路径）"),
+             contrast: Path = typer.Option(..., "--contrast", help="对照集（user_prompts = 要移除行为的场景，dont_touch = 希望保留的场景）"),
+             name: str = typer.Option(..., "--name", help="要创建的名称（方向 <名称>_dir、移除量键 <名称>_amount）"),
+             scene_key: str = typer.Option(..., "--scene-key", help="场景键（gne nw key --role scene。包含 CHiPS 注意力头的层）"),
+             one_key: str = typer.Option(..., "--one-key", help="接近 1 的键（gne nw key --role one）"),
+             neuron: Optional[list[str]] = typer.Option(None, "--neurons", help="层:编号,编号（例 12:101,102）。省略时按激活值从小到大取前 2 个"),
+             subset: str = typer.Option("even", "--subset", help="要移除行为的场景中使用的问法：even（默认）/ odd / all"),
+             max_tokens: int = typer.Option(96, "--max-tokens", help="作为材料的无干预回复长度"),
+             save: Optional[str] = typer.Option(None, "--save", help="将创建的单元写入配方（名称或 .yaml 路径）")):
+    """CHiPS のヘッドの分を、場面を選んで取り除くユニットを作る。ヘッドは書き換えず、同じ層の MLP の 2 個 1 組が、鍵が開いた場面で
+    だけ、CHiPS がそのヘッドで変えるはずの量を MLP の入力から当てて取り除く(取り除く量の鍵は最小二乗)。当たり方(R²)と、
+    CHiPS との一致(いちばん後ろのヘッドの層の出力の変化の cos と大きさの比。どこでも開く鍵・本物の鍵の狙う場面・dont_touch)を出す。"""
+    from .headgate import build, summary_lines
+    s = holder["session"] = c.session()
+    nmap = None
+    if neuron:
+        nmap = {}
+        for x in neuron:
+            L, js = x.split(":", 1)
+            nmap[int(L)] = [int(v) for v in js.split(",")]
+    d = build(s, str(recipe), str(contrast), name=name, scene_key=scene_key, one_key=one_key, neurons=nmap, subset=subset,
+              max_tokens=max_tokens, save=save)
+    return d, "\n".join(summary_lines(d)), 0
+
+
 @gne_command(nw_app, "neurons", "nw neurons")
 def nw_neurons(c: Common, holder: dict,
                layers: str = typer.Option(..., "--layers", help="要测量的层(例 11-23 或 11,18,23)"),
@@ -3082,16 +3139,25 @@ def nw_verify(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: O
               direction: Optional[str] = typer.Option(None, "--direction", help="省略 @NAME 时单元的默认方向"),
               key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 时单元的默认键"),
               text: Optional[list[str]] = typer.Option(None, "--text", help="要读取的文本(默认是英文和日文各一句)。可指定多个"),
-              iv: Optional[list[str]] = typer.Option(None, "--iv", help="在预先应用此干预(配方名称或路径，或单元的写法)的状态下验证")):
+              iv: Optional[list[str]] = typer.Option(None, "--iv", help="在预先应用此干预(配方名称或路径，或单元的写法)的状态下验证"),
+              contrast: Optional[Path] = typer.Option(None, "--contrast", help="对照集。传入后，用目标场景问题的无干预回复来验证（在键打开的位置检查量化舍入造成的偏差）"),
+              subset: str = typer.Option("all", "--subset", help="--contrast 的问题：all（默认）/ odd / even"),
+              n_prompts: int = typer.Option(6, "--prompts", help="从 --contrast 使用的问题数"),
+              max_tokens: int = typer.Option(48, "--max-tokens", help="--contrast 的回复长度")):
     """验证 nw 的 LoRA 是否按公式工作。逐层检查被覆盖神经元的门控、输入、激活是否符合公式，其他神经元是否没有变化，
-    MLP 输出的变化是否为 (新激活 × 新列) − (原激活 × 原列)。"""
+    MLP 输出的变化是否为 (新激活 × 新列) − (原激活 × 原列)。
+    --contrast を渡すと、鍵が開く文(狙う場面の質問と返事)で確かめる。書き換えたニューロンの活性が同じブロックのほかの活性より
+    ずっと大きいと、量子化の丸めで出力が式からずれる(ユニットに !kauto を付けると、活性を小さくして避けられる)。"""
     s = holder["session"] = c.session()
     r = s.recipe(units=unit, path=recipe, default_direction=direction, default_key=key)
-    d = s.nw_verify(r, texts=text or None, iv=_iv_arg(iv))
+    d = s.nw_verify(r, texts=text or None, iv=_iv_arg(iv), contrast=None if contrast is None else str(contrast), subset=subset,
+                    n_prompts=n_prompts, max_tokens=max_tokens)
     lines = []
     for x in d["layers"]:
         lines.append(f"L{x['layer']} N{','.join(map(str, x['neurons']))}: 门控误差 {x['gate_err']:.2e}、输入误差 {x['up_err']:.2e}、激活误差 {x['act_err']:.1e}、"
-                     f"其他神经元的变化 {x['others_changed_max']:.1e}、输出变化的相对误差(中位数){x['out_rel_err_median']:.2e}  {'○' if x['ok'] else '×'}")
+                     f"其他神经元的变化 {x['others_changed_max']:.1e}、输出变化的相对误差(中位数){x['out_rel_err_median']:.2e}、"
+                     f"激活值最大值 {x['act_max']:.3g}（各块最大值的中位数 {x['block_max_median']:.3g}）、倍率 k "
+                     + "、".join(f"{v:.3g}" for v in x["kscale"].values()) + f"  {'○' if x['ok'] else '×'}")
     lines.append(f"{'合格' if d['ok'] else '不合格'}(门控、输入、输出误差 < 5%，激活误差 < 0.1%，其他神经元的变化 < 1e-4。"
                  "门控和输入仍会残留 1～2% 的偏差，来自按量化状态相乘与把行还原为 float 后相减的计算差异)")
     return d, "\n".join(lines), 0 if d["ok"] else 1

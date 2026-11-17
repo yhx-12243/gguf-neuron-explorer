@@ -190,8 +190,9 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def steer(units: list[str], prompt: str | None = None, messages: list[dict[str, str]] | None = None,
                     max_tokens: int = 128, compare: bool = True, dose_unit: str = "rel",
-                    system: str | None = None, when: str = "all", ablate: str | None = None) -> dict:
+                    system: str | None = None, when: str = "all", ablate: str | None = None, lora_when: str = "all") -> dict:
         """用单元（例 ["14:8949:+1.0", "13:7956:-1.0"]）推动并生成（greedy）。compare=True 时并列显示无干预结果。
+        lora_when は LoRA(gain・proj・keyed・nw)を当てる位置: all(既定)/ prompt(プロンプトを読む間だけ)/ reply(生成するトークンだけ)。
         在 "14:8949:x2" 中加 x 表示 gain（将该神经元输出放大 k 倍，x0 表示消除。§6.16）。
         when 为添加位置：all（全部位置）/ gen（仅生成中，不破坏对提示词的理解）/ assistant（仅 assistant 发言）/
         after:<字符串>（输出中出现该字符串后）/ ramp:<a>-<b>（倍率从 a 到 b）。
@@ -199,7 +200,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         def fn():
             r = session.recipe(units=units or None, dose_unit=dose_unit, when=when, ablate=ablate)
             return session.steer(r, prompt=prompt, messages=messages, system=system, max_tokens=max_tokens,
-                                 compare=compare)
+                                 compare=compare, lora_when=lora_when)
         return await call(fn)
 
     @srv.tool()
@@ -291,7 +292,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool(name="eval")
     async def eval_recipe(recipe: str | None = None, units: list[str] | None = None, doses: list[float] | None = None,
-                   when: str | None = None, random_controls: int = 0, reactivity: str | None = None,
+                   when: str | None = None, lora_when: str = "all", random_controls: int = 0, reactivity: str | None = None,
                    head_controls: int = 0, compare_methods: bool = False, match_effect: float | None = None,
                    score_layer: int | None = None, alloc: str | None = None, n_heads: list[int] | None = None,
                    control_pool: str = "before", direction_metrics: bool = True, dir_max_examples: int = 64,
@@ -323,6 +324,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                 return jobs.start("eval", {"alloc": alloc, "n_heads": n_heads, "when": when,
                                            "random_controls": random_controls}).view()
             p = {"recipe": recipe, "units": units, "when": when, "random_controls": random_controls}
+            if lora_when != "all":                             # LoRA を当てる位置(prompt / reply)。ppl は全位置のまま
+                p["lora_when"] = lora_when
             if compare_methods:
                 p.update({"compare_methods": True, "match_effect": match_effect, "score_layer": score_layer})
                 p.pop("random_controls")
@@ -675,18 +678,44 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             return _err(e)
 
     @srv.tool()
+    async def heads_tf(contrast: str, direction: str, target: str, layers: str | None = None, layers_heads: str | None = None,
+                       s: float = 10.0, direction_layer: str = "own", side: str = "a", subset: str = "all", span: str = "sentence",
+                       max_tokens: int = 256, others: int = 64, name: str | None = None) -> dict:
+        """teacher forcing の目安で、層ごと → ヘッドごとに、方向成分を弱めたときの (a) 対象の文(target の正規表現に一致した文字を
+        含む文)のトークンの対数確率の下がり方、(b) それ以外のトークンの変化の絶対値、返事の終わりのトークンの変化を測る(gne heads tf)。
+        基準層より後ろのヘッドも測れる。書き終えた返事だけを使う。"""
+        from .heads_tf import screen
+        return await call(screen, session, contrast, direction=direction, target=target, layers=layers, layers_heads=layers_heads,
+                          s=s, direction_layer=direction_layer, side=side, subset=subset, span=span, max_tokens=max_tokens,
+                          others=others, name=name)
+
+    async def nw_heads(recipe: str, contrast: str, name: str, scene_key: str, one_key: str, neurons: dict | None = None,
+                       subset: str = "even", max_tokens: int = 96, save: str | None = None) -> dict:
+        """CHiPS のヘッドの分を、場面を選んで取り除くユニットを作る(gne nw heads)。recipe は CHiPS のレシピ(proj のユニット)の名前か
+        パス、contrast は対照集合(user_prompts = 取り除きたい場面、dont_touch = 残したい場面)、scene_key・one_key は場面の鍵と
+        ほぼ 1 を返す鍵(mlpin、CHiPS のヘッドの層を含む)。neurons は {層: [番号, 番号]}(省くと働きの小さい順)。
+        返す値: 層ごとの当たり方(R²)、CHiPS との一致(open・scene・other の cos と大きさの比)、ユニット、レシピの保存先。"""
+        from .headgate import build
+        nmap = None if not neurons else {int(k): [int(v) for v in vs] for k, vs in neurons.items()}
+        return await call(build, session, recipe, contrast, name=name, scene_key=scene_key, one_key=one_key, neurons=nmap,
+                          subset=subset, max_tokens=max_tokens, save=save)
+
     async def nw_verify(units: list[str] | None = None, recipe: str | None = None, texts: list[str] | None = None,
-                        iv: str | list[str] | None = None) -> dict:
+                        iv: str | list[str] | None = None, contrast: str | None = None, subset: str = "all",
+                        n_prompts: int = 6, max_tokens: int = 48) -> dict:
         """验证 nw 单元（"L:Nn:nw:aα@方向#键" = 1 个键、"…#场景键&位置键" = 2 个键、"L:Nn+Nm:nw:aα@方向#键&返回 1 的键" = 带上限）的
         LoRA 是否按公式工作。检查被覆盖神经元的门控、输入、激活是否符合公式，其他神经元是否未改变，
-        MLP 输出变化是否匹配（各层的 ok）。recipe 是已保存配方的名称，或使用 units。"""
+        MLP 输出变化是否匹配（各层的 ok）。recipe 是已保存配方的名称，或使用 units。
+        contrast(対照集合の名前かパス)を渡すと、狙う場面の質問に無介入で作った返事で確かめる(鍵が開く位置で、量子化の丸めによる
+        出力のずれを見る。層ごとに活性の最大・ブロックの最大の中央値・倍率 k も返す)。"""
         try:
             if bool(recipe) == bool(units):
                 raise GneError("BAD_ARGS", "请通过 recipe（已保存配方的名称）或 units 之一传入")
             r = session.recipe(path=session.recipe_path(recipe)) if recipe else session.recipe(units=units)
         except Exception as e:  # noqa: BLE001
             return _err(e)
-        return await call(session.nw_verify, r, texts=texts, iv=iv)
+        return await call(session.nw_verify, r, texts=texts, iv=iv, contrast=contrast, subset=subset, n_prompts=n_prompts,
+                          max_tokens=max_tokens)
 
     @srv.tool()
     async def nw_check(contrast: str, units: list[str] | None = None, recipe: str | None = None, subset: str = "odd",
