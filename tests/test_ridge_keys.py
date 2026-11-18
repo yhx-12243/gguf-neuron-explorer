@@ -328,7 +328,7 @@ def test_leak_table_counts_per_group():
         bq = NW._question_summary(groups[g]["questions"], ["0", "1-"], False, 0.4, 1.2, 0.2)
         assert {sg: c["leak"] for sg, c in bq.items()} == {sg: row["segments"][sg]["leak"] for sg in ("0", "1-")}
     text = "\n".join(NW.leak_lines({"leaks": lk}))
-    assert "不希望写入的场景按组统计的泄漏（写入目标量 0.2 以上的问题数 / 问题数" in text and "仅位置 0" in text
+    assert "対象外の場面の群ごとの誤検出（写入目标量 0.2 以上的问题数 / 问题数" in text and "仅位置 0" in text
     assert "report" in text and "2/3" in text and "1/3(+0.13)" in text and "（全部）" in text
     assert NW.leak_lines({"leaks": None}) == [] and NW.leak_lines({}) == []
     one = NW.leak_table({"scene": groups["scene"], "dont_touch:tasks": groups["dont_touch:tasks"]}, ["0", "1-"], 0.2)
@@ -337,7 +337,7 @@ def test_leak_table_counts_per_group():
     # 質問ごとの値の要約の最後に、群ごとの漏れの表が付く
     qs = {"low": 0.4, "over": 1.2, "leak": 0.2, "segments": ["0", "1-"], "cap": [], "n_low": 0, "worst": []}
     lines = NW.question_lines({"question_summary": qs, "groups": {g: {**x, "by_question": {}} for g, x in groups.items()}, "leaks": lk})
-    assert lines[-1].startswith("  请按组查看") and any("不希望写入的场景按组统计的泄漏" in x for x in lines)
+    assert lines[-1].startswith("  请按组查看") and any("対象外の場面の群ごとの誤検出" in x for x in lines)
     # 鍵の作り方の 1 行(gne nw check)
     assert NW.key_fit_line(None) == NW.key_fit_line({"fit": "mean"}) == "键的构建方式：mean（现有做法）"
     assert NW.key_fit_line({"fit": "ridge", "c": {"a_p0": 1.0, "a_p1": 1.0}}) == "键的构建方式：ridge（最小二乘键，按单元格加权。正则化强度 c = 1）"
@@ -404,13 +404,13 @@ def test_templates_list_non_question_groups(tmp_path):
         assert [g["name"] for g in d["dont_touch"]] == ["tasks", "ordinary", "report", "invite", "greet", "request", "partial"], name
         assert all(len(g["prompts"]) >= 4 for g in d["dont_touch"]) and d["fish"]["key_fit"] == "mean", name
         assert not set(d["user_prompts"]) & {q for g in d["dont_touch"] for q in g["prompts"]}, name      # 狙う場面と重ならない
-        assert "key_fit" in about["ja"]["text"] and "key_fit" in about["en"]["text"], name
+        assert "key_fit" in _all(about["ja"]) and "key_fit" in _all(about["en"]), name
         p = tmp_path / f"{name}.yaml"
         write_yaml(p, {k: v for k, v in d.items() if k != "fish"})
         ks = read_key_spec(p)
         assert [g.name for g in ks.dont_touch] == [g["name"] for g in d["dont_touch"]], name
     text = json.loads((root / "tone_in_scene.json").read_text(encoding="utf-8"))["about"]
-    assert "数十問" in text["ja"]["text"] and "several dozen" in text["en"]["text"] and "1 つのモデル・1 つの性格" in text["ja"]["text"]
+    assert "数十問" in _all(text["ja"]) and "several dozen" in _all(text["en"]) and "1 つのモデル・1 つの性格" in _all(text["ja"])
 
 
 # --- モデルあり ----------------------------------------------------------------------------------------
@@ -576,12 +576,12 @@ def test_pipeline_two_stages_and_check(made):
     assert sm["key_fit"] == "ridge" and sm["leaks"] == chk["leaks"] and set(sm["ridge"]) == {"build", "rekey"}
     text = fish.summary_text(p)
     assert "键的构建方式：ridge（最小二乘键，按单元格加权）。正则化强度：第 1 阶段 c = " in text and "应用配方后重建的键 c = " in text
-    assert "不希望写入的场景按组统计的泄漏" in text
+    assert "対象外の場面の群ごとの誤検出" in text
     common = ["-m", str(MODEL), "--root", str(root), "--n-gpu-layers", str(NGL)]
     rp = str(s.recipe_path("rp_nw"))
     r = CliRunner().invoke(app, ["nw", "check", "--recipe", rp, "--contrast", c, "--subset", "all", "--max-tokens", "8", *common])
     assert r.exit_code == 0 and "键的构建方式：ridge（最小二乘键，按单元格加权。正则化强度 c = " in r.output, r.output
-    assert "不希望写入的场景按组统计的泄漏" in r.output and "  report " in r.output and "仅位置 0" in r.output
+    assert "対象外の場面の群ごとの誤検出" in r.output and "  report " in r.output and "仅位置 0" in r.output
     r = CliRunner().invoke(app, ["nw", "check", "--recipe", rp, "--contrast", c, "--subset", "all", "--max-tokens", "8", "--leak", "0.05",
                                  *common, "--json"])
     d = json.loads(r.output.strip().splitlines()[-1])
@@ -658,3 +658,8 @@ def test_key_entries_cli_jobs_and_estimates(made):
     ek = estimate(s, "direction_key", {"contrast": c, "layers": [8], "target": "mlpin", "positions": "pos:0", "key_fit": "ridge"})
     e0 = estimate(s, "direction_key", {"contrast": c, "layers": [8], "target": "mlpin", "positions": "pos:0"})
     assert ek["detail"]["key_fit_seconds"] > 0 and "key_fit_seconds" not in e0["detail"] and ek["seconds"] > e0["seconds"]
+
+
+def _all(a: dict) -> str:
+    """ひな形の説明(about.ja / about.en)の、要約と節の全部の文。"""
+    return " ".join([a.get("text") or ""] + [s["h"] + " " + " ".join(s["body"]) for s in a.get("sections") or []])

@@ -786,6 +786,11 @@ table.fx-behave-tab td.fx-a, table.fx-try-tab td.fx-a { max-width: 760px; white-
 details.more > summary { cursor: pointer; }
 details.more[open] > summary { color: var(--text-4); }
 details.more > p { margin: var(--sp-2) 0 var(--sp-3); }
+.tpl-sum { margin: 0 0 var(--sp-2); }                            /* ひな形の説明: 要約と、節ごとにたたんだ説明 */
+details.tpl-sec { margin: 0 0 var(--sp-1); }
+details.tpl-sec > p, details.tpl-sec > ul { margin: var(--sp-1) 0 var(--sp-2); max-width: 72ch; }
+details.tpl-sec > ul { padding-inline-start: 1.4em; }
+details.tpl-sec li + li { margin-top: 0.15em; }
 .stage details#kb-wrap > summary.kb-sum { display: none; }       /* 鍵の画面の「CHiPS の残りから作る」は作業の一覧で開く(見出しは上に出る) */
 .stage details#evx-ft-wrap > summary { display: none; }        /* 評価の画面の実地テストは作業の一覧で開く */
 #eval-view .build, #direction-view .build { min-height: calc(100% - var(--sp-6)); }
@@ -805,3 +810,10 @@ dialog#ask .ask-btns { display: flex; justify-content: flex-end; gap: var(--sp-4
 input.layers { width: 10em; }
 .fx-part { border-left: 2px solid var(--line-mid); padding-left: var(--sp-4); margin: 0 0 var(--sp-4); }
 .fx-part-h { flex-basis: 100%; }
+/* 選ぶ欄をまとめた fieldset(方向のもと): 見た目はほかの欄のまとまりと同じ。legend は float にして、1 行目の見出しにする */
+fieldset.fx-part { border-width: 0 0 0 2px; border-style: solid; border-color: var(--line-mid); min-inline-size: 0; padding-block: 0; padding-inline-end: 0; }
+fieldset.fx-part > legend { float: left; padding: 0; }
+/* 層の走査の表: 押せる行(その層と Δ を欄に入れる)と、倍率ごとの列のまとまり */
+table.fx-tab tr.fx-pick { cursor: pointer; }
+table.fx-tab tr.fx-pick:hover :is(td, th) { background: var(--hover); }
+table.fx-tab th.fx-scan-g { text-align: center; border-bottom: 1px solid var(--line-mid); }

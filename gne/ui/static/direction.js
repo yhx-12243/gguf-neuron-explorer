@@ -102,7 +102,7 @@ export class DirectionView {
 
   // app.js の onJobFinished から: 一括(head_pipeline)と候補(heads_candidates)
   async jobEnded(j) {
-    if (String(j.kind).startsWith("fish_") || j.kind === "nw_neurons") return this.fish.jobEnded(j);   // FiSH のタブ
+    if (String(j.kind).startsWith("fish_") || j.kind === "nw_neurons" || j.kind === "direction_token_scan") return this.fish.jobEnded(j);   // FiSH のタブ(層の走査も)
     if (String(j.kind).startsWith("direction_key")) return this.key.jobEnded(j);   // CHANGE-07: 鍵(作成・確認・専門家・key-verify・一括)
     if (j.kind === "head_pipeline" || j.kind === "heads_refine") return this.pipe.jobEnded(j);
     if (j.kind !== "heads_candidates") return;
@@ -129,7 +129,7 @@ export class DirectionView {
       : `<option value="">${t("(なし)")}</option>`;
     if (!this.list.length) {
       this.name = null; this.meta = null;
-      this.$("#dv-info").innerHTML = `<p class="muted">${t("方向がありません。上の帯の「CHiPS」か「鍵」「FiSH」で作れます(gne direction --contrast でも作れます)")}</p>`;
+      this.$("#dv-info").innerHTML = `<p class="muted">${t("方向がありません。上の帯の「CHiPS」か「キー」「FiSH」で作れます(gne direction --contrast でも作れます)")}</p>`;
       this.$("#dv-run").disabled = true;
       this.draw();
       return;

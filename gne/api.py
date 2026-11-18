@@ -409,31 +409,53 @@ class Session:
         return ([{"role": "system", "content": system}] if system else []) + [user]
 
     def generate(self, vectors: dict[int, np.ndarray] | None, messages: list[dict], *, max_tokens: int = 128,
-                 when: str = "all", lora: list[tuple[str, float]] | None = None, sampling=None, lora_when: str = "all") -> dict:
+                 when: str = "all", lora: list[tuple[str, float]] | None = None, sampling=None, lora_when: str = "all",
+                 first_token=None) -> dict:
         """单条生成（确保结果不随批处理组合方式变化，F2）。默认 greedy，可用 sampling（engine.Sampling）采样。
         when 是 §6.15 的位置别 steering，lora 是 gain（§6.16）的 LoRA 适配器。
-        lora_when は LoRA を当てる位置: all(既定)/ prompt(プロンプトを読む間だけ)/ reply(生成するトークンだけ)。"""
+        lora_when は LoRA を当てる位置: all(既定)/ prompt(プロンプトを読む間だけ)/ reply(生成するトークンだけ)。
+        first_token(文字か #ID、またはそのリスト)を渡すと、応答の最初をそのトークン(の列)に決めて続きを書かせる
+        (原因の切り分け用。text・token_ids は決めたトークンを含む)。"""
         from .when import generate_when
         e = self.engine
         r, info = generate_when(e, e.steer_ctx(), messages, vectors, when, max_tokens=max_tokens, lora=lora,
-                                sampling=sampling, lora_when=lora_when)
+                                sampling=sampling, lora_when=lora_when, first_ids=self.first_ids(first_token))
         return {"text": r.text, "finish": r.finish, "n_gen": r.n_gen, "token_ids": r.token_ids, "when": info}
+
+    def first_ids(self, first_token) -> list[int] | None:
+        """応答の最初に決めるトークンの指定 → ID の列。文字(1 トークン以上になってよい)・#ID・それらのリスト。"""
+        if first_token is None or first_token == "" or first_token == []:
+            return None
+        e = self.engine
+        out: list[int] = []
+        for x in (first_token if isinstance(first_token, (list, tuple)) else [first_token]):
+            s = str(x).strip()
+            if isinstance(x, int) or (s.startswith("#") and s[1:].isdigit()):
+                from .tokendir import resolve_token
+                out.append(resolve_token(e, x if isinstance(x, int) else s))
+            else:
+                ids = e.tokenize(str(x), add_special=False, parse_special=True)
+                if not ids:
+                    raise GneError("BAD_ARGS", f"回复首个 token {x!r} 为空")
+                out += [int(t) for t in ids]
+        return out
 
     # --- steer ----------------------------------------------------------------------------------
 
     def steer(self, recipe: Recipe | list[str], *, prompt: str | None = None, messages: list[dict] | None = None,
               system: str | None = None, max_tokens: int = 128, compare: bool = True, when: str | None = None,
-              sampling=None, audio: list[str | Path] | None = None, lora_when: str = "all") -> dict:
+              sampling=None, audio: list[str | Path] | None = None, lora_when: str = "all", first_token=None) -> dict:
         """传入 sampling（engine.Sampling）时，无干预与干预使用相同 seed 采样（差异只来自干预）。
-        audio：将音频文件作为用户发言（需要 mmproj）。"""
+        audio：将音频文件作为用户发言（需要 mmproj）。first_token を渡すと、無介入・介入の両方で応答の最初を
+        そのトークンに決めて続きを書かせる(generate の first_token)。"""
         recipe = self._as_recipe(recipe)
         msgs = self.messages(prompt, messages, system, audio)
         vecs, details = self.vectors(recipe)
-        base = self.generate(None, msgs, max_tokens=max_tokens, sampling=sampling) if compare else None
+        base = self.generate(None, msgs, max_tokens=max_tokens, sampling=sampling, first_token=first_token) if compare else None
         lora = self.lora_for(recipe)
         with self.patched(self.patches_for(recipe)):           # 専門家全体の gain・route(作業用コピーで読み直す)
             st = self.generate(vecs, msgs, max_tokens=max_tokens, when=when or recipe.when, lora=lora, sampling=sampling,
-                               lora_when=lora_when)
+                               lora_when=lora_when, first_token=first_token)
         return {"messages": msgs, "recipe": recipe.to_dict(), "units": details, "layer_norms": self._norms(vecs),
                 "when": when or recipe.when, "sampling": None if sampling is None else sampling.to_dict(),
                 "baseline": base, "steered": st, "differs": None if base is None else base["token_ids"] != st["token_ids"]}
@@ -2743,7 +2765,8 @@ class Session:
             if kw.pop("key_fit", None) not in (None, "mean") or kw.pop("key_c", None) is not None:
                 raise GneError("BAD_ARGS", "最小二乘键（key_fit ridge、key_c）只能用于位置键",
                                "场景键（scene）和几乎返回 1 的键（one）只有一种构建方式")
-            keep = ("layers", "name", "subset", "max_tokens", "pseudo", "iv", "seed", "q_energy", "progress", "gen_cache")
+            keep = ("layers", "name", "subset", "max_tokens", "pseudo", "iv", "seed", "q_energy", "progress", "gen_cache",
+                    "prior_max_tokens")
             extra = sorted(k for k, v in kw.items() if k not in keep and v not in (None, False))
             if extra:
                 raise GneError("BAD_ARGS", f"role {role} 的键不能使用 {', '.join(extra)}")
@@ -2752,6 +2775,26 @@ class Session:
             raise GneError("BAD_ARGS", f"role 必须为 position / scene / one（{role!r}）")
         from .keyed_build import build_keys
         return build_keys(self, contrast, **kw)
+
+    def direction_token(self, tokens, **kw) -> dict:
+        """出力層の重み行列のトークンの行から方向を作る(gne direction token。tokendir.token_direction)。tokens はトークンの指定
+        (文字か #ID)のリスト。layers・delta(目標のロジットの上がり Δ)・name は必須。minus(引くトークン)・down(逆向き)・
+        contrast(r̄ を測る入力)・rbar(r̄ を直接)。"""
+        from .tokendir import token_direction
+        return token_direction(self, tokens, **kw)
+
+    def direction_token_scan(self, tokens, contrast: str | Path, **kw) -> dict:
+        """層の走査(gne direction token-scan。tokendir.token_scan): 層ごとに、狙う側の入力の位置 0 でトークンが 1 位になる最小の Δ と、
+        dont_touch の入力に 0.2 倍・0.5 倍を足したときの影響。"""
+        from .tokendir import token_scan
+        kw.setdefault("progress", self.progress)
+        return token_scan(self, tokens, contrast, **kw)
+
+    def prior_fill(self, contrast: str | Path, **kw) -> dict:
+        """対照集合の前のやり取りの応答(content: null)を無介入のモデルで埋めた対照集合を書く(gne nw prior。prior.fill_file)。"""
+        from .prior import fill_file
+        kw.setdefault("progress", self.progress)
+        return fill_file(self, contrast, **kw)
 
     def direction_keys(self, contrast: str | Path, entries, **kw) -> list[dict]:
         """一次生成并读取回复，创建多把只有写入位置不同的键（keyed_build.build_keys_multi）。entries 为

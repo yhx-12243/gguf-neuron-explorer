@@ -200,6 +200,11 @@ def _put_spec(pg, spec):
                 json.dumps(spec, ensure_ascii=False, indent=2))
 
 
+def _all(a: dict) -> str:
+    """ひな形の説明(about.ja / about.en)の、要約と節の全部の文。"""
+    return " ".join([a.get("text") or ""] + [s["h"] + " " + " ".join(s["body"]) for s in a.get("sections") or []])
+
+
 # --- サーバ ----------------------------------------------------------------------------------------------
 
 def test_template_file():
@@ -207,11 +212,11 @@ def test_template_file():
     assert d["about"]["ja"]["title"] and d["about"]["en"]["title"] and d["about"]["ja"]["text"] and d["about"]["en"]["text"]
     assert len(d["user_prompts"]) >= 24 and d["system_a"]
     assert [g["name"] for g in d["dont_touch"]] == ["tasks", "ordinary", "report", "invite", "greet", "request", "partial"]   # 質問でない発言も群ごとに
-    assert d["fish"]["key_fit"] == "mean" and "key_fit" in d["about"]["ja"]["text"] and "key_fit" in d["about"]["en"]["text"]   # 既定の作り方
+    assert d["fish"]["key_fit"] == "mean" and "key_fit" in _all(d["about"]["ja"]) and "key_fit" in _all(d["about"]["en"])   # 既定の作り方
     assert d["fish"]["form"] == "cap" and d["fish"]["segments"] == "0,1-3,4-" and d["fish"]["alpha"] == [1, 1, 0.8]
     assert "layers" not in d["fish"]                                       # 層は使う人が入れる
     assert d["fish"]["stack_fast"] is False                                # 速い読み方は、書けるが既定は切
-    assert "stack_fast" in d["about"]["ja"]["text"] and "stack_fast" in d["about"]["en"]["text"] and "探索" in d["about"]["ja"]["text"]
+    assert "stack_fast" in _all(d["about"]["ja"]) and "stack_fast" in _all(d["about"]["en"]) and "探索" in _all(d["about"]["ja"])
 
 
 def test_units_and_names_without_model():
@@ -457,7 +462,7 @@ def test_fish_tab_end_to_end_in_browser(served, browser):
     assert pg.evaluate("[...document.querySelectorAll('#fx-alphas input')].map((x) => x.value)") == ["1", "1", "0.8"]      # 強さの欄は区切りごと
     assert pg.evaluate("[...document.querySelectorAll('#fx-alphas .fx-al span')].map((x) => x.textContent)") == ["0", "1-3", "4-"]
     assert pg.evaluate("document.querySelector('#fx-layers').value") == ""
-    assert "狙う場面の質問 32 問" in pg.evaluate("document.querySelector('#fx-jcheck').textContent")
+    assert "対象の場面の質問 32 問" in pg.evaluate("document.querySelector('#fx-jcheck').textContent")
     assert "report(4)" in pg.evaluate("document.querySelector('#fx-jcheck').textContent")                   # 変えたくない場面の群
     assert pg.evaluate("document.querySelector('#fx-keyfit').value") == "mean" and pg.evaluate("document.querySelector('#fx-keyc').disabled")
     assert "層 1 つに 6 個" in pg.evaluate("document.querySelector('#fx-need').textContent")
@@ -505,8 +510,8 @@ def test_fish_tab_end_to_end_in_browser(served, browser):
     assert pg.evaluate("document.querySelectorAll('#fx-leak-tab tbody tr').length") == 3
     assert pg.evaluate("[...document.querySelectorAll('#fx-leak-tab thead th')].map((x) => x.textContent)") == ["群", "どれかの区間", "区間 0", "区間 1-3", "区間 4-", "位置 0 だけ"]
     for sel in ("#fx-pipe-fit", "#fx-keys-fit"):
-        assert pg.evaluate(f"document.querySelector('{sel}').textContent").startswith("鍵の作り方: いまの作り方"), sel
-    assert pg.evaluate("document.querySelector('#fx-check-fit').textContent") == "ユニットの鍵の作り方: いまの作り方"
+        assert pg.evaluate(f"document.querySelector('{sel}').textContent").startswith("キーの作り方: いまの作り方"), sel
+    assert pg.evaluate("document.querySelector('#fx-check-fit').textContent") == "ユニットのキーの作り方: いまの作り方"
     # 鍵の作り方の欄 → ジョブの引数(いまの作り方なら渡さない。最小二乗なら key_fit、強さを入れたら key_c)。読めなければ止める
     kf = pg.evaluate(f"""(() => {{ const p = {f}, sel = document.querySelector('#fx-keyfit'), c = document.querySelector('#fx-keyc'), seg = document.querySelector('#fx-seg');
         const out = [p.keyFit('all')]; sel.value = 'ridge'; sel.dispatchEvent(new Event('change')); out.push(c.disabled, p.keyFit('all'));
@@ -713,7 +718,7 @@ def test_fish_steps_in_browser(served, browser, piped):
     _step(pg, "fish", "units")
     pg.click("#fx-rekey")
     pg.wait_for_function(f"{f}.st.keyBase === 'fish_steps_r' && {f}.st.units.length === 2 && {f}.st.units[0].includes('#fish_steps_r_p0')", timeout=900000)
-    assert "レシピを当てた状態で作り直した鍵" in pg.evaluate("document.querySelector('#fx-keys').textContent")
+    assert "レシピを当てた状態で作り直したキー" in pg.evaluate("document.querySelector('#fx-keys').textContent")
     _step(pg, "fish", "check")
     pg.click("#fx-verify-go")
     pg.wait_for_function("document.querySelectorAll('#fx-verify-tab tbody tr').length === 1", timeout=300000)
@@ -734,7 +739,7 @@ def test_fish_steps_in_browser(served, browser, piped):
     assert pg.evaluate("document.querySelectorAll('.fx-behave-tab[data-b=others] tbody tr').length") == 2
     assert "手伝ってくれてありがとう。" in pg.evaluate("document.querySelector('.fx-behave-tab[data-b=scene]').textContent")
     assert "2 問" in pg.evaluate("document.querySelector('[data-fxb=scene]').textContent")
-    assert "鍵づくりに使った質問" not in pg.evaluate("document.querySelector('#fx-behave').textContent")
+    assert "キーづくりに使った質問" not in pg.evaluate("document.querySelector('#fx-behave').textContent")
     assert (served["session"].store.root / "behave" / served["session"].meta.model_id / "fish_steps_fish_scene.json").exists()
     # 区切りを変えると、方向・鍵と合わないことを伝えてユニットを消す
     pg.fill("#fx-seg", "0,1-3,4-")
@@ -768,7 +773,7 @@ def test_fish_tab_in_english(served, browser, piped):
     assert "Build everything" in pg.evaluate("document.querySelector('#fx-all').textContent")
     assert "Target scene" in pg.evaluate("document.querySelector('#fx-check').textContent")
     assert "Values per question" in pg.evaluate("document.querySelector('#fx-check').textContent")
-    assert "Leaks per group of scenes to leave alone" in pg.evaluate("document.querySelector('#fx-check').textContent")
+    assert "False positives per group of non-target scenes" in pg.evaluate("document.querySelector('#fx-check').textContent")
     assert pg.evaluate("document.querySelector('#fx-pipe-fit').textContent").startswith("Key method: current method")
     assert pg.evaluate("document.querySelector('#fx-keyfit').parentElement.textContent").strip().startswith("Key method")
     assert "Least squares (weights per cell)" in pg.evaluate("document.querySelector('#fx-keyfit').textContent")
@@ -786,7 +791,7 @@ def test_fish_tab_in_english(served, browser, piped):
     assert texts["keys"].startswith("Key method: least squares (weights per cell) · Regularization c = 100(chosen by 5-fold splits over questions)")
     assert "at the edge of the candidates" in texts["keys"] and "first keys c = 1" in texts["pipe"] and "keys rebuilt with the recipe applied c = 2(value given)" in texts["pipe"]
     assert texts["ck1"] == "Key method of the units: least squares (weights per cell) · c = 1" and "are mixed" in texts["ck2"]
-    assert texts["bad"].startswith("The regularization strength is a number above 0") and texts["before"].startswith("Least-squares keys are only for reply-position segments")
+    assert texts["bad"].startswith("The regularization strength is a number above 0") and texts["before"].startswith("Least-squares keys are only for response-position segments")
     assert "Use an existing direction" in pg.evaluate("document.querySelector('#fx-usedir').parentElement.textContent")
     # 速い読み方: チェックの文言、できた方向の読み方の表示、見積もりに添える「初回は長めに出ます」
     assert [x.split("(")[0].strip() for x in pg.evaluate("[...document.querySelectorAll('input.fx-fast')].map((x) => x.parentElement.textContent)")] == ["Fast reading"]
@@ -832,8 +837,8 @@ def test_fish_tab_in_english(served, browser, piped):
     tr = {"scene": one, "baseline": one, "others": one, "direction": "fish_job", "layers": [8, 12], "segments": ["0", "1-3", "4-"], "alphas": [1, 1, 0.8], "alpha": [1, 1, 0.8],
           "match": "x", "temperature": 0.7, "seed": 1, "own_prompts": False, "notes": ["方向 fish_job は層 8,12 に重ねて書く前提で作ってあります。", "a", "b"]}
     pg.evaluate(f"(r) => {{ const p = {f}; p.st.tries = [r]; p.st.tryShown = 0; p.renderTry(); }}", tr)
-    assert "Replies that fall into repetition (loops)" in pg.evaluate("document.querySelector('#fx-try-runs').textContent")
-    assert "Reply with the direction added" in pg.evaluate("document.querySelector('#fx-try-scene').textContent")
+    assert "Responses that fall into repetition (loops)" in pg.evaluate("document.querySelector('#fx-try-runs').textContent")
+    assert "Response with the direction added" in pg.evaluate("document.querySelector('#fx-try-scene').textContent")
     _step(pg, "fish", "try")
     pg.fill("#fx-try-layers", "0")                                        # 足せない層の文
     _step(pg, "fish", "try")
@@ -857,7 +862,9 @@ def test_fish_tab_in_english(served, browser, piped):
 # --- ひな形(configs/fish/)と、文字の直前に書く形 -----------------------------------------------------------------
 
 TEMPLATES = ["tone_in_scene.json", "always_persona.json", "sentence_end.json", "scene_and_sentence_end.json", "two_personas.json",
-             "after_chips.json"]                                              # about.order の順
+             "after_chips.json", "route_none.json", "route_ack.json", "heads_by_scene.json", "closing_rmbase.json"]   # about.order の順
+ROUTE = {"route_none.json": "<|im_end|>", "route_ack.json": "◇"}             # 入力の振り分け(トークンの行の方向・位置 0 のキー)
+OTHER = {"heads_by_scene.json", "closing_rmbase.json"}                       # CHiPS のヘッドの分を場面で取り除く・成分を取り除く形
 
 
 def test_all_templates_are_readable(tmp_path):
@@ -872,12 +879,17 @@ def test_all_templates_are_readable(tmp_path):
         d = json.loads((TEMPLATE.parent / name).read_text(encoding="utf-8"))
         a = d.pop("about")
         orders.append(a["order"])
-        assert a["ja"]["title"] and a["en"]["title"] and "試した範囲" in a["ja"]["text"] and "Tried on" in a["en"]["text"], name
-        assert "誤差" in a["ja"]["text"] and "Qwen3.5-4B" in a["ja"]["text"] and "Qwen3.5-4B" in a["en"]["text"], name
+        for lang in ("ja", "en"):                                               # 要約と、5 つの見出しの節
+            assert [x["h"] for x in a[lang]["sections"]][:2] == (["何をするか", "入れるもの"] if lang == "ja" else ["What it does", "What to put in"]), name
+        if name in ROUTE or name in OTHER:
+            _check_new_template(name, d, a, tmp_path)
+            continue
+        assert a["ja"]["title"] and a["en"]["title"] and "試した範囲" in _all(a["ja"]) and "Tried on" in _all(a["en"]), name
+        assert "誤差" in _all(a["ja"]) and "Qwen3.5-4B" in _all(a["ja"]) and "Qwen3.5-4B" in _all(a["en"]), name
         st = d.pop("fish")
         assert set(st) <= set(fish.SETTINGS) and "layers" not in st, name       # 層は使う人が入れる
         assert st.get("stack_fast", False) is False and ("stack_fast" in st) == bool(st.get("stack")), name    # 速い読み方: 重ねる形にだけ書いてあり、切
-        assert ("stack_fast" in a["ja"]["text"]) == ("stack_fast" in a["en"]["text"]) == bool(st.get("stack")), name
+        assert ("stack_fast" in _all(a["ja"])) == ("stack_fast" in _all(a["en"])) == bool(st.get("stack")), name
         assert st["form"] in fish.FORMS, name
         segs = fish._segments(st["segments"])
         al = fish.alphas_of(st["alpha"], len(segs))                             # 数 1 つか、区切りごと
@@ -897,6 +909,30 @@ def test_all_templates_are_readable(tmp_path):
     two = json.loads((TEMPLATE.parent / "two_personas.json").read_text(encoding="utf-8"))
     assert two["system_b"] and two["system_a"] != two["system_b"]
     assert json.loads((TEMPLATE.parent / "after_chips.json").read_text(encoding="utf-8"))["fish"]["iv"] == ""
+
+
+def _check_new_template(name, d, a, tmp_path):
+    """入力の振り分け・ヘッドの分を場面で取り除く・成分を取り除く形のひな形: 説明に確かめた範囲と注意(!kauto)があり、設定が決まりどおりで、
+    対照集合として読める。"""
+    from gne import fish
+    from gne.keyed_build import read_key_spec
+    from gne.prior import spec_has_null
+    from gne.yamlio import write_yaml
+    assert "確かめた範囲と数" in [x["h"] for x in a["ja"]["sections"]] and "!kauto" in _all(a["ja"]) and "!kauto" in _all(a["en"]), name
+    assert "誤差" in _all(a["ja"]) and "Qwen3.5-4B" in _all(a["ja"]) and "Qwen3.5-4B" in _all(a["en"]), name
+    st = d.pop("fish")
+    assert set(st) <= set(fish.SETTINGS) and "layers" not in st and st["form"] == "cap", name
+    if name in ROUTE:
+        assert st["token"] == ROUTE[name] and st["token_delta"] > 0 and st["segments"] == "0" and st["key_fit"] == "ridge" and st["alpha"] == 1, name
+        assert spec_has_null(d), name                                           # 前のやり取りの応答は content: null(無介入のモデルが埋める)
+        assert any(isinstance(q, list) and q[0]["role"] == "system" for q in d["user_prompts"]), name   # システムプロンプトつきの会話も
+    if name == "closing_rmbase.json":
+        assert st["remove"] == "rmbase" and st["kscale"] == "auto" and d["system_a"], name
+    assert d["name"].startswith("fish_") and d["validate"]["match"], name
+    p = tmp_path / f"{d['name']}.yaml"
+    write_yaml(p, d)
+    ks = read_key_spec(p)
+    assert ks.contrast.name == d["name"] and ks.dont_touch, name
 
 
 def test_before_mode_without_model():

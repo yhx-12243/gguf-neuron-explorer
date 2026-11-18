@@ -52,7 +52,7 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    若只想完整跑一遍，用 heads_pipeline(spec)（从创建方向到分配。问题可以有数百个，停止测量的阶段会抽稀到 64 个）。
    最终确定强度：heads_candidates（按组 × 倍率生成，并创建隐藏名称的评分文件）→ 评分 → heads_candidates_tally。
    若某组仍留下无法消除的问题（分配表中的 remain），用 heads_refine 仅从剩余问题中寻找额外注意力头并加入组中。
-   分发前用 fieldtest 确认（按真实用法比较烧录后的文件与原文件；检查 eval 看不到的长任务崩溃和工具调用问题）。
+   分发前用 fieldtest 确认（按真实用法比较合并后的文件与原文件；检查 eval 看不到的长任务崩溃和工具调用问题）。
    - 使用方向的干预，应先用 direction_score 确认基准层与分离度（cohen_d）再继续。
    - heads_causal 的 ablate 与 marginal 排名不同。初次筛选用 ablate，重新分配用 marginal（由 heads_allocate 使用）。
    - 候选与强度方案用不生成文本的指标（direction_score、heads_causal、heads_allocate）来制定。方向上的投影值表示推动量，并非行为本身，因此最终强度要用少量问题生成来确认。
@@ -66,7 +66,7 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    步骤: direction(写入方向)→ direction_key(键。无干预创建。若将对照集的 positions 设为 "before:<正则表达式>"，
    则在与推理时相同上下文的模型自身回复中，要改变字符的紧前方位置即为写入位置)→ direction_key_check(用创建时未
    使用的样本。默认 subset="odd"。held_out 为 false 的值偏乐观。key-check 的选择性若不超过比较用键(打乱标签后用相同
-   步骤创建的键)的 p95，则不要使用该键)→ steer / eval → keyed_export(分发时用 LoRA。烧录的默认是，原为
+   步骤创建的键)的 p95，则不要使用该键)→ steer / eval → keyed_export(分发时用 LoRA。合并时的默认是，原为
    Q8_0 的张量保持 Q8_0，其余为 f16)。when 对 keyed 无效。eval 会在 keyed 配方中加入 eval 的选择性
    区块(行的 keyed.selectivity、结果的 keyed 方式比较与比较用键)。当键与方向用不同对照集创建等，无法推断键的对照集时，
    用 eval(keyed_contrast=创建键的对照集)传入(不传则 keyed 为 skipped)。
@@ -85,7 +85,7 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    （只含条件差异的成分）。默认创建方式（各自读取自己的回复后的差）的方向还包含“所读词语差异”的成分，持续写入时
    更容易陷入重复（Qwen3.5-4B 性格的 1 个示例。docs/keyed-write.md §19）。
    MoE 层用 direction_key(target="shared")写入 shared expert，用 target="expert:e" 写入专家 e(单元为 L:S / L:Ee:keyed:…)。
-   专家用 direction_key_experts 选择在写入位置经常被选中的(rate_a 大且 rate_b 小)专家。烧录时
+   专家用 direction_key_experts 选择在写入位置经常被选中的(rate_a 大且 rate_b 小)专家。合并时
    默认(auto)与 requant="keep" 下，原为 Q8_0 的专家张量保持原类型(f16 会使整个张量变为 F16 而变大)。
 11. FiSH（Formula-instantiated Scene-gated Hidden units。计算生成的神经元，mode nw，docs/fish.md）。无需训练，用计算出的权重覆盖 MLP 神经元，
    只在键响应的位置写入方向。单元："L:Nn:nw:aα@方向#键"（1 个键）、"L:Nn:nw:aα@方向#场景键&位置键"（2 个键 = 场景且位置）、
@@ -93,7 +93,7 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    步骤：用 direction(positions="response", same_reply=True, segments="0,1-3,4-") 创建方向（区段 i 为 "NAME.seg<i>"）→ 用 nw_neurons(layers)
    查看活动量小的神经元表并选择编号 → 用 direction_key(target="mlpin", positions="pos:1-3") 创建位置键、
    direction_key(role="scene") 创建场景键、direction_key(role="one") 创建返回接近 1 的键 → nw_verify（是否符合公式）→ nw_check（各位置的
-   写入量。目标场景约为 1、不希望写入场景约为 0 吗）→ 用 steer / behave 阅读回复 → nw_export（LoRA。不烧录）。
+   写入量。目标场景约为 1、不希望写入场景约为 0 吗）→ 用 steer / behave 阅读回复 → nw_export（LoRA。不合并）。
    仅支持带门控的 MLP（SiLU 门控 × 输入、无偏置）的 dense 层（MoE 层及其他形式会返回 ARCH_UNSUPPORTED）。
    要改变语气，必须在整段回复中持续写入（只写前几个 token 不够）。强度范围较窄，请阅读回复后决定。
    要一次完成，请用 fish_pipeline(contrast, layers, alpha)。强度可按分段设置（对 segments "0,1-3,4-" 使用 alpha [1, 1, 0.8]）。
@@ -117,6 +117,12 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    81 降到 1，语气改变的回复从 14 降到 0，目标场景的语气没有减少（57 → 70。陷入重复的回复按机械计数从 1 增加到 4）。默认仍为
    现有做法（mean）。新方法仅在 1 个模型、1 个性格上验证（docs/fish.md §3）。可用 nw_check 的 leaks（不希望写入的场景按组、
    按分段统计的误写入问题数与平均写入量，以及仅位置 0 的数量）按组检查泄漏。
+11. 混合会话形式（第 2 轮及以后、带 system 提示词）的键：在对照集中混合多轮会话，以及仅该问题带 system（在开头放
+   {"role": "system"}）的会话后创建。前文 assistant 回复若为 content: null，则由无干预模型填充（可用 nw_prior 查看
+   填充后的对照集）。只用第 1 轮创建的键，在第 2 轮及以后、带 system 提示词时会降到 69〜78%（Qwen3.5-4B）。
+   输入路由（用结束 token 不回复、用标记进行附和）时，用 direction_token_scan 选择层和 Δ，再用
+   fish_pipeline(token、token_delta、segments="0"、key_fit="ridge"、alpha=1) 创建。可用 steer 的 first_token
+   固定回复开头来定位问题。
 """
 
 
@@ -190,17 +196,19 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def steer(units: list[str], prompt: str | None = None, messages: list[dict[str, str]] | None = None,
                     max_tokens: int = 128, compare: bool = True, dose_unit: str = "rel",
-                    system: str | None = None, when: str = "all", ablate: str | None = None, lora_when: str = "all") -> dict:
+                    system: str | None = None, when: str = "all", ablate: str | None = None, lora_when: str = "all",
+                    first_token: str | None = None) -> dict:
         """用单元（例 ["14:8949:+1.0", "13:7956:-1.0"]）推动并生成（greedy）。compare=True 时并列显示无干预结果。
         lora_when は LoRA(gain・proj・keyed・nw)を当てる位置: all(既定)/ prompt(プロンプトを読む間だけ)/ reply(生成するトークンだけ)。
         在 "14:8949:x2" 中加 x 表示 gain（将该神经元输出放大 k 倍，x0 表示消除。§6.16）。
         when 为添加位置：all（全部位置）/ gen（仅生成中，不破坏对提示词的理解）/ assistant（仅 assistant 发言）/
         after:<字符串>（输出中出现该字符串后）/ ramp:<a>-<b>（倍率从 a 到 b）。
-        ablate 是用 direction 创建的方向执行投影消除（"NAME"、"NAME@层"、"NAME:0.5"）。units 可以为空。"""
+        ablate 是用 direction 创建的方向执行投影消除（"NAME"、"NAME@层"、"NAME:0.5"）。units 可以为空。
+        first_token(文字か "#<ID>")を渡すと、無介入・介入の両方で応答の最初をそのトークンに決めて続きを書かせる(原因の切り分け用)。"""
         def fn():
             r = session.recipe(units=units or None, dose_unit=dose_unit, when=when, ablate=ablate)
             return session.steer(r, prompt=prompt, messages=messages, system=system, max_tokens=max_tokens,
-                                 compare=compare, lora_when=lora_when)
+                                 compare=compare, lora_when=lora_when, first_token=first_token)
         return await call(fn)
 
     @srv.tool()
@@ -610,7 +618,9 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                             replies_a: str | list[str] | None = None, replies_b: str | list[str] | None = None,
                             iv: str | list[str] | None = None, target: str = "ffn", seed: int = 0,
                             dont_touch_start: bool | None = None, role: str | None = None, key_fit: str | None = None,
-                            key_c: float | None = None) -> dict:
+                            key_c: float | None = None, key_conv_cells: bool = False, key_crit: float | None = None,
+                            key_fp_max: float | None = None, target_reply: str | None = None,
+                            prior_max_tokens: int | None = None) -> dict:
         """提交创建键控写入所用键 κ 的作业（CHANGE-07，用 job_status 查看结果）。将对照集合（configs/contrast/ 中的名称或路径）
         在目标写入位置的平均激活 μ，与不希望写入位置及 dont_touch 激活张成的空间正交，使 κᵀμ = 1，并保存到
         <root>/keys/<model_id>/<name>.npz。必须指定 layers（例 [8, 14, 20]）。positions（省略时使用对照集合的值）为
@@ -637,7 +647,15 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         位置）× 位置分段”的每个单元格相同）。仅适用于 FiSH 的位置键（target="mlpin"、positions="pos:<范围>"），不能用于
         keyed write 的键（BAD_ARGS）。key_c 是正则化强度（省略时，只用建键问题按问题为单位做 5 折交叉验证，从 0.01～100 的
         5 个候选中决定。选中的值和是否位于候选边界见结果的 ridge 与 notes）。若要一次创建各分段的键，请用 fish_pipeline
-        （所有键共用一个正则化强度）。结果中的 key_fit 表示键由哪种方式构建。"""
+        （所有键共用一个正则化强度）。结果中的 key_fit 表示键由哪种方式构建。
+        最小二乗の鍵の追加の設定(既定はどれも使わない): key_conv_cells=True でセルに会話の形(single / multi_turn / system /
+        system_multi_turn)も入れる。positions="after:<正規表現>" は返事のトークンが一致した直後の位置(例 "after:[。！？\\n]" = 文の
+        終わりの次)で開く鍵。target_reply(正規表現、例 "^◇")は狙う場面の応答のうち一致したものだけを狙う場面にする(対照集合の
+        target_reply より優先)。key_crit は決め手のセル(dont_touch の群の、鍵が開く位置と同じ種類の位置)の重みの倍率、key_fp_max は
+        交差検証の決め手のセルの誤検出の上限(超える層はキーを縮める。1 本ずつ・key_c を省いたときだけ)。結果の ridge に、会話の形
+        ごとの数(forms)・セルごとの交差検証の数(cv_cells)・縮めた倍率(shrink)が出る。
+        対照集合の 1 問は、文字列か会話(先頭に {"role": "system", …} を置くとその問だけの system。前のやり取りの assistant を
+        content: null にすると、無介入のモデルで埋める。上限 prior_max_tokens、既定 256。埋めた応答は <root>/prior/ に覚えておく)。"""
         from .jobs import _layers
         try:
             if not _layers(layers):
@@ -649,13 +667,17 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                  "positions": positions, "positions_b": positions_b, "skip": skip, "max_tokens": max_tokens,
                  "q_mode": q_mode, "q_energy": q_energy, "q_max_rank": q_max_rank, "q_max_samples": q_max_samples,
                  "subset": subset, "pseudo": pseudo, "replies_a": replies_a, "replies_b": replies_b, "iv": iv,
-                 "target": target, "seed": seed, "dont_touch_start": dont_touch_start, "key_fit": key_fit, "key_c": key_c}
+                 "target": target, "seed": seed, "dont_touch_start": dont_touch_start, "key_fit": key_fit, "key_c": key_c,
+                 "key_conv_cells": key_conv_cells or None, "key_crit": key_crit, "key_fp_max": key_fp_max,
+                 "target_reply": target_reply, "prior_max_tokens": prior_max_tokens}
             if role in ("scene", "one"):
-                if key_fit not in (None, "mean") or key_c is not None:
-                    raise GneError("BAD_ARGS", "key_fit=\"ridge\"、key_c 只能用于位置键（不传 role 或 role 为 position）",
-                                   "场景键（scene）和几乎返回 1 的键（one）只有一种构建方式")
+                if key_fit not in (None, "mean") or key_c is not None or key_conv_cells or key_crit is not None \
+                        or key_fp_max is not None or target_reply is not None:
+                    raise GneError("BAD_ARGS", "key_fit=\"ridge\"、key_c、key_conv_cells、key_crit、key_fp_max、target_reply 只能用于位置键"
+                                               "（不传 role 或 role 为 position）",
+                       "场景键（scene）和定数键（one）只有一种构建方式")
                 p = {"contrast": p["contrast"], "layers": layers, "name": name, "max_tokens": max_tokens, "subset": subset,
-                     "pseudo": pseudo, "iv": iv, "seed": seed, "role": role}
+                     "pseudo": pseudo, "iv": iv, "seed": seed, "role": role, "prior_max_tokens": prior_max_tokens}
             elif role not in (None, "position"):
                 raise GneError("BAD_ARGS", f"role 必须为 position / scene / one（{role!r}）")
             return jobs.start("direction_key", {k: v for k, v in p.items() if v is not None}).view()
@@ -700,6 +722,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         return await call(build, session, recipe, contrast, name=name, scene_key=scene_key, one_key=one_key, neurons=nmap,
                           subset=subset, max_tokens=max_tokens, save=save)
 
+    @srv.tool()
     async def nw_verify(units: list[str] | None = None, recipe: str | None = None, texts: list[str] | None = None,
                         iv: str | list[str] | None = None, contrast: str | None = None, subset: str = "all",
                         n_prompts: int = 6, max_tokens: int = 48) -> dict:
@@ -720,7 +743,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
     @srv.tool()
     async def nw_check(contrast: str, units: list[str] | None = None, recipe: str | None = None, subset: str = "odd",
                        replies: str = "own", max_tokens: int = 96, n_pos: int = 8, iv: str | list[str] | None = None,
-                       low: float = 0.4, over: float = 1.2, top: int = 5, save: str | None = None, leak: float = 0.2) -> dict:
+                       low: float = 0.4, over: float = 1.2, top: int = 5, save: str | None = None, leak: float = 0.2,
+                       pos_bins: str | None = None, positions: str | None = None, prior_max_tokens: int | None = None) -> dict:
         """提交测量 nw 配方在不同位置类型下的键响应与实际写入量的作业（以 α·d 为 1，用 job_status 查看结果）。
         对对照集合的问题（目标场景 = groups.scene）和 dont_touch 组（不希望写入的场景），按回复位置 0（开始写回复之前）～
         n_pos−1 及之后，为每个单元给出 amount、rho_gate、rho_up 的平均、最小、最大。replies="own" 表示应用配方
@@ -735,7 +759,11 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         leaks 是不希望写入的场景按组的泄漏表：groups 的每一行包含 n（问题数）、any（任一分段中合计写入量达到 leak
         （默认 0.2）以上的问题数）、segments.<分段> 的 leak（该数量）与 total_mean（平均写入量）、pos0（仅位置 0 = 开始写
         回复之前统计的相同数量）。all 是合并所有组的行。请按组检查，确认是否只泄漏到与目标场景形式相同的发言组，以及泄漏是否
-        只是从某个分段转移到了位置 0。key_fit 表示单元的键由哪种方式构建（fit: mean / ridge / mixed；keys: 每个键）。"""
+        只是从某个分段转移到了位置 0。key_fit 表示单元的键由哪种方式构建（fit: mean / ridge / mixed；keys: 每个键）。
+        pos_bins(例 "0,1-3,4-15,16-63,64-")で位置ごとの表をその区分にする(長い応答の後ろの位置まで読むとき。max_tokens を応答を
+        書き終える長さにする。groups.<名前>.finished が書き終えた応答の数)。positions="after:<正規表現>"(または before:)で、一致した
+        位置(match)とそれ以外に分ける。groups.<名前>.by_form は会話の形(single / multi_turn / system / system_multi_turn)ごとの数。
+        前のやり取りの応答(content: null)は無介入のモデルで埋める(上限 prior_max_tokens)。"""
         try:
             if bool(recipe) == bool(units):
                 raise GneError("BAD_ARGS", "请通过 recipe（已保存配方的名称）或 units 之一传入")
@@ -743,7 +771,57 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             return jobs.start("nw_check", {"recipe": r, "contrast": str(_contrast_path(session, contrast, None, None, None, None)),
                                            "subset": subset, "replies": replies, "max_tokens": max_tokens, "n_pos": n_pos,
                                            "low": low, "over": over, "leak": leak, "top": top, **({"save": save} if save else {}),
-                                           **({"iv": iv} if iv is not None else {})}).view()
+                                           **({"iv": iv} if iv is not None else {}),
+                                           **{k: v for k, v in (("pos_bins", pos_bins), ("positions", positions),
+                                                                ("prior_max_tokens", prior_max_tokens)) if v is not None}}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def direction_token(tokens: list[str] | str, layers: list[int] | str, delta: float, name: str,
+                              minus: list[str] | str | None = None, down: bool = False, contrast: str | None = None,
+                              rbar: float | None = None) -> dict:
+        """出力層の重み行列のトークンの行から方向を作るジョブを投げる(job_status で結果。gne direction token)。tokens は 1 トークンに
+        なる文字(特殊トークンの書き方 "<|im_end|>" も可)か "#<ID>" のリスト(複数なら行の平均)。minus は引くトークン(差の向き)。
+        層 layers の残差に β·û を足すと、トークンのロジットが約 delta 上がる(β = Δ × r̄ ÷ ((γ⊙u)·û)、r̄ は contrast の入力の位置 0 での
+        最終層の出力の rms の中央値。rbar で直接渡せる)。down=True で逆向き(出にくくする)。書いた方向は nw のユニット
+        (L:Na+Nb:nw:a1@NAME#KEY&ONE)で、キーが開いた場面だけに足せる(終了トークンで応答しない・マーカーで相づち。docs/fish.md §5)。"""
+        try:
+            from .jobs import _layers
+            p = {"tokens": [tokens] if isinstance(tokens, str) else list(tokens), "layers": _layers(layers), "delta": delta,
+                 "name": name, "minus": ([minus] if isinstance(minus, str) else minus) or None, "down": down or None,
+                 "contrast": str(_contrast_path(session, contrast, None, None, None, None)) if contrast else None, "rbar": rbar}
+            return jobs.start("direction_token", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def direction_token_scan(tokens: list[str] | str, contrast: str, layers: list[int] | str | None = None,
+                                   minus: list[str] | str | None = None, deltas: list[float] | None = None, need: float = 0.95,
+                                   leaks: list[float] | None = None, rbar: float | None = None,
+                                   prior_max_tokens: int | None = None) -> dict:
+        """層の走査のジョブを投げる(job_status で結果。gne direction token-scan。生成しない)。層ごとに、対照集合の user_prompts の
+        入力の位置 0 にだけトークンの行の方向を足し、トークンが 1 位になった入力が need 以上になる最小の Δ(rows.need_delta)と β を
+        探す。その Δ の leaks 倍(既定 0.2・0.5)を dont_touch の入力の位置 0 に足したときの、1 位になった数・KL・1 位が変わった数
+        (rows.leak)も出す。need_delta が None の層は、deltas の最大でも届かない。"""
+        try:
+            from .jobs import _layers
+            p = {"tokens": [tokens] if isinstance(tokens, str) else list(tokens),
+                 "contrast": str(_contrast_path(session, contrast, None, None, None, None)),
+                 "layers": _layers(layers) if layers is not None else None, "minus": ([minus] if isinstance(minus, str) else minus) or None,
+                 "deltas": deltas, "need": need, "leaks": leaks, "rbar": rbar, "prior_max_tokens": prior_max_tokens}
+            return jobs.start("direction_token_scan", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
+    async def nw_prior(contrast: str, out: str | None = None, max_tokens: int | None = None) -> dict:
+        """対照集合の前のやり取りのアシスタントの応答(content: null)を、無介入のモデルに書かせて埋めた対照集合を書くジョブを投げる
+        (job_status で結果。gne nw prior)。使うのはその問の system と、その応答より前のメッセージだけ。結果の path が埋めた対照集合、
+        forms が会話の形ごとの数。キーの作成・nw_check・fish_pipeline は、これを自動で行う(読んで確かめたいときに使う)。"""
+        try:
+            p = {"contrast": str(_contrast_path(session, contrast, None, None, None, None)), "out": out, "max_tokens": max_tokens}
+            return jobs.start("nw_prior", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -769,7 +847,9 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                             iv: str | list[str] | None = None, neurons: dict[str, list[int]] | None = None, top: int = 20,
                             save: str | None = None, summary: bool = False, direction: str | None = None,
                             cap: str | list[str] | None = None, stack_fast: bool | None = None, key_fit: str | None = None,
-                            key_c: float | None = None) -> dict:
+                            key_c: float | None = None, key_conv_cells: bool | None = None, kscale: str | None = None,
+                            remove: str | None = None, prior_max_tokens: int | None = None, token: str | list[str] | None = None,
+                            token_delta: float | None = None) -> dict:
         """用一次作业从头到尾创建 FiSH（用 job_status 查看结果。与 UI 的 FiSH 标签页“全部构建”相同）：方向 → 神经元表 →
         键 → 单元 → 在应用这些单元的状态下重建键 → 是否符合公式 → 写入量。contrast 可以是对照集的表（包含 name、system_a、
         user_prompts、dont_touch 以及 fish 设置），也可以是 configs/contrast/ 的名称或路径、configs/fish/ 的模板名称。
@@ -804,7 +884,12 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         576 个问题时每阶段需要数分钟（会计入估算）。写入位置为 before:<正则表达式> 的键不能使用。Qwen3.5-4B 的傲娇示例中，
         键未见过的 105 条非问题发言里发生写入的从 81 降到 1，语气改变的回复从 14 降到 0，目标场景的语气没有减少（陷入重复
         的回复按机械计数在 100 个问题中从 1 增加到 4）。仅在 1 个模型、1 个性格上验证（docs/fish.md §3）。
-        摘要中的 leaks 是不希望写入的场景按组的泄漏表（与 nw_check 的 leaks 相同）。"""
+        摘要中的 leaks 是不希望写入的场景按组的泄漏表（与 nw_check 的 leaks 相同）。
+        key_conv_cells=True で、最小二乗の鍵のセルに会話の形も入れる(表の fish.key_conv_cells でも書ける)。kscale="auto" で
+        ユニットに !kauto、remove="rm" / "rmbase" で成分を取り除く形にする(fish.kscale・fish.remove)。対照集合の前のやり取りの
+        応答(content: null)は、無介入のモデルで埋める(上限 prior_max_tokens、既定 256)。
+        token(例 "<|im_end|>"・"◇")と token_delta を渡すと、方向を出力層の行列のトークンの行から作る(入力の振り分け。
+        segments="0"・key_fit="ridge"・alpha=1 と一緒に使う。Δ は direction_token_scan で選ぶ。docs/fish.md §5)。"""
         from .jobs import _layers
         try:
             if not _layers(layers):
@@ -816,6 +901,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                  "same_reply": same_reply, "stack": stack, "rekey": rekey, "pseudo": pseudo, "max_tokens": max_tokens,
                  "response_tokens": response_tokens, "iv": iv, "neurons": neurons, "top": top, "save": save,
                  "direction": direction, "cap": cap, "stack_fast": stack_fast, "key_fit": key_fit, "key_c": key_c,
+                 "key_conv_cells": key_conv_cells, "kscale": kscale, "remove": remove, "prior_max_tokens": prior_max_tokens,
+                 "token": token, "token_delta": token_delta,
                  "summary": True if summary else None}
             return jobs.start("fish_pipeline", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001

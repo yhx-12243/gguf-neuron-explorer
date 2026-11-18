@@ -585,7 +585,8 @@ def steer(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optio
           contrast_tokens: int = typer.Option(64, "--contrast-tokens", help="--contrast：生成长度"),
           contrast_prompts: Optional[Path] = typer.Option(None, "--contrast-prompts", help="--contrast：替换验证提示词的 YAML（字符串列表；若为对照集，也可用 reactivity 的 with 或 user_prompts）"),
           audio: Optional[list[Path]] = typer.Option(None, "--audio", help="将音频文件（wav / mp3 / flac）作为用户发言。若指定 --prompt，会在音频后追加文字。需要 mmproj"),
-          lora_when: str = _LORA_WHEN):
+          lora_when: str = _LORA_WHEN,
+          first_token: Optional[str] = typer.Option(None, "--first-token", help="让回复从指定 token 开始并继续生成（文本或 #<ID>。无干预和配方均适用。例如 '◇'。用于定位问题。输出包含指定的 token）")):
     """用配方或单次指定回答提示词（默认 greedy，逐条生成）。"""
     s = holder["session"] = c.session()
     r = s.recipe(units=unit, path=recipe, dose_unit=dose_unit, scale=scale, when=when, ablate=ablate)
@@ -594,7 +595,7 @@ def steer(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optio
         raise GneError("BAD_ARGS", "需要 --prompt 或 --audio 或 --contrast")
     if prompt is not None or audio:
         d = s.steer(r, prompt=prompt, system=system, max_tokens=max_tokens, compare=compare, sampling=sp, lora_when=lora_when,
-                    audio=audio)
+                    audio=audio, first_token=first_token)
     else:                                       # --contrast だけ: 生成はせず、対照集合での効果だけを測る
         vecs, details = s.vectors(r)
         d = {"messages": [], "recipe": r.to_dict(), "units": details, "layer_norms": s._norms(vecs), "when": r.when,
@@ -1917,6 +1918,39 @@ _KEY_FIT = ("键的构建方式：mean（默认。现有做法 = 从目标位置
             "ridge（最小二乘键。把每个位置分别作为一行，用闭式解求出在目标写入位置返回 1、在不希望写入位置返回 0 的键。"
             "不希望写入位置的权重按“场景组 × 位置分段”的每个单元格相同。仅适用于 FiSH 的位置键 = --target mlpin --positions pos:<范围>）")
 _KEY_C = "--key-fit ridge 的正则化强度（矩阵对角线平均值的多少倍。例如 1）。省略时，只用建键问题按问题为单位做 5 折交叉验证，从 0.01、0.1、1、10、100 中决定"
+_KEY_CONV = ("--key-fit ridge 时，把会话形式也加入单元格（single = 不带 system 的单轮 / multi_turn = 多轮 / system = 带 system / "
+             "system_multi_turn = 带 system 的多轮）（默认不加入。docs/fish.md §3“混合会话形式”）")
+_KEY_CRIT = ("--key-fit ridge 时，将决定性单元格（dont_touch 组中与键打开位置同类的位置）的权重乘以多少（默认 1 = 不变。例如 10）。"
+             "仅在逐把创建键时使用")
+_KEY_FPMAX = ("--key-fit ridge 时，若交叉验证中各决定性单元格的误检出（键输出 > 0.4 的比例。按单元格平均）超过此比例，"
+              "则缩小键直到不超过（例如 0.02。默认不缩小）。仅在逐把创建键且省略 --key-c 时使用")
+_TARGET_REPLY = ("--key-fit ridge 时，只把目标场景回复中与此正则表达式匹配的内容作为目标场景（例如 '^◇'。"
+                 "优先于对照集的 target_reply。未匹配的回复作为 scene_other 组归入不希望写入侧）")
+_PRIOR_MT = "用无干预模型填充对照集中前文回复（assistant 的 content: null）时的上限（默认 256）"
+
+
+def _ridge_lines(d: dict) -> list[str]:
+    """最小二乗の鍵の追加の記録(会話の形・target_reply・縮め方・決め手のセルの誤検出)を数行に。"""
+    ri = d.get("ridge") or {}
+    out = []
+    forms = ri.get("forms") or {}
+    if len(forms) > 1 or ri.get("conv_cells"):
+        out.append("  会话形式: " + "、".join(f"{k} {v} 问" for k, v in forms.items()) + ("(单元格中也加入了形式)" if ri.get("conv_cells") else ""))
+    tr = ri.get("target_reply")
+    if tr:
+        out.append(f"  target_reply {tr['pattern']!r}: 匹配的回复 {tr['matched']}、未匹配的回复 {tr['other']}(scene_other)")
+    if ri.get("crit"):
+        out.append(f"  决定性单元格权重 ×{ri['crit']:g}(决定性行 {ri.get('decisive_rows')})")
+    for L, x in sorted((ri.get("shrink") or {}).items(), key=lambda kv: int(kv[0])):
+        out.append(f"  L{L}: 决定性单元格误检出 {x['fp_before']:.3f} → {x['fp_after']:.3f}(键 ×{x['scale']:.3f}。"
+                   f"写入位置中 ≥0.8 的比例 {x['want_before']:.3f} → {x['want_after']:.3f})")
+    for L, tab in sorted((ri.get("cv_cells") or [{}])[0].items(), key=lambda kv: int(kv[0])) if ri.get("cv_cells") else []:
+        dec = [c for c in tab if c.get("decisive")]
+        want = [c for c in tab if c.get("want")]
+        if want:
+            out.append(f"  L{L}(交叉验证): 写入位置中 ≥0.8 " + "、".join(f"{c['group']} {c['bin']} {c['rate']:.3f}" for c in want)
+                       + ("。决定性单元格中 >0.4 " + "、".join(f"{c['group']} {c['rate']:.3f}" for c in dec[:6]) if dec else ""))
+    return out
 
 
 @gne_command(direction_app, "key", "direction key")
@@ -1943,7 +1977,12 @@ def direction_key(c: Common, holder: dict,
         "的输入。仅在专家 e 被选中的位置创建) ")),
                   dont_touch_start: Optional[bool] = typer.Option(None, "--dont-touch-start/--no-dont-touch-start", help="dont_touch 各群问题的、开始写回复紧前方的位置也加入 Q(默认为对照集的 dont_touch_start，没有则加入)。不希望写入侧问题的此位置不加入"),
                   key_fit: str = typer.Option("mean", "--key-fit", help=_KEY_FIT),
-                  key_c: Optional[float] = typer.Option(None, "--key-c", help=_KEY_C)):
+                  key_c: Optional[float] = typer.Option(None, "--key-c", help=_KEY_C),
+                  key_conv_cells: bool = typer.Option(False, "--key-conv-cells", help=_KEY_CONV),
+                  key_crit: Optional[float] = typer.Option(None, "--key-crit", help=_KEY_CRIT),
+                  key_fp_max: Optional[float] = typer.Option(None, "--key-fp-max", help=_KEY_FPMAX),
+                  target_reply: Optional[str] = typer.Option(None, "--target-reply", help=_TARGET_REPLY),
+                  prior_max_tokens: Optional[int] = typer.Option(None, "--prior-max-tokens", help=_PRIOR_MT)):
     """创建 keyed write 的键 κ_L（CHANGE-07）。将目标写入位置的激活平均值 μ_L 与不希望写入位置及 dont_touch 的
     激活所张成的空间 Q_L 正交，归一化为 κ_Lᵀμ_L = 1 后保存（与方向分开的文件）。键在无干预状态下创建（--iv 仅用于叠加）。
     创建后，用 gne direction key-check 在未用于创建的示例（默认 subset odd）上确认分离效果。
@@ -1956,7 +1995,8 @@ def direction_key(c: Common, holder: dict,
                         max_tokens=max_tokens, q_mode=q_mode, q_energy=q_energy, q_max_rank=q_max_rank,
                         q_max_samples=q_max_samples, subset=subset, pseudo=pseudo, replies_a=replies_a,
                         replies_b=replies_b, iv=_iv_arg(iv), target=target, seed=c.seed, dont_touch_start=dont_touch_start,
-                        progress=s.progress, key_fit=key_fit, key_c=key_c)
+                        progress=s.progress, key_fit=key_fit, key_c=key_c, key_conv_cells=key_conv_cells, key_crit=key_crit,
+                        key_fp_max=key_fp_max, target_reply=target_reply, prior_max_tokens=prior_max_tokens)
     d.pop("warnings", None)                        # 警告はエンベロープの warnings に入っている
     n = d["counts"]
     moe = any("rows_a" in r for r in d["layers"])            # 書き込み先 shared・expert:e の鍵(層ごとの行の数を出す)
@@ -2003,6 +2043,56 @@ def _start_rho_text(sr: dict | None) -> str:
     items = ([("不希望写入侧", sr["B"])] if sr.get("B") else []) + list((sr.get("dont_touch") or {}).items())
     out = [f"{g} {_f(v['median'][0], '+.2f')}" for g, v in items if v.get("median") and v["median"][0] is not None]
     return "、".join(out)
+
+
+_TOKEN = ("token（能成为单个 token 的文本、特殊 token 写法 '<|im_end|>'，或 #<ID>）。可重复指定（多个时取行平均）")
+_TOKEN_MINUS = "要减去的 token（可重复。减去其行平均 = 与要添加 token 的差方向）"
+_RBAR = "直接传入 r̄（最终层输出在归一化前的 rms 中位数）。省略时在 --contrast 输入的位置 0 测量"
+
+
+@gne_command(direction_app, "token", "direction token")
+def direction_token(c: Common, holder: dict,
+                    token: list[str] = typer.Option(..., "--token", help=_TOKEN),
+                    layers: str = typer.Option(..., "--layers", help="写入方向的层（例如 22 或 22,25。每层写入相同的 ±β·û）"),
+                    delta: float = typer.Option(..., "--delta", help="目标 logit 上升量 Δ（例如 32）。用 β = Δ × r̄ ÷ ((γ⊙u)·û) 决定长度"),
+                    name: str = typer.Option(..., "--name", help="方向名称（<root>/directions/<model_id>/<名称>.npz）"),
+                    minus: Optional[list[str]] = typer.Option(None, "--minus", help=_TOKEN_MINUS),
+                    down: bool = typer.Option(False, "--down", help="反向（−β·û。让该 token 更难出现的朝向）"),
+                    contrast: Optional[Path] = typer.Option(None, "--contrast", help="用于测量 r̄ 的输入对照集（目标侧和 dont_touch 全部输入的位置 0）。省略时使用 configs/prompts/default.yaml 的问题"),
+                    rbar: Optional[float] = typer.Option(None, "--rbar", help=_RBAR)):
+    """出力層の重み行列の、トークンの行から方向を作る(docs/fish.md §5「トークンの行の方向」)。u = 足すトークンの行の平均 − 引く
+    トークンの行の平均、û = u ÷ ‖u‖。層の残差に β·û を足すと、足すトークンのロジットが約 Δ 上がる(後ろの層が変えないときの見積もり)。
+    書いた方向は nw のユニット(L:Na+Nb:nw:a1@NAME#KEY&ONE)や L:dir:NAME:1 で使える。入力の振り分け(終了トークンで応答しない・
+    マーカーで相づち)の作り方は docs/fish.md §5。どの層・どの Δ にするかは gne direction token-scan で選ぶ。"""
+    s = holder["session"] = c.session()
+    d = s.direction_token(token, layers=parse_layers(layers), delta=delta, name=name, minus=minus, down=down,
+                          contrast=contrast, rbar=rbar)
+    lines = [f"{d['path']}(token {d['token_text']}" + (f" − {d['minus_text']}" if d["minus"] else "") + f"、层 {d['layers']}"
+             + ("、反向" if d["down"] else "") + ")",
+             f"  Δ {d['delta']:g}、r̄ {d['rbar']:.4f}({d['rbar_from']})、(γ⊙u)·û {d['gdot']:.4f} → β {d['beta']:.3f}"]
+    return d, "\n".join(lines), 0
+
+
+@gne_command(direction_app, "token-scan", "direction token-scan")
+def direction_token_scan(c: Common, holder: dict,
+                         token: list[str] = typer.Option(..., "--token", help=_TOKEN),
+                         contrast: Path = typer.Option(..., "--contrast", help="对照集（user_prompts = 想让其输出该 token 的输入，dont_touch = 不希望输出的输入）"),
+                         layers: Optional[str] = typer.Option(None, "--layers", help="扫描的层（省略时为除最终层外的全部层）"),
+                         minus: Optional[list[str]] = typer.Option(None, "--minus", help=_TOKEN_MINUS),
+                         deltas: Optional[str] = typer.Option(None, "--deltas", help="尝试的 Δ（例如 2,4,8,16,32,64。默认 2〜256 共 15 档）"),
+                         need: float = typer.Option(0.95, "--need", help="在目标侧输入中，寻找使该比例以上的输入将 token 排名第一的最小 Δ"),
+                         leaks: str = typer.Option("0.2,0.5", "--leaks", help="向 dont_touch 输入添加的倍率（所需 Δ 的多少倍）"),
+                         rbar: Optional[float] = typer.Option(None, "--rbar", help=_RBAR)):
+    """層の走査(生成しない)。層ごとに、狙う側の入力の位置 0(応答の最初のトークンを決める位置)にだけ β(Δ)·û を足し、トークンが
+    1 位になる最小の Δ を探す。その Δ の 0.2 倍・0.5 倍を dont_touch の入力の位置 0 に足したときの、トークンが 1 位になった数・
+    位置 0 の KL・1 位が変わった数も出す(キーが少し開いてしまったときの影響の目安)。入力の手前までを 1 回だけ読み、最後の
+    トークンだけを読み直すので速い。"""
+    from .tokendir import DELTAS, scan_lines
+    s = holder["session"] = c.session()
+    ds = [float(x) for x in deltas.split(",")] if deltas else list(DELTAS)
+    d = s.direction_token_scan(token, contrast, layers=parse_layers(layers) if layers else None, minus=minus, deltas=ds, need=need,
+                               leaks=[float(x) for x in leaks.split(",") if x.strip()], rbar=rbar)
+    return d, "\n".join(scan_lines(d) + [f"({d['seconds']:.0f} 秒)"]), 0
 
 
 @gne_command(direction_app, "key-check", "direction key-check")
@@ -3089,9 +3179,14 @@ def nw_key(c: Common, holder: dict,
            contrast: Path = typer.Option(..., "--contrast", help="对照集(user_prompts = 目标场景的问题、dont_touch = 不希望其产生反应的问题组)"),
            layers: str = typer.Option(..., "--layers", help="创建键的层(例 11-23 或 11,18,23)"),
            role: str = typer.Option("scene", "--role", help="scene（对目标场景问题的回复全程都反应的键）/ one（在任意位置都几乎返回 1 的键。用于带上限的形式）/ position（在回复位置分段处反应的位置键。与 --positions pos:<范围> 一起使用。等同于 gne direction key --target mlpin）"),
-           positions: Optional[str] = typer.Option(None, "--positions", help="--role position 时：键所反应的回复位置（pos:0 / pos:1-3 / pos:4-。位置 0 = 开始写回复之前）"),
+           positions: Optional[str] = typer.Option(None, "--positions", help="--role position 时：键所反应的回复位置（pos:0 / pos:1-3 / pos:4-。位置 0 = 开始写回复之前。--key-fit ridge 时 after:<正则表达式> = 匹配回复 token 之后的位置，例如 'after:[。！？\\n]' = 句子结束之后）"),
            key_fit: str = typer.Option("mean", "--key-fit", help=_KEY_FIT + "。仅用于 --role position"),
            key_c: Optional[float] = typer.Option(None, "--key-c", help=_KEY_C),
+           key_conv_cells: bool = typer.Option(False, "--key-conv-cells", help=_KEY_CONV),
+           key_crit: Optional[float] = typer.Option(None, "--key-crit", help=_KEY_CRIT),
+           key_fp_max: Optional[float] = typer.Option(None, "--key-fp-max", help=_KEY_FPMAX),
+           target_reply: Optional[str] = typer.Option(None, "--target-reply", help=_TARGET_REPLY),
+           prior_max_tokens: Optional[int] = typer.Option(None, "--prior-max-tokens", help=_PRIOR_MT),
            name: Optional[str] = typer.Option(None, "--name", help="键的名称(默认 <对照集的 name>_<role>)"),
            subset: str = typer.Option("even", "--subset", help="使用的问题: even(默认)/ odd / all"),
            max_tokens: int = typer.Option(96, "--max-tokens", help="生成回复时的长度"),
@@ -3106,23 +3201,29 @@ def nw_key(c: Common, holder: dict,
     if not Ls:
         raise GneError("BAD_ARGS", "请在 --layers 中指定层", "例 --layers 11-23")
     kf = check_key_fit(key_fit)
-    if role != "position" and (kf != "mean" or key_c is not None or positions is not None):
-        raise GneError("BAD_ARGS", "--key-fit ridge、--key-c、--positions 只能用于位置键（--role position）",
-                       "场景键（scene）和几乎返回 1 的键（one）只有一种构建方式")
+    ridge_opts = {"key_conv_cells": key_conv_cells, "key_crit": key_crit, "key_fp_max": key_fp_max, "target_reply": target_reply}
+    if role != "position" and (kf != "mean" or key_c is not None or positions is not None
+                               or any(v not in (None, False) for v in ridge_opts.values())):
+        raise GneError("BAD_ARGS", "--key-fit ridge、--key-c、--positions、--key-conv-cells、--key-crit、--key-fp-max、--target-reply "
+                       "只能用于位置键（--role position）",
+                       "场景键（scene）和定数键（one）只有一种构建方式")
     s = holder["session"] = c.session()
     if role == "position":
-        if not positions or not positions.strip().startswith("pos:"):
-            raise GneError("BAD_ARGS", "--role position 需要 --positions pos:<范围>", "例如 --positions pos:1-3")
+        if not positions or not positions.strip().startswith(("pos:", "after:")):
+            raise GneError("BAD_ARGS", "--role position 需要 --positions pos:<范围>（--key-fit ridge 时也可用 after:<正则表达式>）",
+                           "例 --positions pos:1-3")
         d = s.direction_key(contrast, name=name, layers=Ls, positions=positions, subset=subset, max_tokens=max_tokens, pseudo=pseudo,
-                            iv=_iv_arg(iv), seed=c.seed, target="mlpin", progress=s.progress, key_fit=kf, key_c=key_c)
+                            iv=_iv_arg(iv), seed=c.seed, target="mlpin", progress=s.progress, key_fit=kf, key_c=key_c,
+                            prior_max_tokens=prior_max_tokens, **ridge_opts)
         d.pop("warnings", None)
         lines = [f"{d['path']}（键 {d['name']}、位置键 {d['positions']}、MLP 输入空间、键的构建方式 {d['key_fit']}、{d['seconds']:.1f} 秒）"]
         for r in d["layers"]:
             lines.append(f"  L{r['layer']}: kn {r['kn']:.3f}、创建所用示例上的 AUC {_fc(r['build_auc'], '.3f')}")
+        lines += _ridge_lines(d)
         lines += [f"注: {n}" for n in d["notes"]]
         return {**d, "role": "position"}, "\n".join(lines), 0
     d = s.direction_key(contrast, role=role, name=name, layers=Ls, subset=subset, max_tokens=max_tokens, pseudo=pseudo,
-                        iv=_iv_arg(iv), seed=c.seed, progress=s.progress)
+                        iv=_iv_arg(iv), seed=c.seed, progress=s.progress, prior_max_tokens=prior_max_tokens)
     lines = [f"{d['path']}(键 {d['name']}、{d['role']}、MLP 输入空间、{d['seconds']:.1f} 秒)"]
     for r in d["layers"]:
         if d["role"] == "one":
@@ -3177,7 +3278,10 @@ def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
              over: float = typer.Option(1.2, "--over", help="逐题数值：某区间各位置全部单元写入量合计超过此值的问题计为“超过目标量”"),
              top: int = typer.Option(5, "--top", help="按写入量从小到大显示多少个未充分写入的问题"),
              name: Optional[str] = typer.Option(None, "--name", help="结果文件名（<root>/behave/<model_id>/<名称>_check.json，包含逐题记录）。省略时使用配方名"),
-             iv: Optional[list[str]] = typer.Option(None, "--iv", help="在预先应用此干预(配方名称或路径，或单元的写法)的状态下测量")):
+             iv: Optional[list[str]] = typer.Option(None, "--iv", help="在预先应用此干预(配方名称或路径，或单元的写法)的状态下测量"),
+             pos_bins: Optional[str] = typer.Option(None, "--pos-bins", help="按此分段输出逐位置表（例如 0,1-3,4-15,16-63,64-）。要读取长回复后半部分的位置时，将 --max-tokens 设为足以写完回复的长度（例如 2048）"),
+             match: Optional[str] = typer.Option(None, "--match", help="before:<正则表达式> 或 after:<正则表达式>（例如 'after:[。！？\\n]' = 句子结束后的位置）。按匹配位置（match）和其他位置（other）分开输出"),
+             prior_max_tokens: Optional[int] = typer.Option(None, "--prior-max-tokens", help=_PRIOR_MT)):
     """按位置类型输出键的反应和实际写入量(以 α·d 为 1)。在目标场景(对照集的问题)和不希望写入的场景
     (dont_touch 组)中，从回复位置 0(开始书写之前)起依次显示。检查是否存在写入量远大于 1 的位置、
     在不希望写入的场景中偏离 0 的位置，以及为负(反向)的位置。
@@ -3185,14 +3289,16 @@ def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
     以及未充分写入问题的排名（问题与回复开头）。平均值会掩盖部分问题完全未写入的情况。
     逐题记录会进入 --json 和结果文件。
     最后，输出不希望写入的场景按组的泄漏表：按组、按分段显示写入目标量 --leak（默认 0.2）以上的问题数和平均写入量。
-    还会显示仅位置 0（开始写回复之前）的数量。第一行显示单元的键由哪种方式（mean / ridge）构建。"""
+    还会显示仅位置 0（开始写回复之前）的数量。第一行显示单元的键由哪种方式（mean / ridge）构建。
+    対照集合に会話の形(1 ターン / 複数ターン / system あり)が混ざっていれば、形ごとの数(狙う場面で ρ ≥ b の割合、書き込みたくない
+    場面で書いてしまった質問の数)も出す。前のやり取りの応答(content: null)は、読む前に無介入のモデルで埋める。"""
     import re as _re
     from .nwrite import key_fit_line, question_lines
     s = holder["session"] = c.session()
     r = s.recipe(units=unit, path=recipe, default_direction=direction, default_key=key)
     save = name or (r.name if r.name and _re.fullmatch(r"[\w.\-]+", r.name) else "recipe")
     d = s.nw_check(r, contrast, subset=subset, max_tokens=max_tokens, replies=replies, n_pos=n_pos, iv=_iv_arg(iv), low=low, over=over,
-                   leak=leak, top=top, save=save)
+                   leak=leak, top=top, save=save, pos_bins=pos_bins, positions=match, prior_max_tokens=prior_max_tokens)
     lines = [f"对照集 {d['contrast']}(subset {d['subset']}、回复 {d['replies']}、{d['seconds']:.0f} 秒)。值为写入量的平均值(α·d 为 1。括号内为最小～最大)",
              key_fit_line(d.get("key_fit"))]
     for g, x in d["groups"].items():
@@ -3204,7 +3310,43 @@ def nw_check(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
                 cells.append(f"{b}: " + ("—" if a is None else f"{a['mean']:+.2f}({a['min']:+.2f}～{a['max']:+.2f})"))
             lines.append(f"  {u['unit']}\n    " + "  ".join(cells))
     lines += question_lines(d)
+    lines += form_lines(d)
     lines += [f"注: {n}" for n in d["notes"]] + [f"结果（逐题记录）：{d['path']}"]
+    return d, "\n".join(lines), 0
+
+
+def form_lines(d: dict) -> list[str]:
+    """nw check の会話の形ごとの数(形が 2 つ以上あるときだけ)。"""
+    out = []
+    for g, x in d["groups"].items():
+        bf = x.get("by_form") or {}
+        if len(bf) < 2:
+            continue
+        out.append(f"[{g}] 按会话形式（已写完的回复 {x.get('finished')}/{x['n']}）")
+        for f, y in bf.items():
+            cells = []
+            for sg, v in y["segments"].items():
+                cells.append(f"{sg}: ρ≥b {v['rho_ge_b']:.0%}" if "rho_ge_b" in v else f"{sg}: 写入 {v['leak']}/{v['n']}")
+            out.append(f"  {f} {y['n']} 题  " + "  ".join(cells))
+    return out
+
+
+@gne_command(nw_app, "prior", "nw prior")
+def nw_prior(c: Common, holder: dict,
+             contrast: Path = typer.Option(..., "--contrast", help="对照集（每道问题带 {\"role\": \"assistant\", \"content\": null} 前文回复）"),
+             out: Optional[Path] = typer.Option(None, "--out", help="输出目标（YAML）。省略则为 <root>/contrasts/prior/<名称>-<哈希>.yaml"),
+             max_tokens: Optional[int] = typer.Option(None, "--max-tokens", help=_PRIOR_MT)):
+    """対照集合の、前のやり取りのアシスタントの応答(content: null)を、無介入のモデルに書かせて埋めた対照集合を書く。
+    埋めるときに使うのは、その問の system(あれば)とその応答より前のメッセージだけ(群の system・レシピは使わない)。greedy、
+    思考なし。埋めた応答は <root>/prior/<model_id>/replies.json に覚えておき、同じ会話・同じ上限なら作り直さない。
+    キーの作成(gne nw key・gne direction key・gne nw pipeline)と gne nw check は、これを読む前に自動で行う。ほかの道具に渡すときや、
+    埋めた応答を読んで確かめるときに使う。会話の形(single / multi_turn / system / system_multi_turn)ごとの数も出す。"""
+    from .prior import fill_file
+    s = holder["session"] = c.session()
+    d = fill_file(s, contrast, max_tokens=max_tokens, out=out, progress=s.progress)
+    lines = [f"{d['path']}(已填充回复 {d['filled']}: 新生成 {d['generated']}、缓存 {d['cached']}、因上限 {d['max_tokens']} 截断 {d['cut']})"]
+    for g, f in d["forms"].items():
+        lines.append(f"  {g}: " + "、".join(f"{k} {v}" for k, v in f.items()))
     return d, "\n".join(lines), 0
 
 
@@ -3267,6 +3409,12 @@ def nw_pipeline(c: Common, holder: dict,
                 rekey: Optional[bool] = typer.Option(None, "--rekey/--no-rekey", help="在应用生成的单元的状态下重建键（默认重建）"),
                 key_fit: Optional[str] = typer.Option(None, "--key-fit", help="位置键的构建方式：mean（默认。现有做法）/ ridge（最小二乘键。将每个位置分别作为一行，用闭式解求出在目标写入位置返回 1、在不希望写入位置返回 0 的键。不希望写入位置的权重按“场景组（dont_touch 的组的 name 与目标场景的其他区间）× 位置分段（--segments）”的每个单元格相同）。应用配方后重建键的阶段也使用相同构建方式。键计算在 CPU 上进行，层和问题较多时需要数分钟（会计入估算）。已在 1 个模型、1 个性格上验证（docs/fish.md §3）"),
                 key_c: Optional[float] = typer.Option(None, "--key-c", help=_KEY_C),
+                key_conv_cells: Optional[bool] = typer.Option(None, "--key-conv-cells", help=_KEY_CONV),
+                kscale: Optional[str] = typer.Option(None, "--kscale", help="auto 时给单元添加 !kauto（避免量化舍入的倍率。docs/fish.md §6）。默认不添加"),
+                remove: Optional[str] = typer.Option(None, "--remove", help="rm / rmbase 将单元设为移除成分形式（!rm / !rmbase。仅限带上限的形式）。默认为相加形式"),
+                prior_max_tokens: Optional[int] = typer.Option(None, "--prior-max-tokens", help=_PRIOR_MT),
+                token: Optional[list[str]] = typer.Option(None, "--token", help="方向不由对照集差值构建，而由输出层矩阵中该 token 的行构建（例如 '<|im_end|>' = 用结束 token 不回复，'◇' = 标记。与 --token-delta 一起使用。docs/fish.md §5）"),
+                token_delta: Optional[float] = typer.Option(None, "--token-delta", help="--token 的目标 logit 上升量 Δ（用 gne direction token-scan 选择）"),
                 pseudo: Optional[int] = typer.Option(None, "--pseudo", help="比较用键的数量（默认 4）"),
                 max_tokens: Optional[int] = typer.Option(None, "--max-tokens", help="用键与写入量生成回复的长度（默认 96）"),
                 response_tokens: Optional[int] = typer.Option(None, "--response-tokens", help="用方向生成回复的长度（默认 96）"),
@@ -3291,7 +3439,9 @@ def nw_pipeline(c: Common, holder: dict,
     p = {"contrast": str(contrast), "layers": layers, "alpha": alpha, "cap": cap, "direction": direction, "segments": segments,
          "form": form, "name": name, "save": save,
          "same_reply": same_reply, "stack": stack, "stack_fast": stack_fast, "rekey": rekey, "pseudo": pseudo,
-         "max_tokens": max_tokens, "response_tokens": response_tokens, "top": top, "iv": _iv_arg(iv), "key_fit": key_fit, "key_c": key_c}
+         "max_tokens": max_tokens, "response_tokens": response_tokens, "top": top, "iv": _iv_arg(iv), "key_fit": key_fit, "key_c": key_c,
+         "key_conv_cells": key_conv_cells, "kscale": kscale, "remove": remove, "prior_max_tokens": prior_max_tokens,
+         "token": token or None, "token_delta": token_delta}
     p = {k: v for k, v in p.items() if v is not None}
     if save is not None:
         fish.recipe_file(s, save)                    # 保存先が読めなければ、見積もりの前に止める

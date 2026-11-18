@@ -168,18 +168,29 @@ def is_multi(q) -> bool:
 
 def check_question(q, where: str = "问题", *, in_progress: bool = True) -> None:
     """1 問を確かめる。文字列か、[{"role": "user", "content": …}, {"role": "assistant", …}, …, {"role": "user", …}]。
-    assistant で終われば書きかけの返事(その最後のトークンで測り、生成はその続きから)。in_progress=False の道具は断る。"""
+    assistant で終われば書きかけの返事(その最後のトークンで測り、生成はその続きから)。in_progress=False の道具は断る。
+    先頭に {"role": "system", "content": …} を置くと、その問だけのシステムプロンプト(群の system より優先)。最後でない
+    assistant の content を null にすると、前のやり取りの応答を無介入のモデルで埋める(prior.py。キーの作成・gne nw check・
+    gne nw prior が埋める)。"""
     if isinstance(q, str):
         return
     if not isinstance(q, list) or not q:
         raise GneError("BAD_CONTRAST", f"{where}: 每个问题必须是字符串或对话历史（消息列表）")
+    off = 1 if isinstance(q[0], dict) and q[0].get("role") == "system" else 0
+    if off and len(q) < 2:
+        raise GneError("BAD_CONTRAST", f"{where}: system 之后需要 user 发言")
     for i, m in enumerate(q):
-        if not isinstance(m, dict) or set(m) - {"role", "content"} or not isinstance(m.get("content"), str):
-            raise GneError("BAD_CONTRAST", f"{where}: 第 {i + 1} 项消息必须为 {{\"role\": …, \"content\": 字符串}} 形式")
-        want = "user" if i % 2 == 0 else "assistant"
+        last = i == len(q) - 1
+        ok_null = (isinstance(m, dict) and m.get("role") == "assistant" and m.get("content") is None and not last)
+        if not isinstance(m, dict) or set(m) - {"role", "content"} or not (isinstance(m.get("content"), str) or ok_null):
+            raise GneError("BAD_CONTRAST", f"{where}: 第 {i + 1} 项消息必须为 {{\"role\": …, \"content\": 字符串}} 形式"
+                                           "（仅前文 assistant 可写 content: null，由无干预模型填充）")
+        if i < off:
+            continue
+        want = "user" if (i - off) % 2 == 0 else "assistant"
         if m.get("role") != want:
             raise GneError("BAD_CONTRAST", f"{where}: 对话必须在 user 与 assistant 之间交替，并以 user 开始（第 {i + 1} 项为 "
-                                           f"{m.get('role')!r}，应为 {want!r}）")
+                                           f"{m.get('role')!r}，应为 {want!r}。system 只能有一个且在开头）")
     if q[-1]["role"] != "user":
         if not in_progress:
             raise GneError("BAD_CONTRAST", f"{where}: 对话历史必须由 user 发言结束（将测量或生成其回复）")
@@ -197,10 +208,15 @@ def check_questions(v, where: str, *, in_progress: bool = True) -> None:
 
 
 def turns(q) -> list[dict]:
-    """質問 → メッセージの列(system は含まない)。assistant で終わる履歴の最後には書きかけの印を付ける。"""
+    """質問 → メッセージの列(system は含まない。その問の system は _conv が使う)。assistant で終わる履歴の最後には書きかけの
+    印を付ける。埋めていない前のやり取りの応答(content: null)があれば断る。"""
     if isinstance(q, str):
         return [{"role": "user", "content": q}]
-    out = [{"role": m["role"], "content": m["content"]} for m in q]
+    body = q[1:] if q and q[0].get("role") == "system" else q
+    if any(m.get("content") is None for m in body):
+        raise GneError("BAD_CONTRAST", "前文回复（assistant 的 content: null）尚未填充",
+                       "创建键和 gne nw check 会自动填充。其他工具请传入用 gne nw prior 填充后的对照集")
+    out = [{"role": m["role"], "content": m["content"]} for m in body]
     if out[-1]["role"] == "assistant":
         out[-1][IN_PROGRESS] = True
     return out
@@ -210,11 +226,14 @@ def question_text(q, *, sep: str = " / ") -> str:
     """表示・採点のファイル用の 1 行。会話の履歴は「user: … / assistant: … / user: …」。"""
     if isinstance(q, str):
         return q
-    return sep.join(f"{m['role']}: {m['content']}" for m in q)
+    return sep.join(f"{m['role']}: {'…' if m['content'] is None else m['content']}" for m in q)
 
 
 def _conv(system: str | None, user) -> list[dict]:
-    """system が None なら system なしの会話(空の文字列は空の system として残す)。user は質問(文字列か会話の履歴)。"""
+    """system が None なら system なしの会話(空の文字列は空の system として残す)。user は質問(文字列か会話の履歴)。
+    質問の先頭に system があれば、そちらを使う(群の system より優先)。"""
+    if isinstance(user, list) and user and isinstance(user[0], dict) and user[0].get("role") == "system":
+        system = user[0]["content"]
     return ([] if system is None else [{"role": "system", "content": system}]) + turns(user)
 
 

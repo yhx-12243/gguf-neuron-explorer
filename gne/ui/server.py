@@ -460,16 +460,34 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
     @app.post("/api/fish/units")
     def fish_units(layers: str = Body(...), segments: str = Body(...), neurons: dict = Body(...), form: str = Body("cap"),
                    direction: str = Body(...), base: str = Body(...), alpha: float | list[float] | str = Body(0.9),
-                   cap: str | list[str] | None = Body(None)):
+                   cap: str | list[str] | None = Body(None), kscale: str | float | None = Body(None),
+                   remove: str | None = Body(None)):
         """FiSH のユニットを組む(層 × 区切りごとに 1 個、上限つきの形は 2 個組)。モデルは使わない。specs は書き方の文字列、
         units は UI のレシピの行、needed は層 1 つに要るニューロンの数。alpha は数 1 つ(全部の区切りに同じ値)か、区切りごとのリスト。
-        cap は上限つきの形のしきい値 "a-b"(1 つか、区切りごとのリスト。省くと既定の 0.4-0.8)。"""
+        cap は上限つきの形のしきい値 "a-b"(1 つか、区切りごとのリスト。省くと既定の 0.4-0.8)。kscale("auto")で !kauto、
+        remove("rm" / "rmbase")で成分を取り除く形にする(fish.unit_options。省くと付けない)。"""
         from .. import fish
         segs = fish._segments(segments)
+        try:                                       # トークンの行の方向(区切りなし)は、どの区切りも @NAME をそのまま使う
+            ds = session.direction_set(direction)
+            token = not ds.segments and ds.meta.get("method") == "token_row"
+        except GneError:
+            token = False
         specs = fish.units(layers, len(segs), {int(k): v for k, v in neurons.items()}, form, direction, base, alpha,
-                           fish.before_mode(segs), cap)
+                           fish.before_mode(segs) or token, cap, kscale=kscale, remove=remove)
         return {"specs": specs, "units": fish.unit_rows(session, specs), "needed": fish.needed(len(segs), form),
                 "names": fish.key_names(base, len(segs), form)}
+
+    @app.post("/api/fish/contrast")
+    def fish_contrast(spec: dict = Body(..., embed=True)):
+        """FiSH のタブの入力欄の表(対照集合)を <root>/contrasts/<name>.yaml に書き、そのパスを返す(fish の設定は入れない。
+        モデルは使わない)。パスしか受けないジョブ(direction_token_scan)に渡すため。content: null の応答は、そのジョブが読む前に埋める。"""
+        from ..keyed_pipeline import save_spec
+        if not isinstance(spec, dict):
+            raise GneError("BAD_ARGS", "spec 必须是对照集表格（name、system_a、user_prompts、dont_touch 等）")
+        d = {k: v for k, v in spec.items() if k != "fish"}
+        path, _ = save_spec(session, d)
+        return {"path": str(path), "name": d.get("name")}
 
     @app.post("/api/nw/export")
     def nw_export(units: list[str] = Body(...), name: str = Body(...)):
