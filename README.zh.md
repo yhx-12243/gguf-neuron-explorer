@@ -57,6 +57,7 @@
 - 模型：Qwen3-0.6B、Qwen3.5-4B（混合线性注意力）和 SmolLM2-135M-Instruct（arch `llama`），均为 Q8_0。
 - 尚未测试 Metal。
 - MoE 模型：granite-3.1-1b-a400m 和 LFM2-8B-A1B。参见[混合专家](#混合专家)。
+- SenseNova-Loop-9B（arch `sensenova_loop`，第 4–27 层运行两次），Q4_K_M 和 Q8_0。官方 llama.cpp 目前还无法加载它：需要一个专用环境，使用第三方 llama.cpp 分支并对 llama-cpp-python 做两行修正。参见 [docs/sensenova_loop.md](docs/sensenova_loop.md) 和 [third_party/sensenova-loop/](third_party/sensenova-loop/README.md) 中的可选分支补丁。
 - 对于尚未使用过的模型，请先运行 `gne verify`。
 
 ## 安装
@@ -582,6 +583,7 @@ python -m pytest -q
 - [CHiPS：知道与回答之间的少数注意力头](https://balaena01.github.io/chips-steering/)：文章，包含测量结果与数据。
 - [FiSH：改写少数闲置神经元，让模型只在特定场景改变语气](https://balaena01.github.io/fish-steering/)：文章，包含测量结果与数据。
 - [docs/qwen4exp.md](docs/qwen4exp.md)：Qwen3.8-Flash-Next（`qwen4exp`）：分割 GGUF 文件、四条残差流，以及在不使用 control vector 时哪些功能可用。
+- [docs/sensenova_loop.md](docs/sensenova_loop.md)：SenseNova-Loop-9B（`sensenova_loop`）：如何构建环境、层运行两次时的层编号、改写作用于两次运行还是单次运行，以及按运行分别运行 CHiPS。
 - [docs/head-component-steering.md](docs/head-component-steering.md)：CHiPS，只改变少数由因果选出的注意力头中沿方向的分量（`mode: proj`、`gne direction score`、`gne heads causal`、`gne heads allocate`、`gne eval --compare-methods`），以及它与全层消融的关系。
 - [docs/keyed-write.md](docs/keyed-write.md)：键控写入。只有当从对照集构建的键对写入残差流的权重矩阵输入产生反应时，才进行秩 1 写入（`mode: keyed`、`gne direction key`、`gne direction key-check`），包含句子结尾的完整示例、它与 CHiPS 的关系，以及如何寻找键有效的位置（`gne direction key-causal`）。
 - [docs/persona_workflow.md](docs/persona_workflow.md)：从神经元逐步构建人格（使用 `examples/persona_neurons/` 中的脚本，并以病娇案例作为完整示例），并从示例对话中提取注意力头与神经元。

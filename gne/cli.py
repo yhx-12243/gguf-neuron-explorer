@@ -336,6 +336,12 @@ def info(c: Common, holder: dict,
     if lc is not None:
         rows.append(("llama.cpp", f"可加载（n_layer {lc['n_layer']}, n_embd {lc['n_embd']}, n_vocab {lc['n_vocab']}）"
                      if lc["ok"] else f"无法加载：{lc['error']}（可能需要用新版 llama.cpp 重新构建，R6）"))
+        lp = lc.get("loop") if lc["ok"] else None
+        if lp:                                       # 同じ層を 2 回実行するモデル(docs/sensenova_loop.md)
+            rows.append(("运行两次的层", ("两条流中的层的 control vector：可到达" if lp["cvec_inner"]
+                                           else "两条流中的层的 control vector：无法到达（仅层 0～3、出口层、循环之后的层）")
+                         + "、第二次运行的层名称：" + ("有" if lp["per_visit_names"] else "无")
+                         + "、改写：" + ("仅单元对应的运行" if lp["edits"] == "per_visit" else "两次运行")))
     sp = d.get("speed")
     if sp:
         rows.append(("GPU / CPU 层数", f"GPU {sp['gpu_layers']} / CPU {sp['cpu_layers']}、预计生成 {sp['decode_tok_s']:.0f} tok/s（单条）"
@@ -417,6 +423,13 @@ def verify(c: Common, holder: dict,
     why = {}
     if not s.engine.cvec_supported:
         why |= dict.fromkeys(("V3", "V4", "V12"), f"{s.meta.arch} 的图不读取 control vector")
+    lp = s.engine.loop                               # 同じ層を 2 回実行するモデル: 2 本の流れの中の層の control vector が届くか
+    if lp is not None and not s.engine.loop_cvec_reaches():
+        hint = "（请向 --layer 传入循环之外的层或出口层，或使用已修正为同时加到两条流上的 llama.cpp）"
+        if lp.inner(v.L):
+            why |= dict.fromkeys(("V4", "V12"), f"层 {v.L} 是残差位于两条流中的层，此 llama.cpp 中 control vector 无法到达下一层{hint}")
+        if any(lp.inner(x) for x in (v.L, v.L + 1, v.L + 2) if x < lp.n_layer):
+            why["V3"] = f"层 {v.L}～{v.L + 2} 中有残差位于两条流中的层，此 llama.cpp 中 control vector 无法到达下一层{hint}"
     if s.meta.n_expert:
         why |= dict.fromkeys(("V2", "V11", "V13", "V14"), "这是全层 MoE。此检查假设使用 dense 的 ffn_down（MoE 通过 V24 和 gne experts 检查）")
     steps = [(vid, (lambda vid=vid, fn=fn: VResult(vid, "省略", "skip", why[vid]) if vid in why else fn())) for vid, fn in steps]
@@ -2564,8 +2577,9 @@ def heads_causal(c: Common, holder: dict,
                  mode: str = typer.Option("ablate", "--mode", help="ablate（将输出置 0 并测量下降幅度，用于初次筛选）/ marginal（从当前组提高 s 时的效率 η，用于重新分配）。两者排名不一致"),
                  layers: str = typer.Option("auto", "--layers", help="auto（按层停止，并对下降最大的 --top-layers 个层）/ all / 10-16 / 1,5,9-12"),
                  candidates: Optional[str] = typer.Option(None, "--candidates", help="all / contrib:N（直接贡献前 N）/ L:Hh,…（显式指定）"),
-                 score_layers: Optional[str] = typer.Option(None, "--score-layers", help="测量投影值的层（默认基准层及其后 2 层）"),
+                 score_layers: Optional[str] = typer.Option(None, "--score-layers", help="测量投影值的层（默认基准层及其后 2 层）。在 loop 中，同一层运行两次的模型对应第一次运行的出口、第二次运行的出口、最后一层的前一层"),
                  primary: Optional[int] = typer.Option(None, "--primary", help="输出 causal / contrib / ratio 的层（默认基准层）"),
+                 select_layer: Optional[int] = typer.Option(None, "--select-layer", help="用于选择的层（必须是 --score-layers 之一）。用此层的下降幅度为层和注意力头排序，并将此层之前的注意力头作为候选"),
                  base_recipe: Optional[Path] = typer.Option(None, "--base-recipe", help="marginal：当前组的配方"),
                  base_unit: Optional[list[str]] = typer.Option(None, "--base-unit", help="marginal：当前组（L:Hh:sS@NAME，可多个）"),
                  delta_s: float = typer.Option(3.0, "--delta-s", help="marginal：提高 s 的量"),
@@ -2580,17 +2594,31 @@ def heads_causal(c: Common, holder: dict,
                  sort: str = typer.Option("auto", "--sort", help="表格排序：auto（ablate 用 causal_max，marginal 用 eta）/ causal / contrib / ratio / eta"),
                  show: int = typer.Option(30, "--show"),
                  max_examples: Optional[int] = typer.Option(None, "--max-examples", help="停止并测量的间题数(等间隔抽样。默认全部)"),
-                 include_score_layers: bool = typer.Option(False, "--include-score-layers", help="将测量投影值的层及其之后的注意力头也作为候选(默认排除。只是直接改变测量量，行为不易变化)")):
+                 include_score_layers: bool = typer.Option(False, "--include-score-layers", help="将测量投影值的层及其之后的注意力头也作为候选(默认排除。只是直接改变测量量，行为不易变化)"),
+                 visits: Optional[str] = typer.Option(None, "--visits", help="同一层运行两次的模型：阻止注意力头的运行。first（仅第一次）/ second（仅第二次）/ both（两次）。first、second 需要第二次运行的层具有不同名称的 llama.cpp。要并列显示 3 种方式请用 gne heads visits")):
     """因果スクリーニング(CHANGE-06 C): ヘッドを止めた(ablate)/ 強めた(marginal)ときの、生成なしの射影の値の下がり方。
     各行に直接の寄与 contrib(r̂ᵀW[:, blk]·x の平均)と causal / contrib の比を並べる(1 より大きければ間接の経路、
     小さければ補い合い。射影の値を測る層より後ろのヘッドは contrib が 0 なので causal_max で見る)。
     ablate と marginal は順位が入れ替わる: 最初の候補出しは ablate、配り直しは marginal。"""
     s = holder["session"] = c.session()
-    d = s.heads_causal(name, contrast=contrast, mode=mode, layers=layers, candidates=candidates,
-                       score_layers=_ints(score_layers), primary=primary, base_recipe=base_recipe, base_units=base_unit,
+    if visits == "all":
+        raise GneError("BAD_ARGS", "要并列显示 3 种方式（仅第一次、仅第二次、两次），请使用 gne heads visits",
+                       f"gne heads visits --name {name}")
+    if visits is not None:
+        d = s.heads_causal_visit(name, visits, contrast=contrast, mode=mode, layers=layers, candidates=candidates,
+                                 score_layers=s.score_layers_of(score_layers), primary=primary, base_recipe=base_recipe,
+                                 base_units=base_unit, delta_s=delta_s, hard=hard, hard_subset=hard_subset, b_side_max=b_side_max,
+                                 top_layers=top_layers, positions=positions, subset=subset, b_examples=b_examples, name=out_name,
+                                 direction_layer=direction_layer, max_examples=max_examples,
+                                 include_score_layers=include_score_layers, select_layer=select_layer)
+    else:
+        d = None
+    d = d or s.heads_causal(name, contrast=contrast, mode=mode, layers=layers, candidates=candidates,
+                       score_layers=s.score_layers_of(score_layers), primary=primary, base_recipe=base_recipe, base_units=base_unit,
                        delta_s=delta_s, hard=hard, hard_subset=hard_subset, b_side_max=b_side_max, top_layers=top_layers,
                        positions=positions, subset=subset, b_examples=b_examples, name=out_name,
-                       direction_layer=direction_layer, max_examples=max_examples, include_score_layers=include_score_layers)
+                       direction_layer=direction_layer, max_examples=max_examples, include_score_layers=include_score_layers,
+                       select_layer=select_layer)
     P = d["primary"]
     lines = [f"{d['path']}（{d['n_rows']} 个注意力头，mode={mode}，测量层 L{','.join(map(str, d['score_layers']))}（主 L{P}），{d['seconds']:.0f} 秒）",
              "无干预投影值：" + "、".join(f"L{L} A {x['A']:.2f} / B {x['B']:.2f}" for L, x in d["base_scores"].items())]
@@ -2612,6 +2640,29 @@ def heads_causal(c: Common, holder: dict,
     if mode == "marginal" and d.get("spearman_ablate_marginal") is not None:
         lines.append(f"ablate 与 marginal 的排名相关性（Spearman，{d['n_compared']} 个注意力头）：{d['spearman_ablate_marginal']:+.2f}")
     lines.append("下一步：gne heads allocate --name " + d["direction"] + " --target <A 侧投影值目标>")
+    return d, "\n".join(lines), 0
+
+
+def _visits_out(d: dict, show: int):
+    """heads causal --visits all の表: ヘッドごとに、1 回目だけ・2 回目だけ・両方で止めたときの、選ぶ層での下がり方。"""
+    S = d["select_layer"]
+    sp = d["spearman"]
+    f = lambda x: "—" if x is None else f"{x:+.2f}"
+    lines = [f"{d['path']}（{d['n_heads']} 个注意力头，层 {','.join(map(str, d['layers']))}（带权重的层编号）、测量层 "
+             f"L{','.join(map(str, d['score_layers']))}、选择层 L{S}，{d['seconds']:.0f} 秒）",
+             "无干预投影值：" + "、".join(f"L{L} A {x['A']:.2f} / B {x['B']:.2f}" for L, x in d["base_scores"].items()),
+             f"运行之间的排名相关性（Spearman，按 L{S} 的下降幅度）：第一次与第二次 {f(sp['first_second'])}、"
+             f"第一次与两次 {f(sp['first_both'])}、第二次与两次 {f(sp['second_both'])}",
+             f"  {'注意力头':>8} " + " ".join(f"{'第1次 L' + str(L):>10}" for L in d["score_layers"]) + " "
+             + " ".join(f"{'第2次 L' + str(L):>10}" for L in d["score_layers"]) + " "
+             + " ".join(f"{'两次 L' + str(L):>9}" for L in d["score_layers"]) + f" {'两次−和':>8}"]
+    for r in d["rows"][:show]:
+        lines.append(f"  {r['label']:>8} " + " ".join(f"{r['first']['score_drop'][str(L)]:>+10.2f}" for L in d["score_layers"]) + " "
+                     + " ".join(f"{r['second']['score_drop'][str(L)]:>+10.2f}" for L in d["score_layers"]) + " "
+                     + " ".join(f"{r['both']['score_drop'][str(L)]:>+9.2f}" for L in d["score_layers"])
+                     + f" {r['both_minus_sum']:>+8.2f}")
+    lines.append("（两次−和：同时阻止两次时的下降幅度 − 分别阻止时的下降幅度之和。若为正，说明两次运行会相互增强"
+                 "（同时阻止时下降幅度大于两者之和）；若为负，说明两次运行叠加了相同作用（小于两者之和））")
     return d, "\n".join(lines), 0
 
 
@@ -2697,6 +2748,7 @@ def heads_allocate(c: Common, holder: dict,
                      f"{r['b_side_delta']:>+7.2f} {r['seconds']:>5.0f}  " + " ".join(r["units"])
                      + ("" if r["reached"] else "  （目标未达到）") + ("  ← 推荐" if r["recommended"] else ""))
         lines += _allocate_note(r, d)
+    lines += _initial_lines(d)
     if d["recommended"] is not None:
         rp = next(r["recipe"] for r in d["table"] if r.get("recommended"))
         lines.append(f"配方：{rp}。确认：gne eval --recipe {rp} --random-controls 16")
@@ -2868,6 +2920,10 @@ def heads_pipeline(c: Common, holder: dict,
                    positions: Optional[str] = typer.Option(None, "--positions", help="创建方向的位置：last（默认）/ response 等"),
                    top_layers: Optional[int] = typer.Option(None, "--top-layers"), hard: Optional[int] = typer.Option(None, "--hard"),
                    include_score_layers: bool = typer.Option(False, "--include-score-layers", help="将测量投影值的层及其之后的注意力头也作为候选(默认排除。只是直接改变测量量，行为不易变化)"),
+                   score_layers: Optional[str] = typer.Option(None, "--score-layers", help="投影值的测量层（例 27,51,54。默认基准层及后 2 层）。在 loop 中，同一层运行两次的模型对应第一次运行的出口、第二次运行的出口、最后一层的前一层"),
+                   select_layer: Optional[int] = typer.Option(None, "--select-layer", help="用于注意力头排序和分配目标的层（必须是 --score-layers 之一。默认为：排序用基准层，目标用测量的最后一层）"),
+                   candidate_layers: Optional[str] = typer.Option(None, "--candidate-layers", help="寻找候选注意力头的层（例 28-53）。同一层运行两次的模型中，仅从第一次或仅从第二次选择时使用（与 GNE_LOOP_EDITS=per_visit 一起）"),
+                   always_layers: Optional[str] = typer.Option(None, "--always-layers", help="无论层被阻止时的下降幅度排名如何，始终按注意力头测量的层（例 52,53）。none 表示不追加。sensenova_loop 的默认值是循环之外的层 52、53"),
                    fresh: bool = typer.Option(False, "--fresh", help="不复用已创建的方向和因果结果，从头重新创建"),
                    yes: bool = _YES):
     """対照集合から、方向づくり → 基準層 → 因果スクリーニング(層ごと → ヘッド 1 個ずつ止める)→ 強さの配分(効き目に比例した
@@ -2875,17 +2931,19 @@ def heads_pipeline(c: Common, holder: dict,
     s = holder["session"] = c.session()
     over = {"target": target, "n_heads": _ints(n_heads), "max_examples": max_examples, "positions": positions,
             "top_layers": top_layers, "hard": hard, "resume": False if fresh else None,
-            "include_score_layers": True if include_score_layers else None}
+            "include_score_layers": True if include_score_layers else None, "score_layers": score_layers,
+            "select_layer": select_layer, "candidate_layers": candidate_layers, "always_layers": always_layers}
     _gate(s, "head_pipeline", {"spec": str(spec), **{k: v for k, v in over.items() if v is not None}}, yes, None)
     d = s.heads_pipeline(spec, **over)
     sc, ca, al = d["score"], d["causal"], d["allocate"]
+    ck = "causal" if (d.get("settings") or {}).get("select_layer") not in (None, "") else "causal_max"
     lines = [f"{d['path']}（{d['n_prompts']} 个问题，{d['seconds']:.0f} 秒"
              + (f"，复用已生成的{'、'.join({'direction': '方向', 'causal': '因果'}[x] for x in d['reused'])}" if d.get("reused") else "")
              + "）",
              f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒）",
              f"2. 基准层 L{sc['base_layer']}（cohen_d 最大，停止测量阶段使用 {sc['n'].get('A')} 个问题）",
              f"3. 因果：测量层 L{','.join(map(str, ca['score_layers']))}、{ca['n_rows']} 个注意力头、前列 " +
-             " ".join(f"L{r['layer']}H{r['head']}({r['causal_max']:+.2f}{'，仅破坏所以排除' if r.get('excluded') else ''})" for r in ca["top"][:6])
+             " ".join(f"L{r['layer']}H{r['head']}({r[ck]:+.2f}{'，仅破坏所以排除' if r.get('excluded') else ''})" for r in ca["top"][:6])
              + f"（{ca['seconds']:.0f} 秒）"
              + "".join(f"\n   层 L{r['layer']} 停止后连中立输入也会大幅崩坏（偏移 {r['drift_orth_b']:.2f}），因此未选择"
                        for r in (ca.get("layers") or []) if r.get("excluded"))]
@@ -2898,9 +2956,62 @@ def heads_pipeline(c: Common, holder: dict,
             continue
         lines.append(f"   {r['n_heads']} 个：最大 s {r['s_max']:.2f}，剩余 {r['remain']}/{al['n_a']}，B 正交 {r['b_drift_orth']:.4f}  "
                      + " ".join(r["units"]) + ("  ← 推荐" if r["recommended"] else "") + ("" if r["reached"] else "（目标未达到）"))
+    lines += _initial_lines(al)
+    if d.get("arch_defaults"):                               # この arch だけの既定(sensenova_loop)
+        ad = d["arch_defaults"]
+        lines.append("默认：按此模型（同一层运行两次的 arch）的默认值运行（"
+                     + "、".join(x for x in (f"测量层 {ad['score_layers']}（层 27、51、54）" if "score_layers" in ad else "",
+                                              f"选择层 L{ad['select_layer']}" if "select_layer" in ad else "",
+                                              f"始终按注意力头测量的层 {','.join(map(str, ad['always_layers']))}" if ad.get("always_layers") else "") if x)
+                     + "）。要恢复到之前的默认值，请使用 --score-layers base --always-layers none")
+    if (d.get("settings") or {}).get("score_layers"):        # 測る層を指定したときだけ、層ごとの値を並べる
+        lines += _causal_layer_lines(ca) + _by_layer_lines(al)
+    if s.weights.loop is not None:                           # 回ごとの効き目(1 回目だけ・2 回目だけ・両方で止める)を勧める
+        lines.append(f"逐次运行效果：gne heads visits --name {d['name']}（需要第二次运行的层具有不同名称的 llama.cpp。"
+                     + ("此 llama.cpp 可以使用）" if s.engine.loop_runtime_names() else "此 llama.cpp 无法使用。third_party/sensenova-loop 的补丁 0002）"))
     if d["recommended"]:
         lines.append(f"配方：{d['recommended']['recipe']}。确认：gne eval --recipe {d['recommended']['recipe']} --random-controls 16")
     return d, "\n".join(lines), 0
+
+
+def _initial_lines(al: dict) -> list[str]:
+    """最初の組(効き目に比例)を同じ物差しで測った行と、効率で配り直した組から外れたヘッド(知らせるだけ。推す組は変えない)。"""
+    ir = al.get("initial_row")
+    if not ir:
+        return []
+    out = [f"   初始组（{ir['n_heads']} 个，按效果成比例。用于比较，不改变推荐组）：最大 s {ir['s_max']:.2f}、剩余 {ir['remain']}、"
+           f"B 正交 {ir['b_drift_orth']:.4f}  {ir['recipe']}"]
+    for x in al.get("dropped") or []:
+        if x["heads"]:
+            out.append(f"   在 {x['n_heads']} 个组中，按效率重新分配后剔除的初始组注意力头：" + " ".join(
+                f"L{h['layer']}H{h['head']}（阻止时的下降幅度 {h['causal']:+.2f}，初始 s {h['s_initial']:.2f}）" if h.get("causal") is not None
+                else f"L{h['layer']}H{h['head']}" for h in x["heads"]))
+    return out
+
+
+def _causal_layer_lines(ca: dict, n: int = 6) -> list[str]:
+    """因果スクリーニングの上位のヘッドの、射影の値を測る層ごとの下がり方。"""
+    top = [r for r in ca.get("top") or [] if r.get("score_drop")][:n]
+    if not top:
+        return []
+    return ["因果：各测量层的下降幅度（前 " + str(len(top)) + "）： " + "  ".join(
+        f"L{r['layer']}H{r['head']} " + "/".join(f"L{L} {v:+.2f}" for L, v in sorted(r["score_drop"].items(), key=lambda x: int(x[0])))
+        for r in top)]
+
+
+def _by_layer_lines(al: dict) -> list[str]:
+    """配分の組ごとの、射影の値を測る層ごとの A 側・B 側の平均(当てる前 → 当てた後)。測る層が 2 つ以上のときだけ。"""
+    base = al.get("base_by_layer") or {}
+    rows = [r for r in al.get("table") or [] if r.get("by_layer")]
+    if len(base) < 2 or not rows:
+        return []
+    Ls = sorted(base, key=int)
+    out = ["各测量层的投影值（A 侧平均，应用前 → 应用后。括号内为 B 侧平均）："]
+    out.append("   无干预： " + "  ".join(f"L{L} {base[L]['A']:+.2f}({base[L]['B']:+.2f})" for L in Ls))
+    for r in rows:
+        out.append(f"   {r['n_heads']} 個: " + "  ".join(
+            f"L{L} {base[L]['A']:+.2f}→{r['by_layer'][L]['A']:+.2f}({r['by_layer'][L]['B']:+.2f})" for L in Ls if L in r["by_layer"]))
+    return out
 
 
 
@@ -3075,6 +3186,148 @@ def _fieldtest_text(d: dict) -> str:
     lines.append(f"生成的文本：{d['replies_path']}")
     return "\n".join(lines)
 
+
+
+def _measure_lines(m: dict, keys: list[str] | None = None, label: dict | None = None) -> list[str]:
+    """measure の表: 行 = レシピ、列 = 測る層。A 側の平均(B 側の平均を超えて残る質問の数、A と B の差を縮めた割合)と B 側のずれ。"""
+    Ls = [str(L) for L in m["layers"]]
+    ks = [k for k in keys or list(m["rows"]) if k in m["rows"]]
+    w = max([16] + [len((label or {}).get(k, k)) for k in ks])
+    out = [f"  {'':>{w}} " + " ".join(f"{'L' + L + ' A（剩余／缩小比例）':>26}" for L in Ls) + f" {'B 侧偏移 L' + Ls[-1]:>14}"]
+    for k in ks:
+        r = m["rows"][k]
+        name = (label or {}).get(k, k)
+        if r.get("skipped"):
+            out.append(f"  {name:>{w}} {r['skipped']}")
+            continue
+        cells = []
+        for L in Ls:
+            x = r["by_layer"][L]
+            cl = "—" if x["closure"] is None else f"{x['closure']:.2f}"
+            cells.append(f"{x['A']:>+8.2f}({x['remain']:>2}/{m['n_a']}／{cl:>5})")
+        out.append(f"  {name:>{w}} " + " ".join(f"{c:>26}" for c in cells) + f" {r['by_layer'][Ls[-1]]['b_drift_orth']:>14.4f}")
+    return out
+
+
+def _merge_lines(d: dict) -> list[str]:
+    lines = [f"配方（同时作用于两次运行的形式，可在未打补丁的 llama.cpp 中运行）：{d['recipe']}（相同注意力头的处理：{d['default']}）"]
+    if d.get("how") == "both":
+        lines.append("  比较的形式：" + "、".join(f"{k} {v}" for k, v in d["recipes"].items()))
+    tw = d.get("twins") or []
+    lines.append(f"单元 {d['n_units']['per_visit']} 个（注意力头 {d['n_heads_distinct']} 个）。在两次运行中都选中的注意力头：{len(tw)} 个")
+    for t in tw:
+        e = t["compose_effective"]
+        lines.append(f"  {t['head']}: {' 与 '.join(t['units'])}（方向 cos {t['cos']:+.2f}）。连续相乘时的有效强度 "
+                     f"{e['along_r1']:+.2f}（第 1 个方向）/ {e['along_r2']:+.2f}（第 2 个方向），若只保留较强项则为 s {t['max_s']:+.2f}")
+    m = d.get("measure")
+    if m:
+        lines.append(f"重新测量（方向 {m['direction']}，A {m['n_a']} 问、B {m['n_b']} 问。per_visit = 逐次运行应用的值，"
+                     "shared = 同时作用于两次运行的值）：")
+        lines += _measure_lines(m)
+    return lines
+
+
+@gne_command(heads_app, "visits", "heads visits")
+def heads_visits(c: Common, holder: dict,
+                 name: str = typer.Option(..., "--name", help="方向的名称"),
+                 contrast: Optional[Path] = typer.Option(None, "--contrast", help="对照集合（默认使用创建方向时的对照集合）"),
+                 layers: Optional[str] = typer.Option(None, "--layers", help="要调查的层（带权重的层编号 4～27。默认是分别按仅第一次、仅第二次逐层阻止后，下降幅度较大的 --top-layers 个层）"),
+                 top_layers: int = typer.Option(4, "--top-layers"),
+                 score_layers: Optional[str] = typer.Option(None, "--score-layers", help="投影值的测量层（默认 loop = 27,51,54）"),
+                 select_layer: Optional[int] = typer.Option(None, "--select-layer", help="用于排序和相关性的层（默认是测量的最后一层）"),
+                 positions: str = typer.Option("last", "--positions"),
+                 max_examples: int = typer.Option(64, "--max-examples", help="阻止并测量的问题数量（等间隔抽稀）"),
+                 out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认使用方向名称）"),
+                 show: int = typer.Option(30, "--show")):
+    """同じ層を 2 回実行するモデルで、同じヘッドを 1 回目だけ・2 回目だけ・両方で止めた効き目を並べ、回の間の順位相関を出す
+    (2 回目の層に別の名前がある llama.cpp が要る。無ければ理由と代わりの方法を出して止める)。"""
+    s = holder["session"] = c.session()
+    return _visits_out(s.heads_visits(name, contrast=contrast, layers=parse_layers(layers) if layers else None,
+                                      top_layers=top_layers, score_layers=s.score_layers_of(score_layers),
+                                      select_layer=select_layer, positions=positions, max_examples=max_examples,
+                                      name=out_name), show)
+
+
+@gne_command(heads_app, "loop-pipeline", "heads loop-pipeline")
+def heads_loop_pipeline(c: Common, holder: dict,
+                        spec: Path = typer.Option(..., "--spec", help="对照集合的 JSON / YAML（与 heads pipeline 相同。例 configs/pipeline/disclaimer.json）"),
+                        n_first: int = typer.Option(3, "--n-first", help="第一次运行中选择的注意力头数量"),
+                        n_second: int = typer.Option(3, "--n-second", help="第二次运行中选择的注意力头数量"),
+                        target: str = typer.Option("B", "--target", help="各轮目标（B = B 侧平均值、mid、数值）。第一轮使用层 27、第二轮使用层 54 的值"),
+                        how: str = typer.Option("max", "--how", help="当两次运行都选中相同注意力头时，最终代表形式的处理：max（只保留较强项）/ compose（连续相乘）"),
+                        name: Optional[str] = typer.Option(None, "--name", help="保存名称（默认使用 spec 的 name）"),
+                        fresh: bool = typer.Option(False, "--fresh", help="不复用已创建的方向和因果结果")):
+    """同じ層を 2 回実行するモデルで、1 回目と 2 回目を別々に選ぶ CHiPS(2 回目の層に別の名前がある llama.cpp が要る)。
+    1. 段 0〜27 のヘッドから、段 27(1 回目の出口)の射影の値で選ぶ(1 回目だけに当てる)。
+    2. その組を対照集合の両側に当てた状態で、段 28〜53 のヘッドから、段 54 の射影の値で選ぶ(2 回目だけに当てる)。
+    3. 2 つを合わせ、両方の回に当てるレシピ(修正なしの llama.cpp で動く形)に直して、両方に当てた状態で測り直す。"""
+    s = holder["session"] = c.session()
+    d = s.heads_loop_pipeline(spec, n_first=n_first, n_second=n_second, target=target, how=how, name=name, resume=not fresh)
+    f1, f2 = d["first"], d["second"]
+    lines = [f"{d['path']}({d['seconds']:.0f} 秒)",
+             f"1. 第一次运行（在层 27 选择）：" + " ".join(f1["units"]) + ("" if f1["reached"] else "（未达到目标）"),
+             f"2. 第二次运行（在应用第一次运行组合的状态下，于层 54 选择）：" + " ".join(f2["units"]) + ("" if f2["reached"] else "（未达到目标）"),
+             f"逐次运行应用的配方（用于搜索阶段）：{d['per_visit_recipe']}"]
+    lines += _merge_lines(d["merge"])
+    return d, "\n".join(lines), 0
+
+
+@gne_command(heads_app, "loop-merge", "heads loop-merge")
+def heads_loop_merge(c: Common, holder: dict,
+                     recipe: str = typer.Option(..., "--recipe", help="逐次运行选择的配方（loop_edits: per_visit）的名称或路径"),
+                     how: str = typer.Option("both", "--how", help="当两次运行都选中相同注意力头时：max（只保留较强项）/ compose（连续相乘）/ both（写出两者并并列）"),
+                     default: str = typer.Option("max", "--default", help="当 --how both 时，将 <名称>.shared.yaml 作为代表的形式"),
+                     direction: Optional[str] = typer.Option(None, "--direction", help="重新测量的方向（默认使用配方的 default_direction）"),
+                     contrast: Optional[Path] = typer.Option(None, "--contrast", help="重新测量的对照集合（默认使用创建方向时的对照集合）"),
+                     out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认使用配方名称）"),
+                     no_measure: bool = typer.Option(False, "--no-measure", help="只写出，不重新测量")):
+    """回ごとに選んだヘッドを、両方の回に当てるレシピ(焼き込み・配布できる形)に直す。各ヘッドをどちらの回で選んだかを
+    loop_visits に記録し、両方に当てた状態で段 27・51・54 の射影の値を測り直して、回ごとに当てた値と並べる。
+    回ごとに当てた値は 2 回目の層に別の名前がある llama.cpp でだけ測れる(無ければ省いて、両方に当てた値だけ出す)。"""
+    s = holder["session"] = c.session()
+    d = s.heads_loop_merge(recipe, how=how, default=default, direction=direction, contrast=contrast, out_name=out_name,
+                           measure_it=not no_measure)
+    return d, "\n".join([d["path"]] + _merge_lines(d)), 0
+
+
+@gne_command(heads_app, "measure", "heads measure")
+def heads_measure(c: Common, holder: dict,
+                  name: str = typer.Option(..., "--name", help="方向的名称"),
+                  recipe: list[str] = typer.Option(..., "--recipe", help="要测量的配方（可指定多个）"),
+                  contrast: Optional[Path] = typer.Option(None, "--contrast", help="对照集合（默认使用创建方向时的对照集合）"),
+                  score_layers: Optional[str] = typer.Option(None, "--score-layers", help="测量层（例 27,51,54。loop 表示运行两次模型的 3 个位置。运行两次的模型默认使用 loop）"),
+                  positions: str = typer.Option("last", "--positions"),
+                  max_examples: Optional[int] = typer.Option(None, "--max-examples", help="要测量的问题数量（默认全部）"),
+                  tail: Optional[int] = typer.Option(None, "--tail", help="分解从此层到测量的最后一层之间的变化（例 51：残差大小、cos、用层 51 的方向测量的值、各层 attention 与 MLP 的额外写入）")):
+    """レシピを当てたときの、測る層ごとの射影の値: A 側の平均、B 側の平均を超えて残る A 側の質問の数、A と B の差を縮めた割合、
+    B 側の直交成分のずれ。レシピの当て方(両方の回 / 回ごと)はレシピの記録に従う。"""
+    s = holder["session"] = c.session()
+    d = s.heads_measure(name, list(recipe), contrast=contrast, score_layers=score_layers, positions=positions,
+                        max_examples=max_examples, tail=tail)
+    lines = [f"方向 {d['direction']}，A {d['n_a']} 问、B {d['n_b']} 问"] + _measure_lines(d)
+    if d.get("tail"):
+        lines += _tail_lines(d["tail"])
+    return d, "\n".join(lines), 0
+
+
+def _tail_lines(t: dict) -> list[str]:
+    lo, hi = t["from_layer"], t["to_layer"]
+    mid = list(range(lo + 1, hi + 1))
+    out = [f"层 {lo} → {hi} 的变化分解（问题平均。投影 = 残差 · 该层方向，cos = 投影 ÷ 残差大小）："]
+    for key, r in t["rows"].items():
+        if r.get("skipped"):
+            out.append(f"  {key}: {r['skipped']}")
+            continue
+        for side in "AB":
+            x = r[side]
+            out.append(f"  {key} {side}: 射影 " + " ".join(f"L{L} {x[f'proj-{L}']:+.1f}" for L in range(lo, hi + 1))
+                       + " | 大小 " + " ".join(f"{x[f'norm-{L}']:.0f}" for L in range(lo, hi + 1))
+                       + " | cos " + " ".join(f"{x[f'cos-{L}']:+.3f}" for L in range(lo, hi + 1)))
+            out.append(f"  {'':>{len(key)}}    层 {hi} 的残差用层 {lo} 的方向：{x['to_on_from']:+.1f}（层 {lo} 的残差用层 {hi} 的方向："
+                       f"{x['from_on_to']:+.1f}）。额外写入（层 {hi} 的方向 / 层 {lo} 的方向）："
+                       + " ".join(f"L{L} attn {x[f'attn-{L}-to']:+.1f}/{x[f'attn-{L}-from']:+.1f} MLP {x[f'mlp-{L}-to']:+.1f}/{x[f'mlp-{L}-from']:+.1f}"
+                                  for L in mid))
+    return out
 
 @gne_command(app, "fieldtest")
 def fieldtest_cmd(c: Common, holder: dict,

@@ -9,9 +9,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
+import os
 import re
 import time
 from collections.abc import Callable
@@ -54,6 +56,15 @@ class Session:
             raise GneError("MODEL_NOT_FOUND", f"{self.path} 不存在")
         self.weights = Weights(self.path)
         self.meta = self.weights.meta
+        # 同じ層を 2 回実行するモデル(sensenova_loop、docs/sensenova_loop.md): 書き換えを両方の回に当てるか(既定)、
+        # ユニットの層の回だけに当てるか(GNE_LOOP_EDITS=per_visit。2 回目の層に別の名前を持つ llama.cpp が要る)
+        mode = os.environ.get("GNE_LOOP_EDITS", "shared").strip() or "shared"
+        if mode not in ("shared", "per_visit"):
+            raise GneError("BAD_ARGS", f"GNE_LOOP_EDITS 必须是 shared 或 per_visit（{mode!r}）")
+        from .loop import set_session_mode
+        if self.weights.loop is not None:
+            self.weights.per_visit_names = mode == "per_visit"
+        set_session_mode(mode if self.weights.loop is not None else None)   # 記録の無いレシピを保存するときの当て方
         self.store = Store(root)
         self.store.save_meta(self.meta)
         self.seed = seed
@@ -75,11 +86,54 @@ class Session:
 
     def _make_engine(self, path) -> Engine:
         e = Engine(path, **self._engine_kw)
+        if e.loop is not None:
+            e.loop_edits = "per_visit" if self.weights.per_visit_names else "shared"
+            if self.weights.per_visit_names and not e.loop_runtime_names():
+                e.close()
+                raise GneError("ARCH_UNSUPPORTED", "GNE_LOOP_EDITS=per_visit 需要第二次运行的层具有不同张量名的 llama.cpp"
+                               "（此 llama.cpp 中第二次运行的层与第一次同名，因此无法只对其中一次运行应用 LoRA）",
+                               "不设置 GNE_LOOP_EDITS 时，改写会同时作用于两次运行（docs/sensenova_loop.md）")
         tpl = template_override(self.meta.model_id, self.meta.arch)
         if tpl is not None:
             e.chat_template = tpl[1]
             self.warn(f"已使用 {tpl[0]} 覆盖聊天模板")
         return e
+
+    def _pv_path(self, path: Path) -> Path:
+        """作った LoRA を使い回す置き場所。1 回目と 2 回目に別々に当てる形(per_visit)は、同じ中身でも当て方が違うので別の名前
+        (<名前>.pv.lora.gguf)にする。両方の回に当てる形とほかのモデルは今までどおり。"""
+        if self.weights.loop is None or not self.weights.per_visit_names:
+            return path
+        return path.with_name(path.name.removesuffix(".lora.gguf") + ".pv.lora.gguf")
+
+    def loop_edits_mode(self) -> str | None:
+        """いまの当て方(同じ層を 2 回実行するモデルだけ。shared / per_visit)。ほかのモデルは None。"""
+        if self.weights.loop is None:
+            return None
+        return "per_visit" if self.weights.per_visit_names else "shared"
+
+    @contextlib.contextmanager
+    def loop_mode(self, mode: str | None, what: str = "此指定"):
+        """同じ層を 2 回実行するモデルで、この中だけ当て方を変える(shared = 両方の回、per_visit = 1 回目と 2 回目を別々)。
+        per_visit は、2 回目の層に別の名前がある llama.cpp でだけ(無ければ、理由と代わりの方法を書いて断る)。
+        ほかのモデルと mode=None では何もしない。"""
+        from .loop import LOOP_EDITS, PER_VISIT_FIX, per_visit_refusal, set_session_mode
+        w = self.weights
+        if w.loop is None or mode is None:
+            yield
+            return
+        if mode not in LOOP_EDITS:
+            raise GneError("BAD_ARGS", f"应用方式必须是 shared 或 per_visit（{mode!r}）")
+        if mode == "per_visit" and not self.engine.loop_runtime_names():
+            raise GneError("ARCH_UNSUPPORTED", per_visit_refusal(what), PER_VISIT_FIX)
+        prev = w.per_visit_names
+        w.per_visit_names = mode == "per_visit"
+        set_session_mode(mode)
+        try:
+            yield
+        finally:
+            w.per_visit_names = prev
+            set_session_mode("per_visit" if prev else "shared")
 
     def close(self) -> None:
         if self._engine is not None:
@@ -117,6 +171,9 @@ class Session:
             try:
                 e = self.engine
                 llama = {"ok": True, "n_layer": e.n_layer, "n_embd": e.n_embd, "n_vocab": e.n_vocab}
+                if e.loop is not None:                 # 同じ層を 2 回実行するモデル: この llama.cpp で何ができるか
+                    llama["loop"] = {"cvec_inner": e.loop_cvec_reaches(), "per_visit_names": e.loop_runtime_names(),
+                                     "edits": e.loop_edits}
                 if e.n_layer != m.n_layer:
                     self.warn(f"llama.cpp 的 n_layer {e.n_layer} 与 block_count {m.n_layer} 不一致（例如 MTP 层）")
             except Exception as ex:  # noqa: BLE001
@@ -468,12 +525,20 @@ class Session:
         keyed(CHANGE-07)も同じで、α/α_ref で作った LoRA を倍率 α_ref で当てる(全体を k 倍しても同じファイル)。"""
         if recipe is None:
             return None
+        if self.weights.loop is not None:         # 同じ層を 2 回実行するモデル: レシピの当て方で作る(記録の無いレシピはいまの当て方)
+            import dataclasses
+            mode = recipe.loop_edits or self.loop_edits_mode()
+            with self.loop_mode(mode, f"配方 {recipe.name or ''}".rstrip()):
+                return self._lora_for(dataclasses.replace(recipe, loop_edits=mode))
+        return self._lora_for(recipe)
+
+    def _lora_for(self, recipe: Recipe) -> list[tuple[str, float]] | None:
         out = []
         lora_units = [u for u in recipe.gain_units if u.kind != "expert"]   # 専門家全体の gain はパッチ(patches_for)
         if lora_units:
             from .gain import export_gain_lora, lora_cache_path
             gr = Recipe(lora_units, self.meta.model_id, name=recipe.name)
-            path = lora_cache_path(self.store.gain_dir(self.meta.model_id), gr)
+            path = self._pv_path(lora_cache_path(self.store.gain_dir(self.meta.model_id), gr))
             if not path.exists():
                 tmp = path.with_suffix(".part")
                 export_gain_lora(self.weights, gr, tmp)
@@ -555,7 +620,7 @@ class Session:
         from .headproj import ProjBuilder, export_proj_lora, proj_cache_key, proj_heads
         heads = [p for p in proj_heads(recipe) if p.s]
         b = ProjBuilder(self.weights, self.direction_set, direction_layer=recipe.direction_layer)
-        path = self.store.heads_dir(self.meta.model_id) / f"proj-{proj_cache_key(heads, b)}.lora.gguf"
+        path = self._pv_path(self.store.heads_dir(self.meta.model_id) / f"proj-{proj_cache_key(heads, b)}.lora.gguf")
         if not path.exists():
             tmp = path.with_suffix(".part")
             export_proj_lora(self.weights, recipe.like([u for u in recipe.proj_units if u.k]), tmp, self.direction_set,
@@ -577,7 +642,7 @@ class Session:
                           warn=self._warn_once)
         h, ref = keyed_cache_key(self.weights, kr, self._key_of, self.direction_set, direction_layer=kr.direction_layer,
                                  rows=rows)
-        path = keyed_lora_path(self, h)
+        path = self._pv_path(keyed_lora_path(self, h))
         if not path.exists():
             tmp = path.with_suffix(".part")
             export_keyed_lora(self.weights, kr, tmp, self._key_of, self.direction_set, alpha_ref=ref,
@@ -597,7 +662,7 @@ class Session:
         tens = nw_tensors(self.weights, rows)
         d = self.store.key_dir(self.meta.model_id) / "lora"
         d.mkdir(parents=True, exist_ok=True)
-        path = d / f"nw-{cache_hash(tens)}.lora.gguf"
+        path = self._pv_path(d / f"nw-{cache_hash(tens)}.lora.gguf")
         if not path.exists():
             tmp = path.with_suffix(".part")
             write_lora_tensors(self.weights, tens, tmp, name=f"{self.meta.name} nw",
@@ -677,7 +742,7 @@ class Session:
         r, meta = self.ablation_vector(spec.direction, from_layer=spec.from_layer)
         Ls = layer_list(spec.layers)
         tag = "" if Ls is None else "-L" + hashlib.sha256(json.dumps(Ls).encode()).hexdigest()[:8]
-        path = self.store.ablate_dir(self.meta.model_id) / f"{spec.direction}-{vector_key(r)}{tag}.lora.gguf"
+        path = self._pv_path(self.store.ablate_dir(self.meta.model_id) / f"{spec.direction}-{vector_key(r)}{tag}.lora.gguf")
         if not path.exists():
             tmp = path.with_suffix(".part")
             export_ablation_lora(self.weights, r, tmp, layers=Ls, meta=meta)
@@ -933,6 +998,12 @@ class Session:
             self.warn(f"{', '.join(rest)}：gain 与 route 不会进入 control vector"
                       "（神经元、注意力头、专家神经元的 gain 走 LoRA，专家整体的 gain 与 route 走缩放补丁）")
         vecs, details = self.vectors(recipe)
+        lp = self.weights.loop
+        if fmt == "cvec" and lp is not None and any(lp.inner(L) for L in vecs):
+            inner = sorted(L for L in vecs if lp.inner(L))
+            self.warn(f"层 {', '.join(map(str, inner[:8]))} 是残差位于两条流中的层。原版 llama.cpp（llama-server、llama-cli 等）不会把"
+                      "加到那里的 control vector 传给下一层，因此请使用已修正为同时加到两条流上的 llama.cpp"
+                      "(docs/sensenova_loop.md)")
         if fmt == "cvec" and 0 in vecs:
             raise GneError("BAD_RECIPE", "块 0 无法写入 control vector（llama.cpp 的限制）",
                            "请使用 --format npz/json/safetensors 或 gne bake")
@@ -1410,7 +1481,7 @@ class Session:
     def recipe_save(self, name: str, units: list[str] | Recipe, *, dose_unit: str = "rel",
                     ablate: str | dict | None = None, when: str | None = None, sampling: dict | None = None,
                     default_direction: str | None = None, direction_layer: str | None = None,
-                    default_key: str | None = None) -> dict:
+                    default_key: str | None = None, loop_edits: str | None = None) -> dict:
         """sampling 是尝试该配方时使用的采样设置（不含 seed）。default_direction・direction_layer・default_key は
         @方向・#鍵を省いた proj・keyed のユニットの既定(CHANGE-06・07)。"""
         from .steer import sampling_values
@@ -1421,6 +1492,10 @@ class Session:
                                                                direction_layer=direction_layer, default_key=default_key)
         if sampling:
             r.sampling = sampling_values(sampling, seed=False)
+        if loop_edits is not None:                 # 同じ層を 2 回実行するモデルの当て方(shared / per_visit)
+            if loop_edits not in ("shared", "per_visit"):
+                raise GneError("BAD_ARGS", f"loop_edits 必须是 shared 或 per_visit（{loop_edits!r}）")
+            r.loop_edits = loop_edits
         r.name = name
         path = self.store.recipes_dir() / f"{name}.yaml"
         r.save(path)
@@ -1978,7 +2053,9 @@ class Session:
                      hard: int = 16, hard_subset: str | list[int] | None = None, b_side_max: float | None = None,
                      top_layers: int = 4, positions: str = "last", subset: str = "all", b_examples: int = 16,
                      name: str | None = None, direction_layer: str = "own", max_examples: int | None = None,
-                     drift_max: float | None = 0.5, include_score_layers: bool = False) -> dict:
+                     drift_max: float | None = 0.5, include_score_layers: bool = False,
+                     select_layer: int | None = None, candidate_layers: list[int] | None = None,
+                     always_layers: list[int] | None = None) -> dict:
         """CHANGE-06 C: 因果スクリーニング。ablate は層単位(layers="auto" のとき)→ 下がり方の大きい top_layers 層のヘッドを
         1 個ずつ止める。marginal は base_recipe / base_units の組から s を delta_s 上げたときの効きにくい例での効率 η。
         結果は <root>/heads/<model_id>/<name>.causal.jsonl(と .causal.json)。"""
@@ -1991,6 +2068,10 @@ class Session:
         if not re.fullmatch(r"[\w.\-]+", name):
             raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含字母、数字、_、-、.")
         self.engine.free_steer()                  # 生成しないので、生成用のコンテキストを空けて VRAM を使えるようにする
+        if select_layer is not None:              # 選ぶのに使う層: この層での下がり方で順位をつけ、この層より前のヘッドを候補にする
+            if primary is not None and int(primary) != int(select_layer):
+                raise GneError("BAD_ARGS", "--primary 与 --select-layer 必须指定同一层")
+            primary = int(select_layer)
         st = prepare(self, ds, cs, score_layers=score_layers, primary=primary, positions=positions, subset=subset,
                      b_examples=b_examples, direction_layer=direction_layer, max_examples=max_examples)
         layer_rows, extra = None, {}
@@ -1999,20 +2080,34 @@ class Session:
             layers = parse_layers(layers)
         if mode == "ablate":
             if layers == "auto" and candidates in (None, "all"):
-                layer_rows = screen_layers(self, ds, cs, setup=st, progress=self.progress)
+                # candidate_layers: 候補のヘッドを探す層をここに絞る(同じ層を 2 回実行するモデルで、1 回目だけ・2 回目だけを探すとき)
+                cl = None if candidate_layers is None else sorted({int(x) for x in candidate_layers})
+                if cl is not None:
+                    from .causal import head_layers as _hl
+                    cl = [L for L in _hl(self, max(st.score_layers)) if L in cl]
+                    if not cl:
+                        raise GneError("BAD_ARGS", "candidate_layers 中没有带注意力头的层")
+                layer_rows = screen_layers(self, ds, cs, setup=st, layers=cl, progress=self.progress)
                 # 止めると中立(B 側)の残差が自分の大きさの drift_max 倍以上動く層は、方向に関係なくモデルを壊しているので選ばない
                 for r in layer_rows:
                     if drift_max is not None and (r.get("drift_orth_b") or 0) > drift_max:
                         r["excluded"] = "breaks"
                 # 射影の値を測る層とそれより後の層のヘッドは、測る量を直接動かすので効率が高く見えるが、振る舞いはほとんど変わらなかった
                 # (docs/head-component-steering.md)。既定では 1 個ずつ測る層から外す
-                first = min(st.score_layers)
-                ok = [r for r in layer_rows if r["causal_max"] > 0 and not r.get("excluded")]
+                # 選ぶのに使う層(primary)を指定したときは、その層での下がり方で順位をつけ、その層より前のヘッドを候補にする
+                # (同じ層を 2 回実行するモデルで、1 回目の出口で選ぶときなど)。指定しないときは今までどおり
+                first = st.primary if select_layer is not None else min(st.score_layers)
+                rank = "causal" if select_layer is not None else "causal_max"
+                ok = [r for r in layer_rows if r[rank] > 0 and not r.get("excluded")]
                 early = [r for r in ok if r["layer"] < first]
                 if not include_score_layers and not early and ok:
                     self.warn(f"在测量投影值的层 L{first} 之前，没有停止后能让投影值下降的层，因此也测量测量层的注意力头")
-                pos = sorted(ok if include_score_layers or not early else early, key=lambda r: -r["causal_max"])
+                pos = sorted(ok if include_score_layers or not early else early, key=lambda r: -r[rank])
                 Ls = sorted(r["layer"] for r in pos[:max(1, top_layers)])
+                if always_layers:                 # 層の順位に関係なく、いつもヘッド単位で測る層(候補の境より前で、壊すだけでない層)
+                    okL = {r["layer"] for r in layer_rows if not r.get("excluded")}
+                    Ls = sorted(set(Ls) | {int(L) for L in always_layers
+                                           if int(L) in okL and (include_score_layers or int(L) < first)})
             elif layers in ("auto", "all", None):
                 Ls = head_layers(self, max(st.score_layers))
             else:
@@ -2068,13 +2163,19 @@ class Session:
                    "n_a": st.scorer.n("A"), "n_b": len(st.b_idx), "direction_layer": direction_layer,
                    "max_examples": max_examples, "drift_max": drift_max,
                    **({"top_layers": top_layers} if mode == "ablate" and layer_rows is not None else {}),
+                   **({"score_layers_given": True} if score_layers or select_layer is not None else {}),
+                   **({"select_layer": int(select_layer)} if select_layer is not None else {}),
+                   **({"candidate_layers": sorted({int(x) for x in candidate_layers})} if candidate_layers is not None else {}),
+                   **({"always_layers": sorted({int(x) for x in always_layers})} if always_layers else {}),
+                   **({"loop_edits": self.loop_edits_mode()} if self.weights.loop is not None else {}),
                    "base_scores": {str(L): {"A": float(st.base["A"][L].mean()), "B": float(st.base["B"][L].mean())}
                                    for L in st.score_layers},
                    "updated": time.strftime("%Y-%m-%dT%H:%M:%S"), **extra}
         if layer_rows is not None:
             summary["layer_rows"] = layer_rows
         pj, ps = save_causal(self, name, rows, summary)
-        key = (lambda r: -r["eta"]) if mode == "marginal" else (lambda r: -(r.get("causal_max") or 0))
+        key = (lambda r: -r["eta"]) if mode == "marginal" else \
+            (lambda r: -(r.get("causal" if select_layer is not None else "causal_max") or 0))
         return {"name": name, "path": str(pj), "summary_path": str(ps), **summary,
                 "layers": layer_rows, "rows": sorted(rows, key=key), "n_rows": len(rows),
                 "seconds": time.perf_counter() - t0}
@@ -2086,7 +2187,7 @@ class Session:
                        pool: int = 30, s_max: float | None = None, remain_threshold: float = 0.0, positions: str | None = None,
                        subset: str | None = None, direction_layer: str = "own", name: str | None = None,
                        max_examples: int | None = None, method: str = "proportional", include_score_layers: bool = False,
-                       candidate_layers: list[int] | None = None) -> dict:
+                       candidate_layers: list[int] | None = None, report_initial: bool = True) -> dict:
         """CHANGE-06 D: 効率ベースの強さ配分。candidates は heads causal の結果(名前か .causal.jsonl のパス、既定は方向の名前)。
         method は proportional(s ∝ η で全体を二分探索、s_max の既定 30)か greedy(1 本ずつ上げる、s_max の既定はなし)。"""
         from .causal import allocate, causal_paths, load_causal
@@ -2107,7 +2208,8 @@ class Session:
             keep = {int(x) for x in candidate_layers}
             rows = [r for r in rows if r.get("head") is None or int(r["layer"]) in keep]
         if not include_score_layers:              # 射影の値を測る層とそれより後のヘッドは候補にしない(heads_causal と同じ理由)
-            first = min([int(x) for x in summ.get("score_layers") or []] + [int(score_layer)])
+            first = int(score_layer) if summ.get("select_layer") is not None else \
+                min([int(x) for x in summ.get("score_layers") or []] + [int(score_layer)])
             kept = [r for r in rows if r.get("head") is None or int(r["layer"]) < first]
             if any(r.get("head") is not None for r in kept):
                 rows = kept
@@ -2121,11 +2223,64 @@ class Session:
                         positions=positions or summ.get("positions") or "last", subset=subset or summ.get("subset") or "all",
                         direction_layer=direction_layer, score_layers=summ.get("score_layers"),
                         max_examples=max_examples if max_examples is not None else summ.get("max_examples"),
-                        progress=self.progress)
+                        progress=self.progress, report_initial=report_initial)
 
     PIPELINE_DEFAULTS = {"positions": "last", "score_positions": "last", "target": None, "n_heads": [6, 5, 4], "hard": 16,
                          "top_layers": 4, "max_examples": 64, "s_max": 30.0, "direction_layer": "own", "resume": True,
-                         "include_score_layers": False, "same_reply": False}
+                         "include_score_layers": False, "same_reply": False, "score_layers": None, "select_layer": None,
+                         "candidate_layers": None, "always_layers": None}
+
+    def _loop_pipeline_defaults(self, pipe: dict) -> dict | None:
+        """同じ層を 2 回実行するモデル(sensenova_loop)の一括の既定。測る層を指定しなければ loop(段 27・51・54)・選ぶ層 54 にし、
+        ループの外の段 52・53 はいつもヘッド単位で測る(層を止めた下がり方の順位に関係なく)。今までの既定は score_layers: base、
+        段 52・53 を足さないのは always_layers: none。ほかのモデルでは何もしない(None)。"""
+        lp = self.weights.loop
+        if lp is None:
+            return None
+        used = {}
+        if pipe.get("score_layers") in (None, "", []):
+            pipe["score_layers"] = "loop"
+            used["score_layers"] = "loop"
+            if pipe.get("select_layer") in (None, ""):
+                pipe["select_layer"] = lp.n_layer - 2
+                used["select_layer"] = lp.n_layer - 2
+        if pipe.get("always_layers") is None:
+            tail = [L for L in range(lp.hi2, lp.n_layer - 2)
+                    if self.weights.arch.layers[L].head_dim and self.weights.arch.layers[L].head_writer]
+            pipe["always_layers"] = tail
+            used["always_layers"] = tail
+        return used or None
+
+    @staticmethod
+    def _layers_of(spec) -> list[int] | None:
+        """層の並びの指定("28-53"・"4,5,6"・[28, 29]・None)→ 並べた層の番号か None。"""
+        if spec in (None, "", []):
+            return None
+        if isinstance(spec, str):
+            from .cli import parse_layers
+            return sorted(set(parse_layers(spec)))
+        return sorted({int(x) for x in spec})
+
+    def score_layers_of(self, spec) -> list[int] | None:
+        """射影の値を測る層の指定: None(既定 = 基準層と後段の 2 層)、層の番号の並び("27,51,54" か [27, 51, 54])、
+        loop(同じ層を 2 回実行するモデル: 1 回目の出口・2 回目の出口・最後の層の 1 つ前。最後の層は捕捉の行が間引かれるので測れない)。"""
+        if spec in (None, "", []) or (isinstance(spec, str) and spec.strip().lower() in ("base", "default")):
+            return None                           # base: 基準層と後段の 2 層(同じ層を 2 回実行するモデルでも、今までの既定)
+        if isinstance(spec, str) and spec.strip().lower() == "loop":
+            lp = self.weights.loop
+            if lp is None:
+                raise GneError("BAD_ARGS", "score_layers 的 loop 只能用于同一层运行两次的模型")
+            return [lp.lo2 - 1, lp.hi2 - 1, lp.n_layer - 2]
+        if isinstance(spec, str):
+            from .cli import parse_layers
+            Ls = parse_layers(spec)
+        else:
+            Ls = [int(x) for x in spec]
+        n = self.meta.n_layer
+        bad = [L for L in Ls if not 0 <= L <= n - 2]
+        if bad or not Ls:
+            raise GneError("BAD_ARGS", f"投影值的测量层必须为 0～{n - 2}（{bad or spec}）")
+        return sorted(set(Ls))
 
     def heads_pipeline(self, spec: dict | str | Path, **over) -> dict:
         """対照集合(JSON か YAML、または dict)から、方向づくり → 基準層 → 因果スクリーニング → 強さの配分 を 1 回で回す。
@@ -2175,9 +2330,15 @@ class Session:
             raise
         mx = int(pipe["max_examples"]) if pipe["max_examples"] else None
         sp = pipe["score_positions"]
+        arch_default = self._loop_pipeline_defaults(pipe)          # 同じ層を 2 回実行するモデルだけの既定(引数で渡せば今までどおり)
+        sls = self.score_layers_of(pipe["score_layers"])          # 測る層(None = 既定)
+        cand = self._layers_of(pipe["candidate_layers"])
+        sel = None if pipe["select_layer"] in (None, "") else int(pipe["select_layer"])
+        if sel is not None and sls is not None and sel not in sls:
+            raise GneError("BAD_ARGS", f"用于选择的层 L{sel} 不在投影值的测量层 {sls} 中")
         out: dict = {"name": name, "contrast": str(path), "n_prompts": len(cs.prompts("A")),
                      **({"n_prompts_b": len(cs.prompts("B"))} if cs.separate_prompts else {}), "sides": cs.describe(),
-                     "settings": dict(pipe)}
+                     "settings": dict(pipe), **({"arch_defaults": arch_default} if arch_default else {})}
         reused: list[str] = []                     # resume: 同じ対照集合・同じ設定で作り済みの段は使い回す(止めて流し直したとき)
         self.engine.free_steer()                   # 生成しないので、生成用のコンテキストを空けて VRAM を使えるようにする
         ts = time.perf_counter()                                   # 1. 方向(全部の質問)
@@ -2207,18 +2368,21 @@ class Session:
         else:
             c = self.heads_causal(name, contrast=path, mode="ablate", layers="auto", top_layers=int(pipe["top_layers"]),
                                   positions=sp, max_examples=mx, direction_layer=pipe["direction_layer"],
-                                  include_score_layers=bool(pipe["include_score_layers"]))
+                                  include_score_layers=bool(pipe["include_score_layers"]),
+                                  score_layers=sls, select_layer=sel, candidate_layers=cand,
+                                  always_layers=self._layers_of(pipe["always_layers"]) if pipe["always_layers"] != "none" else None)
         out["causal"] = {"reused": "causal" in reused, "path": c["path"], "score_layers": c["score_layers"], "primary": c["primary"],
                          "base_scores": c["base_scores"], "n_rows": c["n_rows"], "n_a": c["n_a"], "n_b": c["n_b"],
                          "layers": c.get("layers"), "measured_layers": sorted({r["layer"] for r in c["rows"]}),
                          "top": c["rows"][:20], "seconds": time.perf_counter() - ts}
-        S = int(c["score_layers"][-1])                             # 4. 配分(最初の比率 → 効率で配り直す → ヘッド数の比較)
+        # 4. 配分(最初の比率 → 効率で配り直す → ヘッド数の比較)。目標と配分に使う層は、select_layer(無ければ測る最後の層)
+        S = int(sel) if sel is not None else int(c["score_layers"][-1])
         bs = c["base_scores"][str(S)]
         tgt, tgt_from = self._pipeline_target(pipe["target"], bs)
         a = self.heads_allocate(name, contrast=path, target=float(tgt), score_layer=S, n_heads=tuple(int(x) for x in pipe["n_heads"]),
                                 hard=int(pipe["hard"]), s_max=float(pipe["s_max"]), positions=sp,
                                 direction_layer=pipe["direction_layer"], max_examples=mx, remain_threshold=float(tgt),
-                                include_score_layers=bool(pipe["include_score_layers"]))
+                                include_score_layers=bool(pipe["include_score_layers"]), candidate_layers=cand)
         out["allocate"] = a
         out["reused"] = reused
         out["target"], out["target_from"] = float(tgt), tgt_from
@@ -2368,6 +2532,55 @@ class Session:
         out["path"] = str(hd / f"{out_name}.refine.json")
         return out
 
+    # --- 同じ層を 2 回実行するモデル: 1 回目と 2 回目を別々に扱う CHiPS(gne/loopsearch.py) ----------------------------
+
+    def heads_visits(self, direction: str, **kw) -> dict:
+        """ヘッドを 1 回目だけ・2 回目だけ・両方で止めた効き目と、回の間の順位相関(2 回目の層に別の名前がある llama.cpp が要る)。"""
+        from .loopsearch import visits_screen
+        return visits_screen(self, direction, **kw)
+
+    def heads_causal_visit(self, direction: str, visit: str, **kw) -> dict:
+        """因果スクリーニングを、ヘッドを 1 回目だけ(first)・2 回目だけ(second)・両方(both)で止めて行う。first / second は
+        2 回目の層に別の名前がある llama.cpp が要る。候補の層は、2 回実行する層の、その回の段。"""
+        lp = self.weights.loop
+        if lp is None:
+            raise GneError("ARCH_UNSUPPORTED", "--visits 只能用于同一层运行两次的模型")
+        if visit not in ("first", "second", "both"):
+            raise GneError("BAD_ARGS", "--visits 必须是 first / second / both / all")
+        rng = {"first": range(lp.lo1, lp.hi1 + 1), "second": range(lp.lo2, lp.hi2 + 1), "both": range(lp.lo1, lp.hi1 + 1)}[visit]
+        mode = "shared" if visit == "both" else "per_visit"
+        if kw.get("candidate_layers") is None:
+            kw["candidate_layers"] = list(rng)
+        with self.loop_mode(mode, "只阻止其中一次运行注意力头的因果筛选"):
+            return self.heads_causal(direction, **kw)
+
+    def heads_loop_pipeline(self, spec, **kw) -> dict:
+        """1 回目で効くヘッドを選ぶ → それを当てた状態で 2 回目で効くヘッドを選ぶ → 両方の回に当てるレシピに直して測り直す。"""
+        from .loopsearch import loop_pipeline
+        return loop_pipeline(self, spec, **kw)
+
+    def heads_loop_merge(self, recipe, **kw) -> dict:
+        """回ごとに選んだレシピを、両方の回に当てるレシピ(修正なしの llama.cpp で動く形)に直し、測り直す。"""
+        from .loopsearch import loop_merge
+        return loop_merge(self, recipe, **kw)
+
+    def heads_measure(self, direction: str, recipes: list[str], *, contrast=None, score_layers=None,
+                      positions: str = "last", max_examples: int | None = None, tail: int | None = None) -> dict:
+        """レシピを当てたときの、測る層ごとの射影の値(A・B の平均、残る質問の数、縮めた割合、B 側のずれ)。"""
+        from .loopsearch import measure
+        recs: dict = {"none": None}
+        for x in recipes:
+            p = Path(str(x))
+            r = Recipe.load(p if p.exists() else self.recipe_path(str(x)))
+            recs[r.name or p.stem] = r
+        out = measure(self, direction, recs, contrast=contrast, layers=self.score_layers_of(score_layers),
+                      positions=positions, max_examples=max_examples)
+        if tail is not None:                       # 最後の段までの変化の切り分け(残差の大きさ・方向の違い・層ごとの書き足し)
+            from .loopsearch import tail_decompose
+            out["tail"] = tail_decompose(self, direction, recs, from_layer=int(tail), to_layer=max(out["layers"]),
+                                         contrast=contrast, positions=positions, max_examples=max_examples)
+        return out
+
     @staticmethod
     def _pipeline_target(spec, bs: dict) -> tuple[float, str]:
         """一括の目標: 数(射影の値を測る最後の層での射影の値)、"B"(B 側の平均、振る舞いを B 側の水準まで消す)、"mid" か省略
@@ -2401,6 +2614,18 @@ class Session:
         same = (m.get("contrast_sha") == cs.sha and m.get("positions") == positions and m.get("max_examples") == mx
                 and m.get("direction_layer") == pipe["direction_layer"] and m.get("drift_max") == 0.5
                 and int(m.get("top_layers", pipe["top_layers"])) == int(pipe["top_layers"]) and m.get("layer_rows"))
+        want = self.score_layers_of(pipe.get("score_layers"))     # 測る層・選ぶ層を指定したときは、同じ層で測った結果だけ
+        if same and want is None and (m.get("score_layers_given") or pipe.get("select_layer") not in (None, "")):
+            same = False                                          # 既定の層で測るのに、前の結果は指定した層で測ったもの
+        cl = self._layers_of(pipe.get("candidate_layers"))      # 候補の層・いつも測る層・当て方も同じものだけ
+        al = pipe.get("always_layers")
+        al = None if al in (None, "none") else (self._layers_of(al) or None)
+        if same and (m.get("candidate_layers") != cl or m.get("loop_edits") != self.loop_edits_mode()
+                     or m.get("always_layers") != al):
+            same = False
+        if same and want is not None:
+            same = [int(x) for x in m.get("score_layers") or []] == want and (
+                pipe.get("select_layer") in (None, "") or int(m.get("primary", -1)) == int(pipe["select_layer"]))
         if not same:
             return None
         rows = load_causal(self, name, "ablate")
@@ -2408,7 +2633,7 @@ class Session:
             return None
         return {"path": str(pj), "score_layers": m["score_layers"], "primary": m["primary"], "base_scores": m["base_scores"],
                 "n_rows": len(rows), "n_a": m["n_a"], "n_b": m["n_b"], "layers": m["layer_rows"],
-                "rows": sorted(rows, key=lambda r: -(r.get("causal_max") or 0))}
+                "rows": sorted(rows, key=lambda r: -(r.get("causal" if m.get("select_layer") is not None else "causal_max") or 0))}
 
     CANDIDATE_RUBRIC = """# 评分标准（隐藏名称的评分。请按此标准为全部项目评分）
 

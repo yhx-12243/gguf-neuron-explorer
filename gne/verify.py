@@ -221,7 +221,9 @@ class Verifier:
         其他神经元不变。分别检查 (a) 应用 LoRA 适配器，(b) 改写 W_up 的 GGUF。"""
         from .gain import bake_gain_gguf, export_gain_lora
         from .steer import Recipe, Unit
-        L = self.L
+        # 同じ層を 2 回実行するモデルでは、重みを持つ 1 回目の層で確かめる(2 回目の層では、同じ書き換えが 1 回目にも入って
+        # 上流が変わるので、ほかのニューロンも変わる。docs/sensenova_loop.md)
+        L = self.w.stored(self.L)
         n = int(self.rng.integers(self.w.meta.n_ff_at(L)))
         ids = self.prompt_ids[0]
         names = self.e.list_names(ids, L)

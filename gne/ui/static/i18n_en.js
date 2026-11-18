@@ -1157,6 +1157,10 @@ export const EN = {
   "専門家の格子に戻す": "Back to all experts",
   "MoE の専門家のニューロン。×k は、この専門家が選ばれたときだけ効く gain です": "An MoE expert neuron. ×k is a gain that applies only when this expert is selected",
   "残差は {n} 本の流れで、読むときはその平均を使います": "The residual has {n} streams. Readings use their mean",
+  "層 {s} の {v} 回目": "run {v} of layer {s}",
+  "{v} 回目": "run {v}",
+  "層 {a}〜{b} を 2 回続けて実行します。層 {c}〜{d} はその 2 回目で、重みは同じです(書き換えは両方の回に効きます)。各回の中の残差は 2 本の流れで、読むときはその平均を使います":
+    "Layers {a}–{b} run twice in a row. Layers {c}–{d} are the second run and use the same weights (edits apply to both runs). Inside each run the residual has two streams; readings use their mean",
   "このモデルのグラフは control vector を読みません。gain を使ってください": "This model's graph ignores control vectors. Use gain instead",
   "足す押し方は使えません": "add is not available",
   // CHANGE-07 G: 鍵つきの書き込み(direction ビューの「鍵」、recipe タブの keyed)
@@ -2077,6 +2081,7 @@ export const EN = {
   "proj・keyed のユニットに当てる方向の層。その層 = そのユニットがある層の方向 r_L(own)、基準層 = 方向セットの基準層の r(base。gne direction score で記録した層)": "Which layer's direction proj and keyed units use. Own layer = the direction r_L of the unit's layer (own); base layer = r of the direction set's base layer (base; recorded by gne direction score)",
   "proj のユニットに当てる方向の層。その層 = そのヘッドがある層の方向 r_L(own)、基準層 = 方向セットの基準層の r(base。gne direction score で記録した層)": "Which layer's direction the proj units use. Own layer = the direction r_L of the head's layer (own); base layer = r at the direction set's base layer (base; recorded by gne direction score)",
   "方向の層「基準層」は保存したレシピのファイルにだけ入ります(3 列チャットと「今のレシピで eval」はユニットの文字列を送るので、その層の方向で当てます)。": "The base-layer setting is only written to the saved recipe file (the 3-column chat and \"eval with the current recipe\" send unit strings, so they use each unit's own layer).",
+  "このレシピは、1 回目と 2 回目に別々に当てる形(per_visit)です。保存したレシピのファイルには残りますが、3 列チャットと「今のレシピで eval」はユニットの文字列を送るので、両方の回に当てます。回ごとに当てた値は gne heads measure で、配れる形(両方の回に当てる形)には gne heads loop-merge で直します。": "This recipe applies to the first and second run separately (per_visit). The saved recipe file keeps that, but the 3-column chat and \"eval with the current recipe\" send unit strings, so they apply to both runs. Measure the per-run values with gne heads measure, and turn it into a shareable recipe (applied to both runs) with gne heads loop-merge.",
   "質問の最後": "end of the question",
   "応答(遅い)": "response (slow)",
   "key-check の欄に入れて回す(作ったときの対照集合と応答、作成と反対側の質問)": "Fill in key-check and run it (same contrast set and responses as the build, the other half of the questions)",

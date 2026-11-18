@@ -108,6 +108,16 @@ class Weights:
         self._cache_layers = cache_layers
         self._norms: dict[int, np.ndarray] = {}
         self.meta = self._read_meta()
+        # 同じ層を 2 回実行する arch(sensenova_loop): 2 回目の層の名前で、重みを持つ層のテンソルを引けるようにする(loop.py)。
+        # 2 回目の名前を持つ llama.cpp(回ごとの名前)を使うときは、per_visit_names を立てる(LoRA の名前を写し替えない)
+        from .loop import plan_of
+        self.loop = plan_of(self.field, self.meta.arch)
+        self.per_visit_names = False
+        if self.loop is not None:
+            for name, t in list(self._tensors.items()):
+                m = re.match(r"blk\.(\d+)\.(.+)$", name)
+                if m and self.loop.visit(int(m.group(1))) == 1:
+                    self._tensors.setdefault(f"blk.{int(m.group(1)) + self.loop.shift}.{m.group(2)}", t)
 
     # --- metadata -------------------------------------------------------------------------------
 
@@ -193,6 +203,11 @@ class Weights:
             out.append(f"残差有 {hc} 条流（hyper-connections）：读取时使用这些流的平均值")
         if m.arch == "qwen4exp":
             out.append("qwen4exp 的图不读取 control vector：无法使用 add 和方向推动。gain、投影（proj）可通过 LoRA 工作")
+        if self.loop is not None:
+            lp = self.loop
+            out.append(f"层 {lp.lo1}～{lp.lo2 - 1} 连续运行两次（执行顺序中的层 {lp.lo2}～{lp.hi2 - 1} 是第二次运行，使用层 "
+                       f"{lp.lo1}～{lp.lo2 - 1} 的权重）。权重改写（LoRA、合并）会作用于两次运行。每次运行内部的残差分为两条流，"
+                       "读取时使用它们的平均值")
         try:
             qtype = GGMLQuantizationType[m.ffn_down_qtype]
             if not dequantizable(qtype):
@@ -207,8 +222,13 @@ class Weights:
 
     # --- ffn_down -------------------------------------------------------------------------------
 
+    def stored(self, L: int) -> int:
+        """層 L の重みを持つ層の番号(同じ層を 2 回実行する arch の 2 回目の層は 1 回目の層、ほかは L)。"""
+        return self.loop.stored(L) if self.loop is not None else int(L)
+
     def down_matrix(self, L: int) -> np.ndarray:
         """W_down (n_embd, n_ff) float32。ニューロン n の書き込み方向は [:, n]。"""
+        L = self.stored(L)
         if L in self._cache:
             self._cache.move_to_end(L)
             return self._cache[L]
@@ -258,6 +278,7 @@ class Weights:
         """‖W_down[:, n]‖ 全 n(MoE の層は通し番号の順)。"""
         if self.meta.n_expert and self.is_moe(L):
             return self.expert_down_norms(L).reshape(-1)
+        L = self.stored(L)
         if L not in self._norms:
             self._norms[L] = np.linalg.norm(self.down_matrix(L), axis=0).astype(np.float32)
         return self._norms[L]
