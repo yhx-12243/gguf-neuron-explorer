@@ -2821,7 +2821,7 @@ def headproj_ablate(c: Common, holder: dict,
     from .steer import Recipe, Unit
     s = holder["session"] = c.session()
     arch = s.weights.arch
-    Ls = parse_layers(layers) or list(range(s.meta.n_layer))
+    Ls = parse_layers(layers) or list(range(s.weights.n_main))           # MTP の層は本流で実行されないので含めない
     units = [Unit(L, None, 0.0, "head", mode="proj", k=float(scale), head=h, direction=direction)
              for L in Ls if arch.layers[L].head_dim and arch.layers[L].head_writer for h in range(arch.layers[L].n_head)]
     if not units:
@@ -3328,46 +3328,103 @@ def heads_candidates(c: Common, holder: dict,
 
 @gne_command(heads_app, "refine", "heads refine")
 def heads_refine(c: Common, holder: dict,
-                 name: str = typer.Option(..., "--name", help="分配结果（流水线名称或 heads allocate 的保存名称）"),
-                 n_heads: Optional[int] = typer.Option(None, "--n-heads", help="测量剩余项的组的注意力头数量（默认推荐组）"),
+                 name: str = typer.Option(..., "--name", help="分配结果（流水线名称或 heads allocate 的保存名称。传入“从剩余中添加”的结果会叠加）"),
+                 n_heads: Optional[int] = typer.Option(None, "--n-heads", help="用于测量剩余项的组（表中行的单元数上限。默认为推荐组）"),
                  new_heads: str = typer.Option("3,2,1", "--new-heads", help="要追加的组的注意力头数量（逗号分隔）"),
                  out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认 <name>_r1，其他组则为 _r2 …）"),
                  fresh: bool = typer.Option(False, "--fresh", help="不复用已创建的方向和因果结果"),
-                 rank: Optional[str] = typer.Option(None, "--rank", help="追加部件的查找方式：causal（停用注意力头进行测量）/ writes（按写入量对全部部件排序。也可以追加神经元）。默认沿用原流水线设置"),
+                 rank: Optional[str] = typer.Option(None, "--rank", help="追加部件的查找方式：causal（停用注意力头进行测量）/ writes（按写入量对全部部件排序。也可以追加神经元）。默认沿用上一轮设置"),
                  unit_kinds: Optional[str] = typer.Option(None, "--unit-kinds", help="--rank writes 时追加的部件种类：all（注意力头、线性注意力、神经元）/ heads / neurons / layers（整层）。可用逗号追加"),
+                 check_replies: Optional[int] = typer.Option(None, "--check-replies", help="使用代表合并配方进行回复校验的问题数量（每侧。默认沿用原始批量设置，0 表示不校验）"),
+                 check_tokens: Optional[int] = typer.Option(None, "--check-tokens", help="回复校验中允许生成的最大长度（默认沿用原始批量设置）"),
                  yes: bool = _YES):
-    """組を当てても目標まで下がらない A 側の質問(残り)だけで、追加のヘッドを探す。残りの質問と B 側の質問で、組を当てたまま
-    方向を作り直し、一括(基準層 → 因果 → 配分)で足すヘッドと強さを決め、元の組と合わせたレシピを作って残りを測り直す。
+    """組を当てても目標まで下がらない A 側の質問(残り)だけで、組に足す部品を探す。残りの質問と B 側の質問で、組を当てたまま
+    方向を作り直し、一括(基準層 → 因果 → 配分)で足す部品と強さを決め、元の組と合わせたレシピを作って、元の方向・元の目標で
+    残りを測り直す。残りから追加の結果を --name に渡すと重ねる(土台はその行の合わせたレシピ = 元の組 + それまでの回の追加の全部)。
     --rank writes(か元の一括が writes)なら、足す部品にニューロンも選べ、--new-heads は組の部品の数の上限になる。"""
     s = holder["session"] = c.session()
     nh = _ints(new_heads) or [3, 2, 1]
     _gate(s, "heads_refine", {"name": name, "new_heads": nh, **({"rank": rank} if rank else {}),
-                              **({"unit_kinds": unit_kinds} if unit_kinds else {})}, yes, None)
-    d = s.heads_refine(name, n_heads=n_heads, new_heads=nh, out_name=out_name, resume=not fresh, rank=rank, unit_kinds=unit_kinds)
+                              **({"unit_kinds": unit_kinds} if unit_kinds else {}),
+                              **({"check_replies": check_replies} if check_replies is not None else {})}, yes, None)
+    d = s.heads_refine(name, n_heads=n_heads, new_heads=nh, out_name=out_name, resume=not fresh, rank=rank, unit_kinds=unit_kinds,
+                       check_replies=check_replies, check_tokens=check_tokens)
+    return d, _refine_text(d), 0
+
+
+def _refine_text(d: dict) -> str:
+    """heads refine の出力: 合わせたレシピ(土台 + 足した組)が主、足した組だけの値は補足。"""
     rm, cb, pp = d["remaining"], d["combined"], d["pipeline"]
-    lines = [f"{d['path']}（{d['seconds']:.0f} 秒）",
-             f"1. 使用 {d['n_heads']} 个注意力头的组 " + " ".join(d["base_units"]) + f"，L{d['score_layer']} 投影值超过 {d['threshold']:.2f} 的 A 侧问题：{rm['n']}/{rm['n_a']} 个" + (f"（较少，因此按投影值从高到低用 {rm['used']} 个问题创建方向）" if rm["padded"] else ""),
-             f"2. 用剩余问题运行流水线 → 方向 {pp['direction']}" + (f"（复用已生成的{'、'.join({'direction': '方向', 'causal': '因果'}[x] for x in pp['reused'])}）" if pp["reused"] else "")]
-    for r in pp["table"]:
-        if r.get("skipped"):
-            lines.append(f"   {r['n_heads']} 个：{r['skipped']}")
-            continue
-        lines.append(f"   {r['n_heads']} 个：最大 s {r['s_max']:.2f}，剩余 {r['remain']}  " + " ".join(r["units"])
-                     + ("  ← 推荐" if r["recommended"] else "") + ("" if r["reached"] else "（目标未达到）"))
+    rnd = d.get("round") or 1
+    rname = lambda k: "原组" if int(k) == 0 else f"第 {k} 轮"            # noqa: E731
+    byr = " + ".join(f"{rname(k)} {n} 个" for k, n in (d.get("units_by_round") or {}).items())
+    lines = [f"{d['path']}({d['seconds']:.0f} 秒)",
+             f"从剩余中添加 第 {rnd} 轮（原始批量 {d.get('root') or d['base']}）。基础 = {d['base']} 的 {d['n_heads']} 个单元所在行"
+             + (f"的合并配方（原组 + {'第 1 轮' if rnd == 2 else f'第 1～{rnd - 1} 轮'}添加，{len(d['base_units'])} 个单元）" if rnd > 1 else f"的组（{len(d['base_units'])} 个单元）"),
+             f"1. 应用基础后，原方向 {d.get('direction')} 的 L{d['score_layer']} 投影值高于目标 {d['threshold']:.2f} 的"
+             f" A 侧问题：{rm['n']}/{rm['n_a']} 个" + (f"（数量较少，因此按投影值从高到低用 {rm['used']} 个问题创建方向）" if rm["padded"] else ""),
+             f"2. 用剩余问题运行批量 → 新方向 {pp['direction']}" + (f"（复用已创建的{'、'.join({'direction': '方向', 'causal': '因果'}[x] for x in pp['reused'])}）" if pp["reused"] else "")]
     rows = d.get("combined_rows") or []
     if rows:
-        lines.append(f"3. 与原始组合并后的组（用原始方向 L{d['score_layer']} 重新测量。合并前：剩余 {rm['n']}/{rm['n_a']} 个问题，"
-                     f"B 侧正交分量偏移 {rows[0]['b_drift_orth_base']:.4f}）")
+        lines.append(f"3. 将基础与添加组合并后的配方（沿原方向、原目标测量。前 = 仅基础，后 = 合并后。仅提高添加组的强度。"
+                     "推荐行也按这些数值决定）")
+        why_ja = {"remain_up": "剩余数量增加", "effect_down": "组的效果下降", "b_move": "B 侧朝 A 侧移动", "drift": "B 侧正交分量偏移",
+                  "replies_break": "回复损坏"}
         for c in rows:
-            lines.append(f"   + {c['n_new']} 个（共 {c['n_heads']} 个注意力头）：剩余 {c['remain_after']} 个问题，A 平均值 {c['a_mean_before']:.2f} → "
-                         f"{c['a_mean_after']:.2f}，B 偏移 {c['b_drift_orth']:.4f}  {c['recipe']}"
-                         + ("  ← 代表性" if cb and c["recipe"] == cb["recipe"] else ""))
-        lines.append(f"代表性方案也保存到 {Path(cb['recipe']).with_name(d['name'] + '.combined.yaml')}"
-                     + ("（推荐组）" if cb["chosen_by"] == "recommended" else "（没有达到目标的组，因此选择合并后剩余最少的一组）"))
-        lines.append(f"确认：gne eval --recipe {cb['recipe']} --random-controls 16")
+            lab = "s=1 组" if c.get("key") == "s1" else f"上限 {c.get('key') or c['n_new']}"
+            ao = c.get("added_only") or {}
+            lines.append(f"   {lab}：共 {c['n_heads']} 个单元（基础 {c.get('n_base', '?')} + 添加 {c.get('n_added', '?')}）  剩余 {c['remain_before']} → {c['remain_after']} 个、"
+                         f"A 平均 {c['a_mean_before']:.2f} → {c['a_mean_after']:.2f}、B Δ {c.get('b_delta', float('nan')):+.2f}、"
+                         f"B ⊥ {c['b_drift_orth_base']:.3f} → {c['b_drift_orth']:.3f}"
+                         + (f"、段 {c['exit_after']['layer']} 的 A {c['exit_before']['a_mean']:.2f} → {c['exit_after']['a_mean']:.2f}" if c.get("exit_after") else "")
+                         + ("  ← 推荐" if cb and c["recipe"] == cb["recipe"] else "")
+                         + {"worse": f"  [会变差：{'、'.join(why_ja.get(k, k) for k in c.get('why') or [])}]", "no_gain": "  [不会改善]",
+                            "replies_break": "  [回复损坏]"}.get(c.get("verdict"), ""))
+            lines.append(f"      {c['recipe']}")
+            h = c.get("holdout")
+            if h:
+                lines.append(f"      未用于选择的问题：剩余 {h['remain_before']} → {h['remain_after']} / {h['n_a']}、A 平均 {h['a_mean_before']:.2f} → "
+                             f"{h['a_mean_after']:.2f}、B Δ {h['b_delta']:+.2f}、B ⊥ {h['b_drift_orth']:.3f}" + ("" if h["reached"] else "（未达到目标）"))
+            for x in c.get("dups") or []:
+                who = {"layer_attn": "attn", "layer_mlp": "ffn", "neuron": f"N{x['head']}"}.get(x["kind"], f"H{x['head']}")
+                lines.append(f"      同一单元包含在两个方向中：L{x['layer']} {who}"
+                             f"（{'、'.join(f'{rname(k)} s{sv:.2f} @{dn}' for k, sv, dn in zip(x['rounds'], x['s'], x['directions']))}）。两个投影都会应用")
+            for x in c.get("cross_visit") or []:
+                lines.append(f"      循环中的相同权重（保存的层 {x['stored']}）被基础 {x['base']} 和添加组 {x['added']} 在不同轮次使用"
+                             "（搜索时分别应用，合并配方中连续应用。表中的数值为合并配方下的实测值）")
+            if ao:
+                lines.append(f"      （参考：仅添加组，在新方向下 剩余 {ao.get('remain')}、A 平均 {ao.get('a_mean') or float('nan'):.2f}"
+                             + ("" if ao.get("reached") else "、未达到目标") + "）")
+        if cb:
+            lines.append(f"推荐行的合并配方也已保存到 {Path(cb['recipe']).with_name(d['name'] + '.combined.yaml')}（{byr}）")
+        else:
+            lines.append("无推荐行：" + ("所有可作为推荐的合并配方都会导致回复损坏。" if d.get("no_recommend") == "replies_break"
+                                          else "沿原方向、原目标合并后，没有任何一行改善或会变差。")
+                         + "建议不要添加（保留基础）")
+        ck = d.get("check")
+        if ck:
+            r0, r1 = ck["rows"]["none"], ck["rows"]["recipe"]
+            cell = lambda x: f"{x['match_finished']}/{x['finished']}" if x.get("match_finished") is not None else f"{x['finished']}/{x['n']}"   # noqa: E731
+            lines.append(f"4. {'s=1 组' if ck.get('key') == 's1' else '上限 ' + str(ck.get('key'))} 的合并配方的回复校验"
+                         f"（validate.match 匹配，A / B）：无干预 {cell(r0['A'])} / {cell(r0['B'])}、"
+                         f"合并配方 {cell(r1['A'])} / {cell(r1['B'])}。空回复 {r1['A']['empty']}/{r1['B']['empty']}（无干预 {r0['A']['empty']}/{r0['B']['empty']}）、"
+                         f"重复 {r1['A']['loop']}/{r1['B']['loop']}（无干预 {r0['A']['loop']}/{r0['B']['loop']}）")
+            for w in [ck.get("match_warning"), ck.get("note")] + [f"{sd} 侧回复已损坏（重复 {x['loop']}、空 {x['empty']} / {x['n']}）"
+                                                              for sd, x in (ck.get("break_warning") or {}).items()]:
+                if w:
+                    lines.append(f"   注意: {w}")
+        if cb:
+            lines.append(f"检查：gne eval --recipe {cb['recipe']} --random-controls 16")
+        lines.append("仅添加组的表（新方向，仅供参考。不要单独使用）：")
+        for r in pp["table"]:
+            if r.get("skipped"):
+                lines.append(f"   {r['n_heads']} 个：{r['skipped']}")
+                continue
+            lines.append(f"   {r['n_heads']} 个：最大 s {r['s_max']:.2f}、剩余 {r['remain']}  " + " ".join(r["units"])
+                         + ("  （仅按添加组自身数值推荐）" if r["recommended"] else "") + ("" if r["reached"] else "（未达到目标）"))
     else:
-        lines.append("3. 无法创建追加组，因此没有合并后的配方")
-    return d, "\n".join(lines), 0
+        lines.append("3. 未能创建要添加的组，因此没有合并配方")
+    return "\n".join(lines)
 
 
 def _fieldtest_text(d: dict) -> str:

@@ -187,7 +187,7 @@ class KeyedMetrics:
         self.plan = eval_plan(session, self.ks, spec, subset=subset, warn=self._warn)
         if not self.plan["overlap"]["held_out"]:
             self.notes.append(f"测量的示例与创建键时使用的示例重叠（创建 {self.ks.subset}，评估 {self.plan['subset']}）。eval 的选择性会偏乐观")
-        n_layer = session.meta.n_layer
+        n_layer = session.weights.n_main                # MTP の層は本流で実行されないので、本流の最後の層を最終層とする
         kl = sorted({k.layer for k in self.ku})
         self.layers = sorted({int(L) for L in (layers or kl)})
         for L in self.layers:

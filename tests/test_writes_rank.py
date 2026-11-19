@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MODEL = Path(os.environ.get("GNE_TEST_MODEL", ROOT / "models" / "Qwen3-0.6B-Q8_0.gguf"))
 LINEAR = Path(os.environ.get("GNE_TEST_LINEAR_MODEL", ROOT / "models" / "Qwen3.5-4B-Q8_0.gguf"))
 NGL = int(os.environ.get("GNE_TEST_NGL", "-1"))
+HYBRID = os.environ.get("GNE_TEST_HYBRID_MODEL")                 # Qwen3.5-0.8B(MTP の層つきの GGUF なら、その確かめも)
 EVIL = ROOT / "configs" / "contrast" / "evil.yaml"
 
 
@@ -378,8 +379,13 @@ def test_tune_per_unit_strengths():
     b_of = lambda sv: -40.0 + 4.0 * max(0.0, sv[1] - 1) ** 1.2                     # noqa: E731  部品 1 は上げると B 側が A 側へ
     run_s, calls = _tune_case(W, a0, b_of, sc)
     p1 = run_s([1.0, 1.0, 1.0])
-    sv, stop, trace = _tune(run_s, [1.0, 1.0, 1.0], p1, target=0.0, s_max=30.0, sc=sc, hard=2)
+    pb = []
+    sv, stop, trace = _tune(run_s, [1.0, 1.0, 1.0], p1, target=0.0, s_max=30.0, sc=sc, hard=2, probes=pb)
     assert len(sv) == 3 and min(sv) >= 1.0 and stop == "raised"                   # 部品は外さない
+    # 回ごとの記録: 選んだ質問(残りやすい 2 問)、部品ごとの s と効率。B 側を押す部品は上限で上げられない(効率なし)か効率が低い
+    assert pb and pb[0]["step"] == 1 and sorted(pb[0]["hard"]) == [0, 1] and pb[0]["s"] == [1.0, 1.0, 1.0]
+    assert all(len(p["eff"]) == len(p["blocked"]) == 3 for p in pb) and pb[0]["eff"][0] > (pb[0]["eff"][2] or 0)
+    assert pb[0]["eff"][1] is None or pb[0]["eff"][1] < pb[0]["eff"][0]
     assert sv[1] == 1.0 and sv[0] > sv[2]                                          # B 側を押す部品は上がらない、効く部品が高い
     end = run_s(sv)
     assert end["a_mean"] <= 1e-6 and end["feasible"]
@@ -612,6 +618,8 @@ def test_pipeline_rank_writes_end_to_end(session):
         assert r["stop"] in ("target", "raised", "s_max", "drift", "b_move", "no_gain", "iters")
         if r["stop"] == "target":
             assert r["alpha"] == 1.0
+        else:                                                                       # 強さの決め方の記録(回ごとの質問と部品ごとの効率)
+            assert r["probes"] and all(len(p["eff"]) == len(p["s"]) == r["n_used"] and len(p["questions"]) == len(p["hard"]) for p in r["probes"])
         # 測った点(s=1 から)と、組の効き・上限の中か
         assert r["raise"][0]["phase"] == "s1" and all({"a_mean", "b_delta", "b_orth", "effect", "feasible"} <= set(p) for p in r["raise"])
         assert r["feasible"] and r["b_toward"] <= al["b_move_max"] + 1e-9
@@ -641,6 +649,167 @@ def test_pipeline_rank_writes_end_to_end(session):
     rf = session.heads_refine("pw", new_heads=[2])
     pd = json.loads(Path(rf["pipeline"]["path"]).read_text(encoding="utf-8"))
     assert pd["settings"]["rank"] == "writes" and pd.get("writes") and not pd.get("check")
+
+
+@pytest.mark.model
+def test_refine_stacked_keeps_every_round(session):
+    """残りから追加を 3 回重ねる(rank writes、ヘッド・ニューロン・層全体): どの回の合わせたレシピも「元の組 + 1 回目 + … + その回」で、
+    回ごとに方向が違い、部品ごとに何回目かが残る。残りの数は前の回の合わせたレシピで測った数と同じ(元の方向・元の目標で測る)。
+    倍率を上げる前の組(s1)にも合わせたレシピがある。代表の合わせたレシピで応答での確かめを流す(0 で行わない)。"""
+    d = yaml.safe_load(EVIL.read_text(encoding="utf-8"))
+    spec = {"name": "pst", "system_a": d["system_a"], "system_b": d["system_b"], "user_prompts": d["user_prompts"],
+            "validate": d["validate"],
+            "pipeline": {"verify_top": 8, "verify_sample": 0, "n_units": [4, 2], "max_examples": 8, "unit_kinds": "all,layers",
+                         "check_replies": 0, "target": "B"}}
+    out = session.heads_pipeline(spec)
+    hd = session.store.heads_dir(session.meta.model_id)
+    ap = hd / "pst.alloc.json"
+    al = json.loads(ap.read_text(encoding="utf-8"))
+    al["remain_threshold"] = -1e9                                              # 全部残る(仕組みを確かめるため)
+    ap.write_text(json.dumps(al), encoding="utf-8")
+    row0 = next((r for r in al["table"] if r.get("recommended")), next(r for r in al["table"] if not r.get("skipped")))
+    prev_units, prev_remain, name, nh = list(row0["units"]), None, "pst", None
+    for rnd in (1, 2, 3):
+        rf = session.heads_refine(name, n_heads=nh, new_heads=[2], check_replies=1 if rnd == 1 else 0, check_tokens=8)
+        assert rf["root"] == "pst" and rf["round"] == rnd and rf["direction"] == "pst" and rf["base_units"] == prev_units
+        assert prev_remain is None or rf["remaining"]["n"] == prev_remain
+        recs = [c for c in rf["combined_rows"] if c["recommended"]]
+        assert len(recs) <= 1 and all(c["verdict"] in ("better", "worse", "no_gain", "replies_break") for c in rf["combined_rows"])
+        assert (rf["combined"] is None) == (not recs) and (rf["no_recommend"] is None) == bool(recs)
+        assert (hd / f"{rf['name']}.combined.yaml").exists() == bool(recs)
+        if recs:
+            assert recs[0]["verdict"] == "better" and rf["combined"]["key"] == recs[0]["key"]
+        assert (rf["check"] is not None) == (rnd == 1 and bool(recs) or rnd == 1 and rf["no_recommend"] == "replies_break")
+        if rf["check"] is not None:
+            assert set(rf["check"]["rows"]) == {"none", "recipe"} and rf["check"]["n"] == {"A": 1, "B": 1}
+        pd = json.loads(Path(rf["pipeline"]["path"]).read_text(encoding="utf-8"))
+        assert pd["refine"]["round"] == rnd and pd["refine"]["combined_rows"] == rf["combined_rows"]
+        assert pd["settings"]["unit_kinds"] == "all,layers" and pd["settings"].get("strength") in (None, "per_unit")
+        keys = [c["key"] for c in rf["combined_rows"]]
+        assert "s1" in keys and keys[:-1] == [str(r["n_heads"]) for r in pd["allocate"]["table"] if not r.get("skipped")]
+        for c in rf["combined_rows"]:
+            rr = Recipe.load(c["recipe"])
+            specs = [q["spec"] for q in c["parts"]]
+            assert c["units"] == specs and specs[:len(prev_units)] == prev_units and len(rr.units) == len(specs)
+            assert len(specs) == len(prev_units) + c["n_added"] and c["n_base"] == len(prev_units)
+            assert [q["round"] for q in c["parts"]][len(prev_units):] == [rnd] * c["n_added"]
+            assert {q["direction"] for q in c["parts"] if q["round"] == rnd} == {rf["name"]}
+            assert {u.direction for u in rr.units} == {q["direction"] for q in c["parts"]}
+            assert [u.k for u in rr.units] == pytest.approx([q["s"] for q in c["parts"]], rel=1e-3)
+            assert c["remain_before"] == rf["remaining"]["n"] and set(c["added_only"]) >= {"remain", "a_mean", "b_side_delta"}
+            for dp in c["dups"]:
+                assert len(dp["directions"]) >= 2 and len(set(dp["directions"])) == len(dp["directions"])
+        parent = next(c for c in rf["combined_rows"] if c["key"] != "s1")         # 次の回は表の先頭の行から(推す行の有無によらない)
+        if not any(c["recommended"] and c["key"] != "s1" for c in rf["combined_rows"]):
+            with pytest.raises(GneError):                                          # 推す行が無いのに行を選ばずに重ねると断る
+                session.heads_refine(rf["name"], new_heads=[2], check_replies=0)
+        prev_units, prev_remain, name, nh = parent["units"], parent["remain_after"], rf["name"], int(parent["key"])
+    kinds = {q["kind"] for q in parent["parts"]}
+    assert kinds & {"layer_attn", "layer_mlp", "neuron"} or kinds          # 部品の種類が残る(どれが選ばれるかはモデル次第)
+    # 強さの候補も、残りから追加の結果では合わせたレシピで、元の一括の方向・対照集合で作る
+    cd = session.heads_candidates(rf["name"], scales=[1.0], max_prompts=1, max_tokens=4)
+    comb = {c["key"]: c for c in rf["combined_rows"]}
+    assert cd["combined_from"] == rf["name"] and cd["direction"] == "pst" and len(cd["candidates"]) > 1
+    for c in cd["candidates"][1:]:
+        assert c["recipe"] == comb[str(c["n_heads"])]["recipe"] and c["units"] == comb[str(c["n_heads"])]["units"]
+
+
+def test_refine_verdicts_rule():
+    """残りから追加の推す行は、合わせたレシピの数(元の方向・元の目標)で選ぶ。足すと残りが増える・組の効きが下がる・B 側の上限を
+    超える行は推さず、良くなる行が無ければ推さない(足さないほうがよい)。届く行があれば、残りが少なく B ⊥ が小さい中で足した部品が少ない行。"""
+    from gne.api import refine_verdicts
+    row = lambda k, rb, ra, eb, ea, bd=0.0, bo=0.1, am=5.0, na=2: {"key": k, "remain_before": rb, "remain_after": ra, "effect_base": eb,  # noqa: E731
+                                                                   "effect": ea, "b_delta": bd, "b_drift_orth": bo, "a_mean_after": am,
+                                                                   "n_added": na, "n_heads": 10 + na}
+    rows = [row("3", 7, 12, 30, 25), row("2", 7, 3, 30, 34, bd=15.0), row("1", 7, 2, 30, 36, am=-1.0, na=1),
+            row("s1", 7, 2, 30, 36.5, am=-1.0, na=3), row("x", 7, 7, 30, 30.2), row("y", 7, 1, 30, 40, bo=0.7, am=-2.0)]
+    order = refine_verdicts(rows, n_a=20, gap=100.0, sign=1.0, threshold=0.0)
+    v = {r["key"]: (r["verdict"], r["why"]) for r in rows}
+    assert v["3"] == ("worse", ["remain_up", "effect_down"]) and v["2"] == ("worse", ["b_move"]) and v["y"] == ("worse", ["drift"])
+    assert v["x"][0] == "no_gain" and v["1"][0] == v["s1"][0] == "better"
+    assert [r["key"] for r in order] == ["1", "s1"]                                # 届く 2 行: 残り・B ⊥ が同じなので足した部品が少ない行
+    assert refine_verdicts([row("3", 7, 9, 30, 29)], n_a=20, gap=100.0, sign=1.0, threshold=0.0) == []   # 良くなる行が無い
+    far = [row("a", 7, 5, 30, 33), row("b", 7, 4, 30, 40, na=3)]                    # どれも届かない: 組の効きが最大に近い中で少ない
+    assert [r["key"] for r in refine_verdicts(far, n_a=20, gap=100.0, sign=1.0, threshold=0.0)] == ["b", "a"]
+
+
+def test_refine_old_stacked_result_is_refused(tmp_path):
+    """v0.8.3 までに重ねた結果(合わせたレシピに前の回の部品が入っていない)は、土台にせず、元の結果からやり直すよう断る。"""
+    from gne.api import Session
+    hd = tmp_path / "heads"
+    hd.mkdir()
+    (hd / "x_r1.refine.json").write_text(json.dumps({"base": "x", "combined_rows": [{"n_new": 2, "recipe": "a.yaml"}]}), encoding="utf-8")
+    (hd / "x_r1_r1.refine.json").write_text(json.dumps({"base": "x_r1", "combined_rows": [{"n_new": 2, "recipe": "b.yaml"}]}), encoding="utf-8")
+    fake = SimpleNamespace(store=SimpleNamespace(heads_dir=lambda m: hd), meta=SimpleNamespace(model_id="m"))
+    with pytest.raises(GneError) as e:
+        Session._refine_chain(fake, "x_r1_r1", {"n_heads": 2, "recipe": "c.yaml"})
+    assert "x" in e.value.hint and "v0.8.3" in str(e.value)
+    with pytest.raises(GneError):                                             # 合わせたレシピが無い行
+        Session._refine_chain(fake, "x_r1", {"n_heads": 3, "recipe": "c.yaml"})
+
+
+@pytest.mark.model
+def test_pipeline_skips_set_whose_replies_break(session, monkeypatch):
+    """推す組を当てると応答が壊れる(繰り返し・空が増える)なら、同じ規則で次の組を推して確かめ直す。どれも壊れれば推さない。"""
+    d = yaml.safe_load(EVIL.read_text(encoding="utf-8"))
+    spec = {"name": "pbrk", "system_a": d["system_a"], "system_b": d["system_b"], "user_prompts": d["user_prompts"], "validate": d["validate"],
+            "pipeline": {"verify_top": 6, "verify_sample": 0, "n_units": [4, 2, 1], "max_examples": 8, "check_replies": 1, "check_tokens": 8,
+                         "target": "B"}}
+    calls = []
+    real = session.reply_check
+
+    def fake(cs, val, recipe, **kw):                        # 最初に確かめた組だけ壊れたことにする
+        out = real(cs, val, recipe, **kw)
+        calls.append(str(recipe))
+        if len(calls) == 1:
+            out["break_warning"] = {"A": {"loop": 1, "empty": 0, "n": 1, "loop_none": 0, "empty_none": 0}}
+        return out
+    monkeypatch.setattr(session, "reply_check", fake)
+    out = session.heads_pipeline(spec)
+    tab = out["allocate"]["table"]
+    if not out.get("recommended") and len(calls) <= 1:
+        pytest.skip("推す組が 1 つも無い(この題材では確かめられない)")
+    broken = [r for r in tab if r.get("replies_break")]
+    assert len(broken) >= 1 and not any(r.get("recommended") for r in broken)
+    assert out["check"]["tried"][0]["break_warning"] and len(calls) == len(out["check"]["tried"])
+    if out.get("recommended"):
+        assert out["recommended"]["after_replies_break"] == [broken[0]["n_heads"]] and out["check"]["n_heads"] == out["recommended"]["n_heads"]
+        al = json.loads(Path(out["allocate"]["path"]).read_text(encoding="utf-8"))
+        assert al["recommended"] == out["recommended"]["n_heads"]
+    else:
+        assert out["no_recommend"]["reason"].startswith("应用推荐组会导致回复损坏")
+
+
+def test_n_main_skips_mtp_layers():
+    """MTP(nextn)の層は block_count に入るが本流では実行されないので、本流の層の数から除く(nextn_predict_layers か nextn のテンソル)。"""
+    from gne.weights import Weights
+    mk = lambda n, k, mt: SimpleNamespace(meta=SimpleNamespace(n_layer=n, arch="qwen35"),           # noqa: E731
+                                          field=lambda key, d=None: k if key == "qwen35.nextn_predict_layers" else d,
+                                          _tensors={f"blk.{L}.nextn.eh_proj.weight": 1 for L in mt})
+    assert Weights.n_main.fget(mk(25, 1, [24])) == 24 and Weights.n_main.fget(mk(25, 0, [24])) == 24
+    assert Weights.n_main.fget(mk(28, 0, [])) == 28 and Weights.n_main.fget(mk(65, 1, [64])) == 64
+
+
+@pytest.mark.model
+def test_writes_on_mtp_gguf(tmp_path):
+    """MTP の層つきの GGUF(Qwen3.5-0.8B の BF16 は 24 + 1 層)でも、選ぶ層の既定は本流の最後に測れる層で、一括が最後まで流れる
+    (v0.8.3 までは block_count − 2 = 23 を選び、方向に層 23 が無いと止まった)。"""
+    if not HYBRID or not Path(HYBRID).exists():
+        pytest.skip("GNE_TEST_HYBRID_MODEL がありません")
+    from gne.api import Session
+    s = Session(Path(HYBRID), root=tmp_path / "root", n_gpu_layers=NGL, n_ctx=2048)
+    try:
+        if s.weights.n_main == s.meta.n_layer:
+            pytest.skip("GNE_TEST_HYBRID_MODEL に MTP の層がありません")
+        assert s.weights.n_main == s.engine.n_layer                    # llama.cpp も MTP の層を数えない
+        d = yaml.safe_load(EVIL.read_text(encoding="utf-8"))
+        spec = {"name": "mtp", "system_a": d["system_a"], "system_b": d["system_b"], "user_prompts": d["user_prompts"][:8],
+                "pipeline": {"verify_top": 4, "verify_sample": 0, "n_units": [2], "max_examples": 6, "check_replies": 0, "target": "B"}}
+        out = s.heads_pipeline(spec)
+        assert out["rank"] == "writes" and out["writes"]["select_layer"] == s.weights.n_main - 2
+        assert out["allocate"]["score_layer"] <= s.weights.n_main - 2
+    finally:
+        s.close()
 
 
 @pytest.mark.model
