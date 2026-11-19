@@ -282,7 +282,7 @@ def _units_text(units: list[dict]) -> str:
             continue
         who = {"neuron": f"N{u['neuron']}", "random": f"random{u['seed']}", "head": f"H{u.get('head')}"}.get(
             u["kind"], f"dir:{u.get('direction')}")
-        if u.get("mode") == "proj":                          # CHANGE-06
+        if u.get("mode") == "proj":                          # CHANGE-06(ニューロンは ffn_down の列)
             rows.append(f"  L{u['layer']} {who} s{u['k']:g} @{u.get('direction')}"
                         f"（从写入方向分量中减去 {u['k']:g} 倍，以 LoRA 应用）")
             continue
@@ -338,9 +338,13 @@ def info(c: Common, holder: dict,
                      if lc["ok"] else f"无法加载：{lc['error']}（可能需要用新版 llama.cpp 重新构建，R6）"))
         lp = lc.get("loop") if lc["ok"] else None
         if lp:                                       # 同じ層を 2 回実行するモデル(docs/sensenova_loop.md)
-            rows.append(("运行两次的层", ("两条流中的层的 control vector：可到达" if lp["cvec_inner"]
-                                           else "两条流中的层的 control vector：无法到达（仅层 0～3、出口层、循环之后的层）")
-                         + "、第二次运行的层名称：" + ("有" if lp["per_visit_names"] else "无")
+            kind = {"official": "官方修改版", "guideboardlabs": "GuideboardLabs 版"}.get(lp.get("flavor"), "未知修改版")
+            rows.append(("运行两次的层", f"{kind}。"
+                         + ("两条流中的层残差：可读取" if lp.get("inner_resid", True)
+                            else "两条流中的层残差：不可读取（third_party/sensenova-loop/official 的 0001 可读取）")
+                         + "、control vector：" + ("可到达全部层" if lp["cvec_inner"]
+                                                   else "无法到达两条流中的层（仅层 0～3、出口层、循环之后的层。third_party/sensenova-loop/guideboardlabs 的 0001 可到达）")
+                         + "、第二次运行的层名称：" + ("有" if lp["per_visit_names"] else "无（使用所用修改版目录中的 0002 后可用）")
                          + "、改写：" + ("仅单元对应的运行" if lp["edits"] == "per_visit" else "两次运行")))
     sp = d.get("speed")
     if sp:
@@ -424,8 +428,13 @@ def verify(c: Common, holder: dict,
     if not s.engine.cvec_supported:
         why |= dict.fromkeys(("V3", "V4", "V12"), f"{s.meta.arch} 的图不读取 control vector")
     lp = s.engine.loop                               # 同じ層を 2 回実行するモデル: 2 本の流れの中の層の control vector が届くか
+    if lp is not None and not s.engine.loop_inner_resid() and any(lp.inner(x) for x in (v.L, v.L + 1, v.L + 2)):
+        from .loop import INNER_RESID_FIX, INNER_RESID_WHY
+        raise GneError("ARCH_UNSUPPORTED", INNER_RESID_WHY + f"（--layer {v.L} 会在之后 2 层内读取残差）",
+                       INNER_RESID_FIX + "。向 --layer 传入 0、51、52 等层时，即使未修改的 llama.cpp 也可以验证")
     if lp is not None and not s.engine.loop_cvec_reaches():
-        hint = "（请向 --layer 传入循环之外的层或出口层，或使用已修正为同时加到两条流上的 llama.cpp）"
+        hint = ("（请向 --layer 传入循环之外的层或出口层，或使用已修正为同时加到两条流上的 llama.cpp："
+                "GuideboardLabs 版使用 third_party/sensenova-loop/guideboardlabs 的 0001。官方版会从一开始就加到两条流上）")
         if lp.inner(v.L):
             why |= dict.fromkeys(("V4", "V12"), f"层 {v.L} 是残差位于两条流中的层，此 llama.cpp 中 control vector 无法到达下一层{hint}")
         if any(lp.inner(x) for x in (v.L, v.L + 1, v.L + 2) if x < lp.n_layer):
@@ -752,6 +761,9 @@ def gain(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
                 + [f"  L{L}: " + ", ".join(f"H{int(h)} s{sv:g}@{dn}" for h, sv, dn in x["heads"])
                    + f"（方向分量投影，秩 {x['rank']}{'' if x['folded'] else '，方向混杂，无法折叠为秩 1'}）"
                    for L, x in (d.get("proj_layers") or {}).items()]
+                + [f"  L{L}: " + ", ".join(f"N{int(n)} s{sv:g}@{dn}" for n, sv, dn in x["neurons"])
+                   + f"（神经元的方向分量投影、ffn_down 的秩 {x['rank']}{'' if x['folded'] else '，方向混杂，无法折叠为秩 1'}）"
+                   for L, x in (d.get("proj_neuron_layers") or {}).items()]
                 + _keyed_export_lines(d)
                 + [f"  query 操作：{p}" for p in (d.get("query_loras") or [])])
         text = (f"{d['path']}({d['bytes'] / 1e6:.2f} MB、LoRA)" + "".join("\n" + r for r in rows)
@@ -2092,7 +2104,7 @@ def direction_token_scan(c: Common, holder: dict,
                          contrast: Path = typer.Option(..., "--contrast", help="对照集（user_prompts = 想让其输出该 token 的输入，dont_touch = 不希望输出的输入）"),
                          layers: Optional[str] = typer.Option(None, "--layers", help="扫描的层（省略时为除最终层外的全部层）"),
                          minus: Optional[list[str]] = typer.Option(None, "--minus", help=_TOKEN_MINUS),
-                         deltas: Optional[str] = typer.Option(None, "--deltas", help="尝试的 Δ（例如 2,4,8,16,32,64。默认 2〜256 共 15 档）"),
+                         deltas: Optional[str] = typer.Option(None, "--deltas", help="尝试的 Δ（例如 2,4,8,16,32,64。默认 2～256 共 15 档）"),
                          need: float = typer.Option(0.95, "--need", help="在目标侧输入中，寻找使该比例以上的输入将 token 排名第一的最小 Δ"),
                          leaks: str = typer.Option("0.2,0.5", "--leaks", help="向 dont_touch 输入添加的倍率（所需 Δ 的多少倍）"),
                          rbar: Optional[float] = typer.Option(None, "--rbar", help=_RBAR)):
@@ -2867,6 +2879,9 @@ def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, u
     for L, x in (d.get("proj_layers") or {}).items():
         lines.append(f"  L{L}: " + ", ".join(f"H{int(h)} s{sv:g}@{dn}" for h, sv, dn in x["heads"])
                      + f"（秩 {x['rank']}" + ("" if x["folded"] else "，方向混杂，无法折叠为秩 1") + "）")
+    for L, x in (d.get("proj_neuron_layers") or {}).items():
+        lines.append(f"  L{L}: " + ", ".join(f"N{int(n)} s{sv:g}@{dn}" for n, sv, dn in x["neurons"])
+                     + f"（神经元、ffn_down 的秩 {x['rank']}" + ("" if x["folded"] else "，方向混杂，无法折叠为秩 1") + "）")
     lines += _keyed_export_lines(d, requant_line=not (bake and d.get("parts")))
     if bake and d.get("parts"):                 # 分割 GGUF: 同じ型で書き戻した
         how = {"keep": "以原类型写回", "auto": "以 auto 写回(Q8_0 保持原类型，其余为 F16"
@@ -2895,14 +2910,37 @@ def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, u
 
 
 @gne_command(headproj_app, "check", "headproj check")
-def headproj_check(c: Common, holder: dict, layer: int = typer.Option(..., "--layer"), head: int = typer.Option(..., "--head"),
+def headproj_check(c: Common, holder: dict, layer: int = typer.Option(..., "--layer"),
+                   head: Optional[int] = typer.Option(None, "--head", help="要校验的注意力头（与 --neuron 二选一）"),
+                   neuron: Optional[int] = typer.Option(None, "--neuron", help="要校验的神经元（ffn_down 的列。与 --head 二选一）"),
+                   whole: Optional[str] = typer.Option(None, "--whole", help="校验整层写入：attn（整个注意力输出）或 ffn（整个 MLP 输出）"),
                    direction: str = typer.Option(..., "--direction", help="方向名称"),
                    ss: str = typer.Option("1,2,6", "--s", help="要确认的 s")):
-    """V24・V25: proj の LoRA で、ヘッドが残差に書き込む重み行列の出力の差が numpy の計算(方向成分を s 倍ぶん引く)と合い、直交成分が変わらないか。"""
+    """V24・V25: proj の LoRA で、残差に書き込む重み行列の出力の差が numpy の計算(方向成分を s 倍ぶん引く)と合い、直交成分が変わらないか。
+    --head はヘッド(attn_output / ssm_out の列ブロック)、--neuron は MLP のニューロン(ffn_down の 1 列。MLP の出力 ffn_out の差で見る)、
+    --whole attn / ffn は層の書き込み全体(注意の出力全体 / MLP の出力全体)。"""
+    if sum(x is not None for x in (head, neuron, whole)) != 1:
+        raise GneError("BAD_ARGS", "请指定 --head、--neuron、--whole 中的一项")
     s = holder["session"] = c.session()
-    d = s.check_head_proj(layer, head, direction, ss=[float(x) for x in ss.split(",")])
-    lines = [f"L{layer} H{head}（{d['out_tensor']}，方向 {direction} 的 L{d['direction_from']}，注意力头写入与方向的 |cos| 中位数 "
-             f"{_f(d['dir_cos_head'], '.3f')})"]
+    sl = [float(x) for x in ss.split(",")]
+    if whole is not None:
+        d = s.check_whole_proj(layer, whole.lower(), direction, ss=sl)
+        lines = [f"L{layer} {d['kind']}（{d['out_tensor']}、方向 {direction} 的 L{d['direction_from']}、写入与方向的 |cos| 中位数 "
+                 f"{_f(d['dir_cos'], '.3f')}）"]
+        for r in d["rows"]:
+            lines.append(f"  s {r['s']:g}：相对误差中位数 {r['rel_err_median']:.2e}、方向分量 {r['par_after_over_before']:+.3f} 倍"
+                         f"（期望 {1 - r['s']:+g}）、正交分量变化 {r['orth_change_rel_median']:.2e}  {'○' if r['ok'] else '×'}")
+        lines.append(f"V24 {'通过' if d['v24'] else '未通过'}、V25 {'通过' if d['v25'] else '未通过'}")
+        return d, "\n".join(lines), 0 if d["ok"] else 1
+    if neuron is not None:
+        d = s.check_neuron_proj(layer, neuron, direction, ss=sl)
+        who = f"L{layer} N{neuron}"
+        lines = [f"{who}（{d['out_tensor']}、激活 {d['act_tensor']}、方向 {direction} 的 L{d['direction_from']}、"
+                 f"写入方向与该方向的 |cos| {_f(d['dir_cos_neuron'], '.3f')}、有激活的位置 {d['n_active']}/{d['n_tokens']}）"]
+    else:
+        d = s.check_head_proj(layer, head, direction, ss=sl)
+        lines = [f"L{layer} H{head}（{d['out_tensor']}、方向 {direction} 的 L{d['direction_from']}、注意力头写入与方向的 |cos| 中位数 "
+                 f"{_f(d['dir_cos_head'], '.3f')}）"]
     for r in d["rows"]:
         lines.append(f"  s {r['s']:g}：相对误差中位数 {r['rel_err_median']:.2e}，方向分量 {r['par_after_over_before']:+.3f} 倍"
                      f"（期望 {1 - r['s']:+g}）、正交分量变化 {r['orth_change_rel_median']:.2e}  {'○' if r['ok'] else '×'}")
@@ -2915,31 +2953,53 @@ def headproj_check(c: Common, holder: dict, layer: int = typer.Option(..., "--la
 def heads_pipeline(c: Common, holder: dict,
                    spec: Path = typer.Option(..., "--spec", help="对照集 JSON 或 YAML（name、user_prompts 或按侧 prompts_a / prompts_b、system_a / system_b 或 recipe_a / recipe_b，可选 pipeline 设置）"),
                    target: Optional[str] = typer.Option(None, "--target", help="难生效示例投影值目标：数值、B（消到 B 侧平均值）、mid（默认，A 与 B 中点）"),
-                   n_heads: Optional[str] = typer.Option(None, "--n-heads", help="要比较的组的注意力头数量（默认 6,5,4）"),
+                   n_heads: Optional[str] = typer.Option(None, "--n-heads", help="--rank causal：要比较的组的注意力头数量（默认 6,5,4）。--rank writes 使用 --n-units"),
                    max_examples: Optional[int] = typer.Option(None, "--max-examples", help="停止测量阶段使用的问题数量（默认 64，等间距抽稀）"),
                    positions: Optional[str] = typer.Option(None, "--positions", help="创建方向的位置：last（默认）/ response 等"),
-                   top_layers: Optional[int] = typer.Option(None, "--top-layers"), hard: Optional[int] = typer.Option(None, "--hard"),
+                   top_layers: Optional[int] = typer.Option(None, "--top-layers", help="--rank causal：逐个测量注意力头的层数（默认 4）"),
+                   hard: Optional[int] = typer.Option(None, "--hard", help="--rank causal：测量效率时，投影值容易保留的问题数量（默认 16）"),
                    include_score_layers: bool = typer.Option(False, "--include-score-layers", help="将测量投影值的层及其之后的注意力头也作为候选(默认排除。只是直接改变测量量，行为不易变化)"),
                    score_layers: Optional[str] = typer.Option(None, "--score-layers", help="投影值的测量层（例 27,51,54。默认基准层及后 2 层）。在 loop 中，同一层运行两次的模型对应第一次运行的出口、第二次运行的出口、最后一层的前一层"),
                    select_layer: Optional[int] = typer.Option(None, "--select-layer", help="用于注意力头排序和分配目标的层（必须是 --score-layers 之一。默认为：排序用基准层，目标用测量的最后一层）"),
-                   candidate_layers: Optional[str] = typer.Option(None, "--candidate-layers", help="寻找候选注意力头的层（例 28-53）。同一层运行两次的模型中，仅从第一次或仅从第二次选择时使用（与 GNE_LOOP_EDITS=per_visit 一起）"),
-                   always_layers: Optional[str] = typer.Option(None, "--always-layers", help="无论层被阻止时的下降幅度排名如何，始终按注意力头测量的层（例 52,53）。none 表示不追加。sensenova_loop 的默认值是循环之外的层 52、53"),
+                   candidate_layers: Optional[str] = typer.Option(None, "--candidate-layers", help="候选部件所在的层（例 28-53）。同一层运行两次的模型中，仅从第一次运行或仅从第二次运行选择时使用（与 GNE_LOOP_EDITS=per_visit 一起）"),
+                   always_layers: Optional[str] = typer.Option(None, "--always-layers", help="--rank causal：无论层被阻止时的下降幅度排名如何，始终按注意力头测量的层（例 52,53）。none 表示不追加。sensenova_loop 的默认值是循环之外的层 52、53"),
                    fresh: bool = typer.Option(False, "--fresh", help="不复用已创建的方向和因果结果，从头重新创建"),
+                   rank: Optional[str] = typer.Option(None, "--rank", help="候选查找方式：writes（默认。按方向上的写入量一次性对全部部件排序 → 用 s=1 校验前几名 → 从 s=1 开始构建组）/ causal（v0.7.0 之前的默认值。逐层停用 → 逐个停用前几名层的注意力头 → 按效率重新分配）。回复没有变化时，也试试另一种方式"),
+                   unit_kinds: Optional[str] = typer.Option(None, "--unit-kinds", help="--rank writes 的部件种类：heads（默认。注意力头、线性注意力头）/ all（+ MLP 神经元）/ neurons / layers（将整层注意力输出、整个 MLP 输出作为 1 个部件）。可用逗号追加（例 heads,layers）"),
+                   verify_top: Optional[int] = typer.Option(None, "--verify-top", help="--rank writes：逐个重新运行以校验的前几名数量（默认 64）"),
+                   verify_sample: Optional[int] = typer.Option(None, "--verify-sample", help="--rank writes：从前几名之后（到前几名的 4 倍）等间隔追加校验的数量（默认 16。在较大范围内测量排名相关性。也会成为组的候选）"),
+                   verify_mode: Optional[str] = typer.Option(None, "--verify-mode", help="--rank writes：校验方式。proj（默认。在 s=1 时投影）/ ablate（将输出置 0）"),
+                   n_units: Optional[str] = typer.Option(None, "--n-units", help="--rank writes：要比较的组中部件数量的上限（默认 24,12,6）"),
+                   check_replies: Optional[int] = typer.Option(None, "--check-replies", help="--rank writes：用选中的组生成回复并统计 validate.match 的问题数量（每侧。默认 16，0 表示关闭）"),
+                   check_tokens: Optional[int] = typer.Option(None, "--check-tokens", help="回复校验的长度上限（默认 512）"),
+                   holdout: bool = typer.Option(False, "--holdout", help="--rank writes：将问题分成两半，用偶数序号选择，用奇数序号（未用于选择的问题）测量表中的数值和回复校验（每侧至少 16 个问题）"),
+                   loop_direction: Optional[str] = typer.Option(None, "--loop-direction", help="--rank writes、同一层运行两次的模型：按第一次运行的层（first）或第二次运行的层（second）的方向，测量并投影循环内的部件"),
                    yes: bool = _YES):
-    """対照集合から、方向づくり → 基準層 → 因果スクリーニング(層ごと → ヘッド 1 個ずつ止める)→ 強さの配分(効き目に比例した
-    最初の組を二分探索 → 射影の値が残りやすい質問で効率を測って 0 から配り直す → ヘッド数を変えた組の比較)を 1 回で回す。"""
+    """対照集合から、方向づくり → 基準層 → 候補づくり → 強さの配分 を 1 回で回す。候補づくりと配分は 2 通り:
+    --rank writes(既定): 全部の部品(注意ヘッド・線形注意のヘッド、--unit-kinds all で MLP のニューロンも)を方向への書き込みの量で
+    順位づけ → 上位を 1 個ずつ s=1 で流し直して確かめる → 効き目の大きい順に s=1 で組に足し、足りなければ全体の強さを上げる → 応答での確かめ。
+    --rank causal(v0.7.0 までの既定): 因果スクリーニング(層ごと → ヘッド 1 個ずつ止める)→ 効き目に比例した最初の組を二分探索 →
+    射影の値が残りやすい質問で効率を測って 0 から配り直す → ヘッド数を変えた組の比較。"""
     s = holder["session"] = c.session()
     over = {"target": target, "n_heads": _ints(n_heads), "max_examples": max_examples, "positions": positions,
             "top_layers": top_layers, "hard": hard, "resume": False if fresh else None,
             "include_score_layers": True if include_score_layers else None, "score_layers": score_layers,
-            "select_layer": select_layer, "candidate_layers": candidate_layers, "always_layers": always_layers}
+            "select_layer": select_layer, "candidate_layers": candidate_layers, "always_layers": always_layers,
+            "rank": rank, "unit_kinds": unit_kinds, "verify_top": verify_top, "verify_sample": verify_sample, "verify_mode": verify_mode,
+            "n_units": _ints(n_units), "check_replies": check_replies, "check_tokens": check_tokens,
+            "holdout": True if holdout else None, "loop_direction": loop_direction}
     _gate(s, "head_pipeline", {"spec": str(spec), **{k: v for k, v in over.items() if v is not None}}, yes, None)
     d = s.heads_pipeline(spec, **over)
+    if d.get("writes"):
+        return d, "\n".join(_pipeline_writes_lines(d)), 0
+    rank_line = ("选择方式：v0.7.0 之前的选择方式（--rank causal。逐层停用 → 逐个停用前几名层的注意力头 → 按效率重新分配）"
+                 + (f"。{d['rank_note']}" if d.get("rank_note") else ""))
     sc, ca, al = d["score"], d["causal"], d["allocate"]
     ck = "causal" if (d.get("settings") or {}).get("select_layer") not in (None, "") else "causal_max"
     lines = [f"{d['path']}（{d['n_prompts']} 个问题，{d['seconds']:.0f} 秒"
              + (f"，复用已生成的{'、'.join({'direction': '方向', 'causal': '因果'}[x] for x in d['reused'])}" if d.get("reused") else "")
              + "）",
+             rank_line,
              f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒）",
              f"2. 基准层 L{sc['base_layer']}（cohen_d 最大，停止测量阶段使用 {sc['n'].get('A')} 个问题）",
              f"3. 因果：测量层 L{','.join(map(str, ca['score_layers']))}、{ca['n_rows']} 个注意力头、前列 " +
@@ -2968,9 +3028,168 @@ def heads_pipeline(c: Common, holder: dict,
         lines += _causal_layer_lines(ca) + _by_layer_lines(al)
     if s.weights.loop is not None:                           # 回ごとの効き目(1 回目だけ・2 回目だけ・両方で止める)を勧める
         lines.append(f"逐次运行效果：gne heads visits --name {d['name']}（需要第二次运行的层具有不同名称的 llama.cpp。"
-                     + ("此 llama.cpp 可以使用）" if s.engine.loop_runtime_names() else "此 llama.cpp 无法使用。third_party/sensenova-loop 的补丁 0002）"))
+                     + ("此 llama.cpp 可以使用）" if s.engine.loop_runtime_names() else "此 llama.cpp 无法使用。third_party/sensenova-loop 中所用修改版目录的补丁 0002）"))
     if d["recommended"]:
         lines.append(f"配方：{d['recommended']['recipe']}。确认：gne eval --recipe {d['recommended']['recipe']} --random-controls 16")
+    return d, "\n".join(lines), 0
+
+
+KIND_JA = {"attn": "注意力", "linear": "线性注意力", "neuron": "神经元", "layer_attn": "整层注意力", "layer_mlp": "整层 MLP"}
+WRITES_STOP = {"target": "全部为 s=1", "raised": "整体提高了强度", "s_max": "达到上限后停止", "drift": "因 B 侧正交分量偏移而停止",
+               "b_move": "因 B 侧朝 A 侧移动而停止", "no_gain": "提高后也没有改善，因此停止"}
+
+
+def _same_total(k: str, n_units: dict) -> bool:
+    """層全体の部品の和は、同じ種類の個別の部品(ヘッド・ニューロン)の和と同じなので、個別の部品もあれば並べない。"""
+    return (k == "layer_attn" and (n_units.get("attn") or n_units.get("linear"))) or (k == "layer_mlp" and n_units.get("neuron"))
+
+
+def _verify_corr_line(sp: dict) -> str:
+    return "、".join(f"{'全部' if k == 'all' else KIND_JA.get(k, k)} {_f(v['score_vs_gap_drop'], '+.2f')}"
+                     f"（仅 A 侧 {_f(v['score_vs_a_drop'], '+.2f')}，{v['n']} 个）" for k, v in sp.items())
+
+
+def _pipeline_writes_lines(d: dict) -> list[str]:
+    """heads pipeline --rank writes の表示。"""
+    wr, ve, al = d["writes"], d["verify"], d["allocate"]
+    ts = wr.get("totals_share") or {}
+    lines = [f"{d['path']}（{d['n_prompts']} 个问题，{d['seconds']:.0f} 秒）",
+             "选择方式：按写入量排列全部部件（--rank writes，默认。部件 "
+             + "、".join(KIND_JA.get(k, k) for k in wr["kinds"])
+             + "。v0.7.0 之前的选择方式是 --rank causal）",
+             f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒）",
+             f"2. 基准层 L{d['score']['base_layer']}（cohen_d 最大）",
+             f"3. 写入排序：选择层 L{wr['select_layer']}，A {wr['n']['A']} 个问题、B {wr['n']['B']} 个问题，A−B 差距 {wr['gap']:.2f}，"
+             f"部件 " + "、".join(f"{KIND_JA[k]} {n}" for k, n in wr["n_units"].items() if n) + f"（{wr['seconds']:.0f} 秒）",
+             "   直接写入之和 ÷ 差距：" + "、".join(f"{KIND_JA[k]} {v:+.0%}" for k, v in ts.items()
+                                                    if v is not None and wr["n_units"].get(k) and not _same_total(k, wr["n_units"]))
+             + "（每层的方向都会旋转，因此总和不为 1）",
+             *(["   各层直接写入 ÷ 差距（整个注意力、整个 MLP，前 6 层）："
+                + " | ".join(f"L{x['layer']} 注意力 {_f(x['attn_share'], '+.0%')}、MLP {_f(x['mlp_share'], '+.0%')}" for x in wr["layer_scores"][:6])]
+               if wr.get("layer_scores") else []),
+             f"4. 对前 {ve['n']} 个逐个{'用 s=1 投影' if ve['mode'] == 'proj' else '停用'}校验（"
+             + "、".join(f"{KIND_JA[k]} {n}" for k, n in ve["kinds"].items() if n) + f"，{ve['seconds']:.0f} 秒）。"
+             f"分数与测得的 A−B 差距缩小量的排名相关性：" + _verify_corr_line(ve["spearman"]),
+             f"5. 从 s=1 构建组（目标 {d['target']:.2f} = {d['target_from']}，候选 {al['pool']} 个。"
+             f"A 侧无干预的平均值为 {al['base_a_mean']:.2f}）："]
+    if al.get("holdout"):
+        h_ = al["holdout"]
+        lines.append(f"   将问题分成两半（--holdout）：用于选择 {d['n_prompts']} 个问题，用于重测表中数值的是 A {h_['n_a']} 个问题、B {h_['n_b']} 个问题"
+                     f"（目标 {h_['target']:.2f}，A 侧无干预的平均值 {h_['base_a_mean']:.2f}）。回复校验也使用未用于选择的问题")
+    for r in ([dict(al["s1"], s1=True)] if al.get("s1") else []) + al["table"]:
+        if r.get("skipped"):
+            lines.append(f"   上限 {r['n_heads']} 个：{r['skipped']}")
+            continue
+        kk = "、".join(f"{KIND_JA[k]} {n}" for k, n in r["kinds"].items() if n)
+        head = f"   s=1（提高前）：{r['n_used']} 个（{kk}）" if r.get("s1") else \
+            f"   上限 {r['n_heads']} 个：{r['n_used']} 个（{kk}），强度 {r['s_max']:.2f}（{WRITES_STOP.get(r['stop'], r['stop'])}）"
+        lines.append(head + f"、A 平均 {r['a_mean']:.2f}、B Δ {r['b_side_delta']:+.2f}、B 正交 {r['b_drift_orth']:.4f}、"
+                     f"剩余 {r['remain']}/{al['n_a']}" + ("" if r.get("effect") is None else f"、效果 {r['effect']:.2f}")
+                     + ("  ← 推荐" if r.get("recommended") else "") + ("" if r["reached"] else "（未达到目标）"))
+        ho = r.get("holdout")
+        if ho:                                       # 選ぶのに使っていない質問での数
+            lines.append(f"      未用于选择的问题：A 平均 {ho['a_mean']:.2f}、B Δ {ho['b_side_delta']:+.2f}、B 正交 {ho['b_drift_orth']:.4f}、"
+                         f"剩余 {ho['remain']}/{al['holdout']['n_a']}、效果 {ho['effect']:.2f}" + ("" if ho["reached"] else "（未达到目标）"))
+        lines.append("      " + " ".join(r["units"]))
+        X = al.get("loop_exit")
+        bl, b0 = (r.get("by_layer") or {}).get(str(X)), (al.get("base_by_layer") or {}).get(str(X))
+        if X is not None and bl and b0:              # ループのモデル: 1 回目の出口での変化(ループの中の部品は 1 回目にも効く)
+            lines.append(f"      第 {X} 段（第一次运行的出口）：A {b0['A']:.2f} → {bl['A']:.2f}、B Δ {bl['B'] - b0['B']:+.2f}"
+                         + ("" if bl.get("b_orth") is None else f"、B 正交 {bl['b_orth']:.4f}"))
+        if len(r.get("raise") or []) > 1:           # 倍率ごとの A 平均・B Δ・B 直交(格子の点と、上限の手前を詰めた点)
+            edge = [p for p in r["raise"] if p.get("phase") == "edge"]          # 上限の手前を詰めた点は、上限の中で最後の点と超えた最初の点だけ
+            keep = [max((p for p in edge if p["feasible"]), key=lambda p: p["alpha"], default=None),
+                    min((p for p in edge if not p["feasible"]), key=lambda p: p["alpha"], default=None)]
+            pts = sorted([p for p in r["raise"] if p.get("phase") in ("s1", "grid")] + [p for p in keep if p], key=lambda p: p["alpha"])
+
+            def at_exit(p):
+                q = (p.get("layers") or {}).get(str(X)) if X is not None else None
+                return "" if not q else f" [段{X} BΔ {q['b_delta']:+.1f} B⊥ {q['b_orth']:.2f}]"
+            lines.append("      各倍率：" + " | ".join(f"×{p['alpha']:.2f} A {p['a_mean']:.1f} BΔ {p['b_delta']:+.1f} B⊥ {p['b_orth']:.2f}"
+                                                   + at_exit(p) + ("" if p["feasible"] else " 超出") for p in pts))
+    if d.get("recommended") and not d["recommended"].get("reached", True):
+        lines.append("   所有组都未达到目标，因此在限制范围内推荐效果（A 侧下降幅度 − B 侧移动幅度）最大的组")
+    if d.get("no_recommend"):
+        lines.append(f"   无推荐组：{d['no_recommend']['reason']}。下一步：--rank causal（v0.7.0 之前的选择方式）、"
+                     "通过 --unit-kinds 更改部件种类、heads refine（从剩余问题中追加部件）")
+    for nt in al.get("notes") or []:
+        lines.append("   注意: " + nt["text"])
+    ck = d.get("check")
+    if ck:
+        def cell(x):
+            return f"{x['match_finished']}/{x['finished']}" if x.get("match_finished") is not None else f"{x['finished']}/{x['n']} 已完成生成"
+        for key, lab in (("none", "无干预"), ("recipe", "推荐组" if ck.get("recommended") else f"上限 {ck.get('n_heads')} 个的组（无推荐组）")):
+            x = ck["rows"][key]
+            lines.append(f"6. 回复校验 {lab}：A {cell(x['A'])}、B {cell(x['B'])}（已完成生成的回复中的匹配。空回复 A {x['A']['empty']}/B {x['B']['empty']}，"
+                         f"重复 A {x['A']['loop']}/B {x['B']['loop']}，达到上限被截断的 A {x['A']['at_limit']}/B {x['B']['at_limit']}）")
+        if not (ck["held_out"]["A"] and ck["held_out"]["B"]):
+            lines.append("   （这是用选择时所用问题进行的校验。请用未参与调整的问题运行 gne behave 来校验）")
+        if ck.get("match_warning"):
+            lines.append("   注意: " + ck["match_warning"])
+        for side, x in (ck.get("break_warning") or {}).items():
+            lines.append(f"   注意：应用组后 {side} 侧的回复被破坏（重复 {x['loop']}、空 {x['empty']} / {x['n']} 个问题，无干预时 "
+                         f"{x['loop_none']}、{x['empty_none']}）。请降低强度，或尝试其他组/其他部件种类")
+        if ck.get("note"):
+            lines.append("   注意: " + ck["note"])
+        if ck.get("suggest"):
+            lines.append("   回复没有变化时，也请试试 --rank causal（v0.7.0 之前的选择方式）。在 Qwen3.5-4B 的免责声明（disclaimer）题材上，"
+                         "这种方式即使投影值达到目标也不会改变回复，而 v0.7.0 之前的方式减少了免责声明（但也会给轻松的问题添加免责声明）")
+    if d.get("unused_settings"):
+        lines.append("未使用的设置（仅在 --rank causal 时使用）：" + ", ".join(d["unused_settings"]) + "。组中部件数量使用 --n-units")
+    lines.append("弱点：排名只看直接写入。只是驱动后续层写入者的部件不会体现在分数中")
+    if d["recommended"]:
+        lines.append(f"配方：{d['recommended']['recipe']}。校验：gne eval --recipe {d['recommended']['recipe']} --random-controls 16")
+    return lines
+
+
+@gne_command(heads_app, "writes", "heads writes")
+def heads_writes(c: Common, holder: dict,
+                 name: str = typer.Option(..., "--name", help="方向名称"),
+                 contrast: Optional[Path] = typer.Option(None, "--contrast", help="对照集（默认使用创建方向时的对照集）"),
+                 select_layer: Optional[int] = typer.Option(None, "--select-layer", help="测量分数的层（默认是最靠后的可测量层）。该层之前的部件为候选"),
+                 unit_kinds: str = typer.Option("all", "--unit-kinds", help="all（注意力头、线性注意力头、MLP 神经元）/ heads / neurons / layers（整层注意力输出、整个 MLP 输出）。可用逗号追加（例 all,layers、attn,layer_mlp）"),
+                 positions: str = typer.Option("last", "--positions"), subset: str = typer.Option("all", "--subset"),
+                 max_examples: Optional[int] = typer.Option(None, "--max-examples", help="用于排名的问题数量（默认全部）"),
+                 verify_top: int = typer.Option(64, "--verify-top", help="逐个重新运行以校验的前几名数量（0 表示不校验）"),
+                 verify_sample: int = typer.Option(16, "--verify-sample", help="从前几名之后（到前几名的 4 倍）等间隔追加校验的数量（在较大范围内测量排名相关性）"),
+                 verify_mode: str = typer.Option("proj", "--verify-mode", help="proj（在 s=1 时投影）/ ablate（将输出置 0）"),
+                 verify_examples: int = typer.Option(64, "--verify-examples", help="校验时使用的 A 侧问题数量（等间隔抽稀）"),
+                 score_layers: Optional[str] = typer.Option(None, "--score-layers", help="校验时排列投影值的层（默认是基准层及后续层）"),
+                 out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认是方向名称）"),
+                 loop_direction: str = typer.Option("first", "--loop-direction", help="同一层运行两次的模型：按第一次运行的层（first）或第二次运行的层（second）的方向测量循环内的部件"),
+                 show: int = typer.Option(30, "--show")):
+    """全部の部品(注意ヘッド・線形注意のヘッド・MLP のニューロン)を、方向への書き込みの量で順位づけする。質問 1 問につき 1 回流すだけで、
+    部品ごとに「その層の方向 r̂ にどれだけ書いたか」(ヘッドは出力·r̂、ニューロンは活性 ×(ffn_down の列·r̂))を読み、点数 =
+    選ぶ層での「s=1 で直接に縮まる A と B の差」で並べる。上位は 1 個ずつ s=1 で射影して流し直し、因果スクリーニングと同じ物差しで
+    確かめ、点数との順位相関を出す。直接の書き込みしか見ないので、後ろの書き手を動かしているだけの部品は見落とす。
+    層ごとの更新のベクトル(A 側の平均 − B 側の平均、種類ごと・質問を半分ずつ)は .writes.npz に残す。"""
+    s = holder["session"] = c.session()
+    d = s.heads_writes(name, contrast=contrast, select_layer=select_layer, kinds=unit_kinds, positions=positions, subset=subset,
+                       max_examples=max_examples, verify_top=verify_top, verify_sample=verify_sample, verify_mode=verify_mode,
+                       verify_examples=verify_examples, score_layers=s.score_layers_of(score_layers), name=out_name,
+                       loop_direction=loop_direction)
+    ts = d.get("totals_share") or {}
+    lines = [f"{d['path']}（选择层 L{d['select_layer']}，A {d['n']['A']} 个问题、B {d['n']['B']} 个问题，A−B 差距 {d['gap']:.2f}，{d['seconds']:.0f} 秒）",
+             "部件：" + "、".join(f"{KIND_JA[k]} {n}" for k, n in d["n_units"].items() if n)
+             + "。直接写入之和 ÷ 差距：" + "、".join(f"{KIND_JA[k]} {v:+.0%}" for k, v in ts.items()
+                                                      if v is not None and d["n_units"].get(k) and not _same_total(k, d["n_units"])),
+             *(["各层直接写入 ÷ 差距（整个注意力、整个 MLP，前 6 层）："
+                + " | ".join(f"L{x['layer']} 注意力 {_f(x['attn_share'], '+.0%')}、MLP {_f(x['mlp_share'], '+.0%')}" for x in d["layer_scores"][:6])]
+               if d.get("layer_scores") else []),
+             f"公式校验（部件之和与捕获层输出之差的最大值）：注意力 {_f((d.get('check') or {}).get('attn_rel_max'), '.2%')}、"
+             f"MLP {_f((d.get('check') or {}).get('mlp_rel_max'), '.2%')}、各层更新与残差之差（中位数 / 最大值） "
+             f"{_f((d.get('check') or {}).get('layer_rel_median'), '.2%')} / {_f((d.get('check') or {}).get('layer_rel_max'), '.2%')}",
+             f"  {'部件':>10} {'种类':<8} {'分数':>8} {'占比':>7} {'该层中':>8}" + (f" {'测得缩小量':>9} {'A 下降量':>9} {'B 正交':>7}" if d.get("verify") else "")]
+    vr = {r["label"]: r for r in ((d.get("verify") or {}).get("rows") or [])}
+    for r in d["rows"][:show]:
+        v = vr.get(r["label"])
+        lines.append(f"  {r['label']:>10} {KIND_JA[r['kind']]:<8} {r['score']:>+8.3f} {_f(r['share'], '+7.1%')} {r['own']:>+8.3f}"
+                     + (f" {v['gap_drop']:>+9.3f} {v['causal']:>+9.3f} {_f(v.get('drift_orth_b'), '7.4f')}" + ("  排除" if v.get("excluded") else "")
+                        if v else ""))
+    if d.get("verify"):
+        lines.append("分数与测得效果的排名相关性（Spearman，A−B 差距的缩小量）：" + _verify_corr_line(d["verify"]["spearman"]))
+    lines.append(f"数组：{d['npz']}（各层更新的向量、各部件的写入）")
+    lines.append("弱点：只看直接写入。只是驱动后续层写入者的部件不会体现在分数中")
     return d, "\n".join(lines), 0
 
 
@@ -3105,13 +3324,17 @@ def heads_refine(c: Common, holder: dict,
                  new_heads: str = typer.Option("3,2,1", "--new-heads", help="要追加的组的注意力头数量（逗号分隔）"),
                  out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认 <name>_r1，其他组则为 _r2 …）"),
                  fresh: bool = typer.Option(False, "--fresh", help="不复用已创建的方向和因果结果"),
+                 rank: Optional[str] = typer.Option(None, "--rank", help="追加部件的查找方式：causal（停用注意力头进行测量）/ writes（按写入量对全部部件排序。也可以追加神经元）。默认沿用原流水线设置"),
+                 unit_kinds: Optional[str] = typer.Option(None, "--unit-kinds", help="--rank writes 时追加的部件种类：all（注意力头、线性注意力、神经元）/ heads / neurons / layers（整层）。可用逗号追加"),
                  yes: bool = _YES):
     """組を当てても目標まで下がらない A 側の質問(残り)だけで、追加のヘッドを探す。残りの質問と B 側の質問で、組を当てたまま
-    方向を作り直し、一括(基準層 → 因果 → 配分)で足すヘッドと強さを決め、元の組と合わせたレシピを作って残りを測り直す。"""
+    方向を作り直し、一括(基準層 → 因果 → 配分)で足すヘッドと強さを決め、元の組と合わせたレシピを作って残りを測り直す。
+    --rank writes(か元の一括が writes)なら、足す部品にニューロンも選べ、--new-heads は組の部品の数の上限になる。"""
     s = holder["session"] = c.session()
     nh = _ints(new_heads) or [3, 2, 1]
-    _gate(s, "heads_refine", {"name": name, "new_heads": nh}, yes, None)
-    d = s.heads_refine(name, n_heads=n_heads, new_heads=nh, out_name=out_name, resume=not fresh)
+    _gate(s, "heads_refine", {"name": name, "new_heads": nh, **({"rank": rank} if rank else {}),
+                              **({"unit_kinds": unit_kinds} if unit_kinds else {})}, yes, None)
+    d = s.heads_refine(name, n_heads=n_heads, new_heads=nh, out_name=out_name, resume=not fresh, rank=rank, unit_kinds=unit_kinds)
     rm, cb, pp = d["remaining"], d["combined"], d["pipeline"]
     lines = [f"{d['path']}（{d['seconds']:.0f} 秒）",
              f"1. 使用 {d['n_heads']} 个注意力头的组 " + " ".join(d["base_units"]) + f"，L{d['score_layer']} 投影值超过 {d['threshold']:.2f} 的 A 侧问题：{rm['n']}/{rm['n_a']} 个" + (f"（较少，因此按投影值从高到低用 {rm['used']} 个问题创建方向）" if rm["padded"] else ""),
@@ -3238,6 +3461,7 @@ def heads_visits(c: Common, holder: dict,
                  positions: str = typer.Option("last", "--positions"),
                  max_examples: int = typer.Option(64, "--max-examples", help="阻止并测量的问题数量（等间隔抽稀）"),
                  out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认使用方向名称）"),
+                 loop_direction: str = typer.Option("first", "--loop-direction", help="同一层运行两次的模型：按第一次运行的层（first）或第二次运行的层（second）的方向测量循环内的部件"),
                  show: int = typer.Option(30, "--show")):
     """同じ層を 2 回実行するモデルで、同じヘッドを 1 回目だけ・2 回目だけ・両方で止めた効き目を並べ、回の間の順位相関を出す
     (2 回目の層に別の名前がある llama.cpp が要る。無ければ理由と代わりの方法を出して止める)。"""

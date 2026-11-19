@@ -150,6 +150,52 @@ def test_capture_names_and_shapes():
     assert "l_out_pre-30" not in out                       # 欲しいと言っていない名前は返さない
 
 
+def test_plan_from_official_keys():
+    """公式の GGUF の loop.* / mhc.* の鍵から、GuideboardLabs 版の layer_kinds と同じ段の対応を作る。MTP の層は数えない。"""
+    from gne.loop import kinds_from_loop_keys, plan_of
+    from gne.steer import GneError
+    meta = {"x.loop.start": 4, "x.loop.end": 28, "x.loop.count": 2, "x.mhc.start": 4, "x.mhc.end": 28, "x.block_count": 57,
+            "x.nextn_predict_layers": 1}
+    get = lambda k, d=None: meta.get(k, d)
+    assert kinds_from_loop_keys(get, "x") == KINDS
+    p = plan_of(get, "x")
+    assert (p.lo1, p.lo2, p.shift, p.n_layer) == (4, 28, 24, 56) and not p.inner(56)
+    assert plan_of(lambda k, d=None: {"x.mhc.layer_kinds": KINDS}.get(k, d), "x").lo2 == 28     # GuideboardLabs 版の鍵も読む
+    assert plan_of(lambda k, d=None: d, "x") is None
+    with pytest.raises(GneError):
+        kinds_from_loop_keys(lambda k, d=None: {**meta, "x.loop.count": 3}.get(k, d), "x")
+
+
+def test_capture_official_names_and_refusal():
+    """公式の改造版: 1 つ目の mhc_input は attention の入力(attn_in)。0001 の 2 本の流れは並べて l_out_streams にする。
+    中の層の残差を読めない llama.cpp では、欲しい中の層の名前が無ければ理由と直し方を書いて断る。"""
+    from gne.capture import Capture
+    from gne.steer import GneError
+    c = Capture(lambda n: n in {"l_out-30", "l_out_streams-30", "attn_in-30"})
+    c.loop, c.loop_d, c.loop_full = plan_from_kinds(KINDS), 4, frozenset({31})
+    assert c._canon("mhc_input-30") == "attn_in-30"
+    assert c._want("mhc_stream_a-30") and c._want("mhc_stream_b-30") and not c._want("mhc_stream_a-3")
+    a, b = np.ones((2, 4), np.float32), 3 * np.ones((2, 4), np.float32)
+    c._store("mhc_stream_a-30", a)
+    c._store("mhc_stream_b-30", b)
+    c._store("l_out-30", (a + b) / 2)
+    out = c.take()
+    np.testing.assert_allclose(out["l_out_streams-30"], np.concatenate([a, b], axis=1))
+    assert "mhc_stream_a-30" not in out
+    r = Capture(lambda n: n in {"l_out-2", "l_out-30"})
+    r.loop, r.loop_d = plan_from_kinds(KINDS), 4
+    r.loop_refuse = ("読めません", "0001 を当ててください")
+    r._store("l_out-2", a)
+    with pytest.raises(GneError) as ex:
+        r.take()
+    assert "l_out-30" in ex.value.message and "0001" in ex.value.hint
+    ok = Capture(lambda n: n in {"l_out-2", "l_out-27"})               # 繰り返しの外と出口だけなら断らない
+    ok.loop, ok.loop_d, ok.loop_refuse = plan_from_kinds(KINDS), 4, ("x", "y")
+    ok._store("l_out-2", a)
+    ok._store("l_out-27", a)
+    assert set(ok.take()) == {"l_out-2", "l_out-27"}
+
+
 def test_head_layers_skip_second_visit():
     from gne.causal import _visits, head_layers
     li = [SimpleNamespace(index=L, head_dim=4, head_writer="ssm_out") for L in range(56)]
@@ -313,6 +359,9 @@ def test_loop_pipeline_defaults():
     kept = {"score_layers": "base", "select_layer": None, "always_layers": "none"}
     assert Session._loop_pipeline_defaults(fake, kept) is None and kept["score_layers"] == "base"
     assert Session._loop_pipeline_defaults(SimpleNamespace(weights=SimpleNamespace(loop=None)), dict(pipe)) is None
+    # rank writes(v0.8.0 からの一括の既定)は全部の層を順位づけるので、段 52・53 をいつも測る指定は足さない(測る層・選ぶ層は同じ)
+    pw = {"score_layers": None, "select_layer": None, "always_layers": None, "rank": "writes"}
+    assert Session._loop_pipeline_defaults(fake, pw) == {"score_layers": "loop", "select_layer": 54} and pw["always_layers"] is None
 
 
 MODEL = os.environ.get("GNE_TEST_SENSENOVA")
@@ -343,19 +392,32 @@ def test_real_weights_and_arch():
 
 @real
 def test_real_capture_every_layer(engine):
+    """全部の層の l_out と、2 本の流れの中の層の MLP の入力・2 本を並べた値・ルーターの値。公式の改造版は 0001 を当てたときだけ
+    (当てていなければ、中の層の残差を欲しがると理由と直し方を書いて断る)。"""
     from gne.capture import Capture
+    from gne.steer import GneError
     e = engine
     ids = e.tokenize_prompt(e.render_chat([{"role": "user", "content": "Hello!"}]))
     want = {f"l_out-{L}" for L in range(e.n_layer)} | {"attn_residual-30", "attn_post_norm-30", "ffn_out-30", "attn_output-31",
                                                       "l_out_streams-30"}
+    official = e.loop_graph()["flavor"] == "official"
+    if official:
+        want |= {"mhc_attn_gates-30", "mhc_ffn_gates-30"}
     cap = Capture(lambda n: n in want)
     ctx = e.probe_ctx(cap, need=len(ids))
     e.clear_memory(ctx)
     e.prefill(ctx, [ids])
+    if not e.loop_inner_resid():
+        with pytest.raises(GneError) as ex:
+            cap.take()
+        assert "0001" in (ex.value.hint or "")
+        return
     got = cap.take()
     assert want <= set(got), sorted(want - set(got))
     s = got["l_out_streams-30"]
-    np.testing.assert_allclose(s.reshape(s.shape[0], 2, -1).mean(axis=1), got["l_out-30"], atol=1e-5)
+    np.testing.assert_allclose(s.reshape(s.shape[0], 2, -1).mean(axis=1), got["l_out-30"], atol=1e-4)
+    if official:
+        assert got["mhc_attn_gates-30"].shape[1] == 8 and got["mhc_ffn_gates-30"].shape[1] == 8
 
 
 @real
@@ -469,3 +531,76 @@ def test_real_recipe_mode_per_file(tmp_path):
         assert s.lora_for(pv)[0][0] != s.lora_for(sh)[0][0]          # 同じ中身でも当て方が違えば別のファイル
     assert not s.weights.per_visit_names                              # セッションの当て方は元に戻る
     s.close()
+
+
+@real
+def test_real_writes_ranking_mhc(tmp_path):
+    """v0.8.0 の書き込みの順位づけ: 2 本の流れの中の層でも、部品から組み立てた層の更新(c·副層の出力、c = (post0 + post1)/2)が、
+    捕まえた残差の差 l_out-L − l_out-(L−1) と合う。部品は重みを持つ層の番号で表し(2 回目の層は候補にしない)、
+    2 回の書き込みを足す。ニューロンの射影は両方の回に効き、式どおりに MLP の出力を変える。"""
+    import json as _json
+    from gne.api import Session
+    from gne.steer import GneError
+    cfg = Path(__file__).resolve().parent.parent / "configs" / "pipeline" / "question_kinds.json"
+    d = _json.loads(cfg.read_text(encoding="utf-8"))
+    import yaml as _yaml
+    c = tmp_path / "qk.yaml"
+    c.write_text(_yaml.safe_dump({"name": "qk", "prompts_a": d["prompts_a"][:6], "prompts_b": d["prompts_b"][:6]},
+                                 allow_unicode=True), encoding="utf-8")
+    try:
+        s = Session(MODEL, root=tmp_path / "root", n_ctx=1024, n_seq_max=1)
+        s.engine
+    except (RuntimeError, GneError) as ex:
+        pytest.skip(f"この llama.cpp では読めません: {ex}")
+    try:
+        s.direction(contrast=c, name="qk", positions="last")
+        out = s.heads_writes("qk", verify_top=2, verify_sample=0, verify_examples=4)
+        ck = out["check"]
+        assert ck["layer_rel_median"] < 0.05 and ck["attn_rel_max"] < 0.1 and ck["mlp_rel_max"] < 0.1, ck
+        z = np.load(out["npz"])
+        assert set(z["layer_visit"].tolist()) == {0, 1, 2} and int(z["select_layer"]) == 54
+        lp = s.weights.loop
+        assert not any(lp.second(int(L)) for L in z["head_layer"])           # 2 回目の層は候補にしない(同じ重み)
+        assert out["n_units"]["neuron"] == 30 * s.meta.n_ff                    # 層 0〜27 と 52・53
+        m = s.check_neuron_proj(10, 7, "qk", ss=(1.0,))
+        assert m["v24"], m["rows"]
+    finally:
+        s.close()
+
+
+@real
+def test_real_writes_loop_direction_and_whole_layers(tmp_path):
+    """v0.8.1: loop_direction second では、ループの中の部品を 2 回目の段の番号で表し(その段の方向で測り、射影する。重みは同じ)、
+    1 回目の段は候補にしない。層ごとの直接の書き込み(layer_scores)と層全体の部品(layer_attn・layer_mlp)が並ぶ。
+    層全体の射影(ffn・attn)の LoRA は、ループの中の層でも式どおり(重みは両方の回で同じ)。"""
+    import json as _json
+    import yaml as _yaml
+    from gne.api import Session
+    from gne.steer import GneError
+    cfg = Path(__file__).resolve().parent.parent / "configs" / "pipeline" / "question_kinds.json"
+    d = _json.loads(cfg.read_text(encoding="utf-8"))
+    c = tmp_path / "qk.yaml"
+    c.write_text(_yaml.safe_dump({"name": "qk", "prompts_a": d["prompts_a"][:6], "prompts_b": d["prompts_b"][:6]},
+                                 allow_unicode=True), encoding="utf-8")
+    try:
+        s = Session(MODEL, root=tmp_path / "root", n_ctx=1024, n_seq_max=1)
+        s.engine
+    except (RuntimeError, GneError) as ex:
+        pytest.skip(f"この llama.cpp では読めません: {ex}")
+    try:
+        s.direction(contrast=c, name="qk", positions="last")
+        out = s.heads_writes("qk", kinds="heads,layers", verify_top=0, loop_direction="second")
+        lp = s.weights.loop
+        z = np.load(out["npz"])
+        hl = {int(L) for L in z["head_layer"]}
+        assert any(lp.second(L) for L in hl) and not any(lp.visit(L) == 1 for L in hl)   # ループの中は 2 回目の段で表す
+        rows = _json.loads(Path(out["path"]).read_text(encoding="utf-8"))["rows"]
+        assert any(r["kind"] == "layer_attn" for r in rows) and any(r["kind"] == "layer_mlp" for r in rows)
+        assert not any(r["kind"] in ("layer_attn", "layer_mlp") and lp.visit(r["layer"]) == 1 for r in rows)
+        assert out["layer_scores"] and {"layer", "attn", "mlp"} <= set(out["layer_scores"][0])
+        for kind in ("ffn", "attn"):
+            m = s.check_whole_proj(10, kind, "qk", ss=(1.0,))
+            assert m["v24"] and m["v25"], (kind, m["rows"])
+    finally:
+        s.close()
+

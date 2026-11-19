@@ -57,7 +57,7 @@
 - 模型：Qwen3-0.6B、Qwen3.5-4B（混合线性注意力）和 SmolLM2-135M-Instruct（arch `llama`），均为 Q8_0。
 - 尚未测试 Metal。
 - MoE 模型：granite-3.1-1b-a400m 和 LFM2-8B-A1B。参见[混合专家](#混合专家)。
-- SenseNova-Loop-9B（arch `sensenova_loop`，第 4–27 层运行两次），Q4_K_M 和 Q8_0。官方 llama.cpp 目前还无法加载它：需要一个专用环境，使用第三方 llama.cpp 分支并对 llama-cpp-python 做两行修正。参见 [docs/sensenova_loop.md](docs/sensenova_loop.md) 和 [third_party/sensenova-loop/](third_party/sensenova-loop/README.md) 中的可选分支补丁。
+- SenseNova-Loop-9B（arch `sensenova_loop`，第 4–27 层运行两次）。官方 llama.cpp 目前还无法加载它：需要一个专用环境，使用两种 llama.cpp fork 之一（各自使用自己的 GGUF 文件），并对 llama-cpp-python 0.3.36 做修正。模型团队的 fork（OpenSenseNova/llama.cpp，基于 llama.cpp 1.0）读取 sensenova/SenseNova-Loop-9B-GGUF 的官方 GGUF 文件，包括 BF16；GuideboardLabs fork（基于 llama.cpp 0.8）读取 guideboardlabs/SenseNova-Loop-9B-GGUF，生成速度约快 5 倍。该选哪个见 [docs/sensenova_loop.md](docs/sensenova_loop.md)，补丁见 [third_party/sensenova-loop/](third_party/sensenova-loop/README.md)。
 - 对于尚未使用过的模型，请先运行 `gne verify`。
 
 ## 安装
@@ -121,6 +121,9 @@ gne direction score --name evil                               # 逐层 A/B 分�
 gne heads causal --name evil                                  # 输出置零后会降低沿方向投影的注意力头（不生成）
 gne heads allocate --name evil --target -3 --n-heads 6,5,4    # 按效率分配强度，并比较头更少的组
 gne heads allocate --name evil --target -3 --method greedy    # 或逐个提高最有效注意力头的强度
+gne heads writes --name evil                                  # 按沿方向的写入量对每个注意力头、线性注意力头和 MLP 神经元排序，再校验前几名
+gne headproj check --layer 20 --neuron 4096 --direction evil  # 对照公式校验神经元投影单元（20:N4096:s1@evil）
+gne headproj check --layer 20 --whole ffn --direction evil     # 对整层 MLP 输出单元（20:ffn:s1@evil）做同样校验；--whole attn 对应 20:attn:s1@evil
 gne heads candidates --alloc evil --prompts held_out.yaml     # 为每个组 × 倍率生成回复，写出供匿名评分
 gne heads candidates --tally evil                             # 汇总每个候选的评分
 gne steer --recipe ~/.gne/heads/<model_id>/evil.alloc-n4.yaml --system "You are a cruel AI." -p "Who are you?" --compare   # 仅所选头沿方向的分量
@@ -231,12 +234,13 @@ gne steer -m M --unit 12:E37:N511:x2 -p "..." --compare
 - `marginal` 模式下，同一命令从当前组出发，逐次略微提高单个注意力头的强度，以测量单位强度带来的下降（其效率）；这一排名通常与直接停掉注意力头得到的排名不同。
 - `gne heads allocate` 按效率比例分配强度，缩放整个组直到最难生效的示例达到目标值，并构建头数更少的组，以便选择与较大组效果相当的最小一组。
 
-`gne heads pipeline --spec file.json` 可从包含对照集（以及可选设置）的单个文件一次运行这些步骤：使用全部问题创建方向、记录基准层、筛选层再筛选单个注意力头、分配强度。
+`gne heads pipeline --spec file.json` 可从包含对照集（以及可选设置）的单个文件一次运行从方向到强度分配的全部步骤。从 v0.8.0 起，默认的候选查找方式是按每个单元沿方向的写入量排序（`--rank writes`，见下方列表）。上文的 `gne heads causal` 和 `gne heads allocate` 流程（先筛选层，再筛选单个注意力头，然后按效率分配）是 `--rank causal`，即 v0.7.0 之前的默认方式。
 
 - **问题数量：** 问题可以有数百个。停头阶段使用等间隔抽取的子集（默认 64 个），因为每次试验都会读取它使用的全部问题。
 - **排除候选：** 若停掉某些层或头会让 B 侧（中性侧）残差变化超过其自身大小的一半，则将其排除，因为它们不是在作用于方向，而是在破坏模型；停掉第一层的全部注意力头通常就会如此。
 - **目标：** 未指定目标时，强度瞄准两侧平均投影的中点。中点通常只能消除约一半行为，因此要完全消除时请将目标写为 `B`：强度会瞄准 B 侧投影平均值（若最强头卡在默认上限 `s_max = 30`，请提高上限）。
 - **恢复：** 中止后使用相同文件和设置重新运行会复用已创建的方向和因果结果，并从分配阶段继续（`--fresh` 或 UI 中的“从头重新创建”会重建全部内容）。
+- **选择（`--rank`）：** 默认的 `--rank writes` 在每个问题上运行一次，读取每一层中每个注意力头和线性注意力头沿方向的写入量，逐个将前几名以 s=1 投影进行校验，并按测得效果顺序以 s=1 加入组（只有仍不足时才整体提高强度）。随后用所选组写出回复，并统计 `validate.match`。`--unit-kinds all` 会把 MLP 神经元也加入候选（神经元投影单元为 `L:Nn:sS@NAME`；它会从该神经元的 MLP 输出权重列中移除方向分量）。`--unit-kinds heads,layers` 或 `all,layers` 还会加入整层单元：某层的整个注意力输出（`L:attn:sS@NAME`）或整个 MLP 输出（`L:ffn:sS@NAME`）；输出会列出每层的直接写入量，因此可看出哪些层重要。`--holdout` 将问题分成两半，并在未用于选择的那一半上测量表中的数值（每侧 16 个以上）。`--rank causal` 是 v0.7.0 之前使用的选择方式：基准层之前的注意力头，仅来自同时停止时最能降低投影的层，然后按效率重新分配。如果回复校验表明行为没有改变，请尝试另一种方式（在 Qwen3.5-4B 的免责声明题材上，`--rank causal` 效果更好）。输出会说明实际运行了哪种方式。步骤、比较和弱点见 [docs/head-component-steering.md](docs/head-component-steering.md) §3.9。
 
 比较表的“剩余”列统计某组未能降到目标的 A 侧问题数。`gne heads refine --name NAME`（表中的“从剩余中添加”）只将这些剩余问题作为 A 侧、原始 B 侧问题作为 B 侧，在两侧应用该组后重建方向，并运行相同步骤来选出要添加的注意力头和强度。该组已经改变的部分在两侧相同，因此新方向只保留该组尚未消除的差异。补充注意力头是在原组应用状态下找到的，因此绝不单独使用：对于比较表中的每个组，它会写出一个合并原组与该组的配方，并沿原方向重新测量剩余数量和 B 侧偏移。表中的加载和 eval 按钮使用这些合并配方。
 
@@ -492,7 +496,7 @@ gne serve -m models/Qwen3.5-4B-Q8_0.gguf      # http://127.0.0.1:8791
   - **嵌入：** rollout 文本的 UMAP。
 - **构建：** 每个界面左侧显示步骤（或任务）列表，右侧显示所选步骤的输入、运行和结果。步骤会标记为完成、运行中或待办。所有步骤共用的设置（名称、层、强度等）统一放在顶部。
   - **方向：** 查看已保存的方向在每一层多大程度分开对照集两侧、基准层在哪里，以及所选层的逐示例投影。只有点击“重新测量”时才会测量（保留上一次的测量结果）。
-  - **CHiPS：** 接收 JSON 形式的对照集（粘贴、从文件加载，或从六种用途模板开始），将方向 → 基准层 → 因果筛选 → 强度分配作为一次作业运行，并逐步显示结果：每个阶段的简短说明、被排除的注意力头及原因、按停头所得的排名与按效率所得的排名如何互换，以及头数更少的组比较。任何组都可替换配方或发送到评估。第 5 步会创建强度候选。
+  - **CHiPS：** 接收 JSON 形式的对照集（粘贴、从文件加载，或从六种用途模板开始），将方向 → 基准层 → 因果筛选 → 强度分配作为一次作业运行，并逐步显示结果：每个阶段的简短说明、被排除的注意力头及原因、按停头所得的排名与按效率所得的排名如何互换，以及头数更少的组比较。任何组都可替换配方或发送到评估。第 5 步会创建强度候选。设置按选择方式分组，未选中的方式所对应的组会被禁用（“按写入量从全部单元中选择”：单元类型、组大小上限，以及“更多设置”下的要校验的单元数、回复校验问题和最大 token 数、分别用于选择和测量的不同问题，以及循环内单元的方向；“停止并选择”：注意力头数量、测试注意力头的层、困难问题）。字段值会被使用；如果 JSON 的 `pipeline` 下含有相同项，加载 JSON 时会将其值放入字段。
   - **键：** 键控写入任务通过左侧列表切换。“构建键”接收文件或 JSON 形式的对照集（可从三个用途模板开始），用一个按钮运行方向、键，并在未用于建键的示例上检查（与打乱后构建的比较用键对照），所有结果集中显示在一处。结果可将键控单元加入配方，并逐层检查 LoRA 是否按公式写入（key-verify）。在 MoE 模型上，专家选择频率表可引导为指定专家构建键。其他任务包括“查找有效层”“检查区分效果（key-check）”“已保存的键”和“用 CHiPS 剩余内容构建”（收集行为仍能穿过 CHiPS 配方的问题，并由此创建键控对照集）。
   - **FiSH：** 从对照集到各项检查逐步构建计算生成的神经元（来自模板的对照集、按回复位置分段的方向、低活跃度神经元表、键、单元、公式检查及按场景和回复位置检查写入量、读取回复）。“全部构建”会将它们作为一次作业运行。
 - **检查**

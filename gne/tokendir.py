@@ -38,7 +38,7 @@ def resolve_token(engine, spec) -> int:
     if s.lstrip("#").isdigit() and (s.startswith("#") or isinstance(spec, int)):
         t = int(s.lstrip("#"))
         if not 0 <= t < engine.n_vocab:
-            raise GneError("BAD_ARGS", f"token ID {t} 超出词表范围（0〜{engine.n_vocab - 1}）")
+            raise GneError("BAD_ARGS", f"token ID {t} 超出词表范围（0～{engine.n_vocab - 1}）")
         return t
     ids = engine.tokenize(str(spec), add_special=False, parse_special=True)
     if len(ids) != 1:
@@ -152,7 +152,7 @@ def token_direction(session, tokens, *, layers, delta: float, name: str, minus=N
     last = K.last_main_layer(w)
     bad = [L for L in Ls if not 0 <= L < last]
     if bad:
-        raise GneError("BAD_ARGS", f"不能写入层 {bad}（0〜{last - 1}。不含最终层）")
+        raise GneError("BAD_ARGS", f"不能写入层 {bad}（0～{last - 1}。不含最终层）")
     try:
         delta = float(delta)
     except (TypeError, ValueError):
@@ -248,7 +248,7 @@ def token_scan(session, tokens, contrast, *, layers=None, minus=None, deltas: Se
     Ls = sorted({int(L) for L in layers}) if layers else list(range(0, last))
     bad = [L for L in Ls if not 0 <= L < last]
     if bad:
-        raise GneError("BAD_ARGS", f"无法扫描层 {bad}（0〜{last - 1}）")
+        raise GneError("BAD_ARGS", f"无法扫描层 {bad}（0～{last - 1}）")
     ds = sorted({float(x) for x in deltas})
     if not ds or ds[0] <= 0:
         raise GneError("BAD_ARGS", "deltas 必须是大于 0 的数值列表")

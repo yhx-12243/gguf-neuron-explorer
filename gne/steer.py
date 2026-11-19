@@ -328,12 +328,16 @@ class Recipe:
             if u.mode == "keyed":                                         # CHANGE-07
                 self._validate_keyed(u)
                 continue
-            if u.kind in ("ffn", "attn"):
-                raise GneError("BAD_RECIPE", f"{u}: kind {u.kind} 只能用于 keyed（例如 {u.layer}:{u.kind}:keyed:a1@NAME#KEY）")
-            if u.mode == "proj":                                          # CHANGE-06
-                if u.kind != "head" or u.head is None or u.k is None:
-                    raise GneError("BAD_RECIPE", f"{u}: proj 只适用于注意力头，需要 head 与 s"
-                                                 "（例 {layer: 33, kind: head, head: 16, mode: proj, direction: NAME, s: 6}）")
+            if u.kind in ("ffn", "attn") and u.mode != "proj":
+                raise GneError("BAD_RECIPE", f"{u}: kind {u.kind} 只能用于 keyed（例如 {u.layer}:{u.kind}:keyed:a1@NAME#KEY、"
+                                             f"{u.layer}:{u.kind}:s1@NAME)")
+            if u.mode == "proj":                                          # CHANGE-06(ニューロンは v0.8.0、層全体は v0.8.1)
+                if not ((u.kind == "head" and u.head is not None) or (u.kind == "neuron" and u.neuron is not None)
+                        or (u.kind in ("attn", "ffn") and u.head is None and u.neuron is None)) or u.k is None:
+                    raise GneError("BAD_RECIPE", f"{u}: proj 可为注意力头（head）、神经元（neuron）或整层写入（attn、ffn），"
+                                                 "需要 s（例 {layer: 33, kind: head, head: 16, mode: proj, direction: NAME, s: 6}、"
+                                                 "{layer: 20, neuron: 4096, mode: proj, direction: NAME, s: 1}、"
+                                                 "{layer: 20, kind: ffn, mode: proj, direction: NAME, s: 1}）")
                 if not (u.direction or self.default_direction):
                     raise GneError("BAD_RECIPE", f"{u.label()}：proj 需要方向（单元 direction 或配方 default_direction）")
                 if u.direction is not None and not re.fullmatch(r"[\w.\-]+", u.direction):
@@ -448,6 +452,9 @@ _UNIT_RE = re.compile(r"^(\d+):(?:(\d+)|random:(\d+)|dir:([\w.\-@]+)|[Hh](\d+)):
 
 
 _PROJ_RE = re.compile(r"^(\d+):[Hh](\d+):s([+-]?[\d.]+(?:e[+-]?\d+)?)(?:@([\w.\-]+))?$", re.I)
+_PROJN_RE = re.compile(r"^(\d+):N(\d+):s([+-]?[\d.]+(?:e[+-]?\d+)?)(?:@([\w.\-]+))?$", re.I)   # ニューロンの射影(v0.8.0)
+# 層の書き込み全体の射影(v0.8.1): attn = その層の注意の出力全体(attn_output、線形注意の層は ssm_out)、ffn = MLP の出力全体(ffn_down)
+_PROJW_RE = re.compile(r"^(\d+):(attn|ffn):s([+-]?[\d.]+(?:e[+-]?\d+)?)(?:@([\w.\-]+))?$", re.I)
 
 
 _MOE_RE = re.compile(r"^(\d+):(?:E(\d+)|(S)):(?:N(\d+):(x?)|(x)|(route):)([+-]?[\d.]+(?:e[+-]?\d+)?)$", re.I)
@@ -483,6 +490,9 @@ def parse_unit(spec: str) -> Unit:
     MoE(CHANGE-05): 専門家のニューロンは "L:Ee:Nn:dose" / "L:Ee:Nn:xk"、専門家全体は "L:Ee:xk"(x0 で消す)、
     ルーターバイアスは "L:Ee:route:delta"、shared expert のニューロンは "L:S:Nn:dose" / "L:S:Nn:xk"。
     ヘッドの方向成分の射影(CHANGE-06)は "L:Hh:sS@NAME"(例 33:H16:s15.4@tsundere_r)。@NAME を省くとレシピの default_direction。
+    ニューロンの方向成分の射影(ffn_down の列から方向成分を引く)は "L:Nn:sS@NAME"(例 20:N4096:s1@evil)。
+    層の書き込み全体の射影は "L:attn:sS@NAME"(注意の出力全体: attn_output、線形注意の層は ssm_out)と "L:ffn:sS@NAME"
+    (MLP の出力全体: ffn_down)。行列全体から方向成分を引く(W ← W − s r̂ (r̂ᵀW))。
     鍵つきの書き込み(CHANGE-07)は "L:ffn:keyed:aα@DIR#KEY"(例 19:ffn:keyed:a1.25@zundamon_r#zundamon_k)。
     書き込み先は ffn(ffn_down)・attn(attn_output)・S(shared expert)・Ee(専門家 e)。@DIR / #KEY を省くとレシピの
     default_direction / default_key。@-DIR は α の符号に畳む(打ち消し)。KEY は比較用の鍵 NAME~j も可。"""
@@ -514,6 +524,14 @@ def parse_unit(spec: str) -> Unit:
     if mp:
         L, h, sv, dname = mp.groups()
         return Unit(int(L), None, 0.0, "head", mode="proj", k=float(sv), direction=dname, head=int(h))
+    mpn = _PROJN_RE.match(spec.strip())
+    if mpn:
+        L, n, sv, dname = mpn.groups()
+        return Unit(int(L), int(n), 0.0, "neuron", mode="proj", k=float(sv), direction=dname)
+    mpw = _PROJW_RE.match(spec.strip())
+    if mpw:
+        L, where, sv, dname = mpw.groups()
+        return Unit(int(L), None, 0.0, where.lower(), mode="proj", k=float(sv), direction=dname)
     mm = _MOE_RE.match(spec.strip())
     if mm:
         L, e, shared, n, ngain, egain, route, val = mm.groups()
@@ -531,10 +549,12 @@ def parse_unit(spec: str) -> Unit:
     m = _UNIT_RE.match(spec.strip())
     if not m:
         raise GneError("BAD_UNIT", f"无法解析单元指定 {spec!r}",
-                       ("L:N:dose（例：14:8949:+1.0）、L:random:SEED:dose，gain 为 L:N:x2（倍率），方向为 "
-        "L:dir:NAME:dose，注意力头为 L:Hh:xk（例 21:H7:x0），方向分量投影为 L:Hh:sS@NAME（例 "
-        "33:H16:s6@NAME），MoE 为 L:Ee:Nn:dose、L:Ee:xk、L:Ee:route:delta、L:S:Nn:dose；带键写入为 "
-        "L:ffn:keyed:aα@方向#键（attn、S、Ee 也适用） "))
+                       "L:N:dose（例：14:8949:+1.0）、L:random:SEED:dose，gain 为 L:N:x2（倍率），方向为 L:dir:NAME:dose，"
+                       "注意力头为 L:Hh:xk（例 21:H7:x0），方向分量投影为 L:Hh:sS@NAME（例 33:H16:s6@NAME），"
+                       "神经元的方向分量投影 L:Nn:sS@NAME（例 20:N4096:s1@NAME），"
+                       "整层写入的投影 L:attn:sS@NAME、L:ffn:sS@NAME，"
+                       "MoE 为 L:Ee:Nn:dose、L:Ee:xk、L:Ee:route:delta、L:S:Nn:dose；"
+                       "带键写入为 L:ffn:keyed:aα@方向#键（attn、S、Ee 也适用）")
     L, n, seed, dname, head, gain, val = m.groups()
     if head is not None:
         if not gain:

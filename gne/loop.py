@@ -1,14 +1,16 @@
 """同じ層を 2 回実行するモデル(arch sensenova_loop、SenseNova-Loop-9B)の、実行順の層と保存されている層の対応。docs/sensenova_loop.md。
 
 SenseNova-Loop は、保存されている 32 層のうち 4〜27 を 2 回続けて実行する(1 回の計算で 56 層分)。GGUF は実行順の 56 層で
-宣言し(block_count = 56)、重みは 1 回目の層(blk.0〜27)と最後の 4 層(blk.52〜55)だけを持つ。2 回目の層(blk.28〜51)は、
+宣言し(公式の GGUF は block_count = 57。最後の 1 つは MTP の層)、重みは 1 回目の層(blk.0〜27)と最後の 4 層(blk.52〜55)
+だけを持つ。2 回目の層(blk.28〜51)は、
 llama.cpp が読み込むときに 1 回目と同じテンソル(同じ名前)を指す。gne の層の番号は実行順(0〜55)で、グラフの捕捉の名前・
 control vector の番号と同じ。2 回目の層 L の重みは、保存されている層 L − 24 の重み。
 
 各回の中では残差が 2 本の流れになり(mHC: manifold-constrained hyper-connections)、層ごとのルーターが、どちらの流れを
 どれだけ読むか・書くか・混ぜるかを決める。gne は 2 本の平均を残差として読む(回の出口で平均されるので、最終の出力に直結する)。
 
-ここにあるのは GGUF のメタデータ({arch}.mhc.layer_kinds)だけで決まる対応。重みの読み替えは weights.py、捕捉の名前は
+ここにあるのは GGUF のメタデータ(公式の {arch}.loop.* / {arch}.mhc.*、GuideboardLabs 版の {arch}.mhc.layer_kinds)だけで
+決まる対応。重みの読み替えは weights.py、捕捉の名前は
 capture.py、LoRA のテンソル名の写し替えは to_stored(下)。
 """
 
@@ -71,8 +73,10 @@ class LoopPlan:
         return [s, s + self.shift] if self.visit(s) == 1 else [s]
 
     def inner(self, L: int) -> bool:
-        """2 本の流れの中の層(入る層・中の層)。出る層は 2 本を平均した後に control vector が足されるので含めない。"""
-        return self.kinds[int(L)] in (ENTER, INSIDE)
+        """2 本の流れの中の層(入る層・中の層)。出る層は 2 本を平均した後に control vector が足されるので含めない。
+        MTP の層(実行順の層の後ろに付く nextn の層)は含めない。"""
+        L = int(L)
+        return 0 <= L < len(self.kinds) and self.kinds[L] in (ENTER, INSIDE)
 
     def label(self, L: int) -> str:
         """表示: 'L30 = 層 6 の 2 回目'。繰り返しの外なら 'L3'。"""
@@ -108,9 +112,35 @@ def plan_from_kinds(kinds) -> LoopPlan | None:
     return LoopPlan(ks, lo1, lo2, shift)
 
 
+def kinds_from_loop_keys(get, arch: str) -> list[int] | None:
+    """公式の GGUF(OpenSenseNova/llama.cpp の変換)の {arch}.loop.start / end / count と {arch}.mhc.start / end から、
+    実行順の層ごとの種類(layer_kinds と同じ 0 / 1 / 2 / 4)を作る。MTP の層({arch}.nextn_predict_layers)は数えない。
+    鍵が無ければ None。2 回の繰り返しで、2 本の流れの範囲が繰り返しの範囲と同じものだけを扱う。"""
+    start, end, count = (get(f"{arch}.loop.{k}") for k in ("start", "end", "count"))
+    if start is None or end is None or count is None:
+        return None
+    start, end, count = int(start), int(end), int(count)
+    m0, m1 = int(get(f"{arch}.mhc.start", start)), int(get(f"{arch}.mhc.end", end))
+    n_exec = int(get(f"{arch}.block_count", 0) or 0) - int(get(f"{arch}.nextn_predict_layers", 0) or 0)
+    if count != 2 or (m0, m1) != (start, end) or not 0 <= start < end <= n_exec - (end - start):
+        raise GneError("BAD_MODEL", f"循环形状（loop {start}～{end} × {count}、mhc {m0}～{m1}、层 {n_exec}）不是 gne 支持的形式"
+                       "（运行两次、两条流的范围 = 循环范围）")
+    width = end - start
+    kinds = []
+    for il in range(n_exec):
+        p = il if il < start else (start + (il - start) % width if il < end + width else il - width)
+        inside = start <= il < end + width
+        kinds.append(0 if not inside else ENTER if p == start else LEAVE if p == end - 1 else INSIDE)
+    return kinds
+
+
 def plan_of(get, arch: str) -> LoopPlan | None:
-    """GGUF のメタデータを読む関数 get(key) から。同じ層を 2 回実行する arch でなければ None。"""
-    return plan_from_kinds(get(f"{arch}.mhc.layer_kinds")) if arch else None
+    """GGUF のメタデータを読む関数 get(key) から。同じ層を 2 回実行する arch でなければ None。公式の GGUF の
+    loop.* / mhc.* の鍵を先に見て、無ければ GuideboardLabs 版の GGUF の {arch}.mhc.layer_kinds を読む。"""
+    if not arch:
+        return None
+    kinds = kinds_from_loop_keys(get, arch)
+    return plan_from_kinds(kinds if kinds is not None else get(f"{arch}.mhc.layer_kinds"))
 
 
 def stored_tensor_name(weights, name: str) -> str:
@@ -215,8 +245,17 @@ def per_visit_refusal(what: str) -> str:
             "因此无法只作用于其中一次运行。")
 
 
-PER_VISIT_FIX = ("逐次运行搜索得到的结果，可用 gne heads loop-merge 转换为同时作用于两次运行的形式（shared）的配方，这样未打补丁的 llama.cpp 也能"
-                 "使用。逐次运行测量（--score-layers loop、--select-layer）即使不修改 llama.cpp 也可以进行")
+INNER_RESID_WHY = ("此 llama.cpp（官方修改版 OpenSenseNova/llama.cpp，未做修改）不会把两条流内的层"
+                   "（每次运行的入口到出口之前，按执行顺序为 4～26、28～50）的残差保留在图中，因此无法执行读取这些残差的操作"
+                   "（在全部层构建方向、查找基准层、向该层写入 FiSH 等）。")
+INNER_RESID_FIX = ("请使用应用 gne 的 third_party/sensenova-loop/official/0001 后构建的 llama.cpp（它只是为残差和 MLP 输入命名并保留在"
+                   "图中，计算结果不变）。未修改的 llama.cpp 只能读取循环外的层"
+                   "（0～3、52～55）和每次运行的出口（27、51）（例如：--score-layers loop）。如果使用 GuideboardLabs 版的 llama.cpp 和 GGUF，则无需修改也能读取")
+
+PER_VISIT_FIX = ("逐次运行搜索得到的结果，可用 gne heads loop-merge 转换为同时作用于两次运行的形式（shared）的配方，这样即使 llama.cpp 未应用 0002 也能"
+                 "使用。若要分别作用于每次运行，需要使用应用了与所用修改版匹配的 third_party/sensenova-loop/official 或 guideboardlabs 的 0002 后"
+                 "构建的 llama.cpp。"
+                 "逐次运行测量（--score-layers loop、--select-layer）即使不修改 llama.cpp 也可以进行")
 
 
 def twin_effect(s1: float, s2: float, c: float) -> tuple[float, float]:

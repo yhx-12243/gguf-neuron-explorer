@@ -812,7 +812,7 @@ def summary_text(d: dict) -> str:
              key_fit_text(s.get("key_fit"), s.get("ridge")),
              "是否符合公式：" + ("通过" if s["ok"] else "未通过（请用 gne nw verify 查看各层误差）")]
     for g, x in s["check"].items():
-        cells = "  ".join(f"{b}: {a['mean']:+.2f}({a['min']:+.2f}〜{a['max']:+.2f})" for b, a in x["amount"].items())
+        cells = "  ".join(f"{b}: {a['mean']:+.2f}({a['min']:+.2f}～{a['max']:+.2f})" for b, a in x["amount"].items())
         lines.append(f"写入量 [{g}] {x['n']} 个问题，重复 {x['loops']}: {cells}")
     for g, segs in (s.get("twin") or {}).items():
         lines.append(f"另一运行写入 [{g}]（即使权重相同的层也计入写入量。上面的合计包含该部分，按问题取中位数）： "

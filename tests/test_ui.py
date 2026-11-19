@@ -3011,6 +3011,8 @@ def test_pipeline_api_and_panel(pipe_server, browser):
         pg.select_option("#pp-tpl-sel", "small")
         assert "pirate" in pg.evaluate("document.querySelector('#pp-check').textContent")
         _step(pg, "chips", "input")
+        pg.select_option("#pp-rank", "causal")                                    # ヘッド数などは「止めて選ぶ」だけで使う(既定の書き込みの量では無効)
+        _step(pg, "chips", "input")
         pg.fill("#pp-nheads", "3,2")
         _step(pg, "chips", "input")
         pg.fill("#pp-mx", "8")
@@ -3027,6 +3029,7 @@ def test_pipeline_api_and_panel(pipe_server, browser):
         assert len(pp) == 2 and pp[1]["params"]["yes"] is True                           # 見積もりを確かめてから投げ直す
         p = pp[0]["params"]
         assert (p["n_heads"], p["max_examples"], p["top_layers"], p["hard"], p["positions"]) == ([3, 2], 8, 1, 4, "last") and "target" not in p
+        assert p["rank"] == "causal" and not ({"unit_kinds", "n_units", "verify_top", "check_replies", "holdout"} & set(p))
         assert p["spec"]["name"] == "pirate" and len(p["spec"]["user_prompts"]) == 8
         # 目標の欄: 数のほかに B(B 側の平均)と mid。読めない書き方は投げない
         for v, want in (("b", "B"), ("mid", "mid"), ("-3.5", -3.5)):
@@ -3038,6 +3041,276 @@ def test_pipeline_api_and_panel(pipe_server, browser):
         assert pg.evaluate("window.gne.directionView.pipe.params()") is None
         _step(pg, "chips", "input")
         pg.fill("#pp-target", "")
+        if lang == "en":
+            assert pg.evaluate("[...window.gneI18n.missing]") == []
+        assert not errors, errors
+        pg.close()
+
+
+# --- 一括の rank writes の結果(全部の部品を書き込みの量で並べる、v0.8.0)------------------------------------------------------
+
+def _seed_pipeline_writes(s, name: str = "ppw") -> dict:
+    """rank writes の一括の結果(Session.heads_pipeline の出力の形)。組にはヘッドとニューロン(L:Nn:sS@NAME)が入る。"""
+    import yaml
+    m = s.meta
+    hd = s.store.heads_dir(m.model_id)
+    hd.mkdir(parents=True, exist_ok=True)
+    spec = {"name": name, "system_a": "You are a pirate.", "system_b": "You are a helpful assistant.",
+            "user_prompts": [f"Question {i}?" for i in range(6)]}
+    cp = s.store.contrast_dir() / f"{name}.yaml"
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    cp.write_text(yaml.safe_dump(spec))
+    units = {4: [f"12:H5:s2@{name}", f"14:N100:s2@{name}", f"13:N7:s2@{name}", f"12:H3:s2@{name}"], 2: [f"12:H5:s1@{name}", f"14:N100:s1@{name}"]}
+
+    def unit_yaml(u):
+        L, who, sv = u.split(":")[0], u.split(":")[1], float(u.split(":s")[1].split("@")[0])
+        return ({"layer": int(L), "neuron": int(who[1:]), "mode": "proj", "s": sv} if who[0] == "N"
+                else {"layer": int(L), "kind": "head", "mode": "proj", "head": int(who[1:]), "s": sv})
+    for n, us in units.items():
+        (hd / f"{name}.alloc-n{n}.yaml").write_text(yaml.safe_dump({"name": f"{name}-n{n}", "model_id": m.model_id, "default_direction": name,
+                                                                  "units": [unit_yaml(u) for u in us]}))
+
+    def heads_of(us):
+        out = []
+        for u in us:
+            L, who, sv = int(u.split(":")[0]), u.split(":")[1], float(u.split(":s")[1].split("@")[0])
+            out.append({"layer": L, "head": int(who[1:]), "kind": "neuron" if who[0] == "N" else "attn", "s": sv})
+        return out
+    vrow = lambda lab, kind, L, i, sc, gd: {"label": lab, "layer": L, "index": i, "kind": kind, "score": sc, "share": sc / 40, "own": sc,  # noqa: E731
+                                            "sampled": False, "mode": "proj", "score_drop": {"20": gd}, "causal": gd, "causal_max": gd,
+                                            "b_side_delta": 0.1, "drift_orth_b": 0.02, "gap_drop": gd + 0.1, "effect": gd - 0.1,
+                                            "excluded": False, "seconds": 0.5}
+    out = {
+        "name": name, "contrast": str(cp), "n_prompts": 6,
+        "sides": {"A": {"system": "You are a pirate.", "recipe": None}, "B": {"system": "You are a helpful assistant.", "recipe": None}},
+        "settings": {"positions": "last", "score_positions": "last", "target": "B", "n_heads": [6, 5, 4], "hard": 16, "top_layers": 4,
+                     "max_examples": 64, "s_max": 30.0, "direction_layer": "own", "rank": "writes", "unit_kinds": "all",
+                     "verify_top": 64, "verify_sample": 16, "verify_mode": "proj", "n_units": [4, 2], "check_replies": None, "check_tokens": 512},
+        "direction": {"path": "x.npz", "positions": "last", "n_rows": {"A": 6, "B": 6}, "seconds": 1.0},
+        "score": {"base_layer": 14, "best_layer": 14, "n": {"A": 6, "B": 6}, "seconds": 1.0,
+                  "layers": [{"layer": L, "cohen_d": 5.0 - abs(L - 14) * 0.3, "cos_base": 1.0 - abs(L - 14) * 0.05, "A": 3.0, "B": -3.0}
+                             for L in range(1, s.meta.n_layer - 1)]},
+        "writes": {"select_layer": 20, "kinds": ["attn", "linear", "neuron"], "n": {"A": 6, "B": 6}, "skipped_long": {"A": 0, "B": 0},
+                   "gap": 40.0, "base": {"A": 30.0, "B": -10.0}, "n_units": {"attn": 320, "linear": 0, "neuron": 60000},
+                   "totals": {"attn": 12.0, "linear": 0.0, "neuron": 20.0}, "totals_share": {"attn": 0.3, "linear": 0.0, "neuron": 0.5},
+                   "check": {"attn_rel_max": 0.01, "mlp_rel_max": 0.004, "layer_rel_median": 0.003, "layer_rel_max": 0.005},
+                   "seconds": 3.0, "path": str(hd / f"{name}.writes.json"), "npz": str(hd / f"{name}.writes.npz")},
+        "verify": {"mode": "proj", "n": 3, "kinds": {"attn": 2, "linear": 0, "neuron": 1},
+                   "spearman": {"all": {"n": 3, "score_vs_gap_drop": 0.5, "score_vs_a_drop": 0.5, "score_vs_effect": 0.5}},
+                   "excluded": [], "seconds": 4.0,
+                   "top": [vrow("12:H5", "attn", 12, 5, 3.0, 2.5), vrow("14:N100", "neuron", 14, 100, 2.0, 1.8), vrow("12:H3", "attn", 12, 3, 1.0, 1.2)]},
+        "causal": {"score_layers": [14, 20], "primary": 20, "n_a": 6, "n_b": 6,
+                   "base_scores": {"14": {"A": 10.0, "B": -3.0}, "20": {"A": 30.0, "B": -10.0}}},
+        "allocate": {"name": name, "direction": name, "score_layer": 20, "score_layers": [14, 20], "target": -10.0, "n_a": 6, "n_b": 6,
+                     "method": "unit1", "pool": 3, "trace": [], "initial": None, "recommended": 2,
+                     "table": [{"n_heads": n, "n_units": n, "n_used": len(us), "units": us, "heads": heads_of(us),
+                                "kinds": {"attn": sum(1 for u in us if ":H" in u), "linear": 0, "neuron": sum(1 for u in us if ":N" in u)},
+                                "s_max": float(us[0].split(":s")[1].split("@")[0]), "s_median": float(us[0].split(":s")[1].split("@")[0]),
+                                "alpha": float(us[0].split(":s")[1].split("@")[0]), "stop": "target" if n == 2 else "raised",
+                                "reached": True, "remain": 1, "a_max": 2.0, "a_mean": -9.0, "b_mean": -10.0, "b_side_delta": 0.2,
+                                "b_drift_par": 0.01, "b_drift_orth": 0.05, "recipe": str(hd / f"{name}.alloc-n{n}.yaml"), "seconds": 3.0,
+                                "recommended": n == 2} for n, us in units.items()]},
+        "check": {"n": {"A": 6, "B": 6}, "max_tokens": 512, "match": "arr", "held_out": {"A": False, "B": False}, "a_changed": 0,
+                  "note": "射影の値は目標に届いても、A 側の応答の一致はほとんど減っていません(振る舞いが変わっていない可能性)",
+                  "rows": {k: {side: {"n": 6, "finished": 5, "match_finished": 4 if side == "A" else 0, "empty": 0, "loop": 0, "at_limit": 1}
+                               for side in "AB"} for k in ("none", "recipe")}, "n_heads": 2, "recommended": True},
+        "target": -10.0, "target_from": "B 側の平均",
+        "recommended": {"n_heads": 2, "units": units[2], "recipe": str(hd / f"{name}.alloc-n2.yaml")}, "seconds": 20.0}
+    (hd / f"{name}.pipeline.json").write_text(json.dumps(out, ensure_ascii=False))
+    return out
+
+
+def _seed_pipeline_writes_081(s, name: str = "ppw81") -> dict:
+    """v0.8.1 の形の rank writes の結果: 倍率ごとの点(raise)、倍率を上げる前の組(allocate.s1)、どれも届かないので組の効きで推した組
+    (上限 4 は B 側が A 側へ動いて止めた)。"""
+    out = _seed_pipeline_writes(s, name)
+    hd = s.store.heads_dir(s.meta.model_id)
+    al = out["allocate"]
+    pt = lambda a, am, bd, bo, ok=True: {"alpha": a, "a_mean": am, "b_delta": bd, "b_toward": bd / 40, "b_orth": bo,  # noqa: E731
+                                         "effect": 30 - am - abs(bd), "feasible": ok, "over": None if ok else "b_move", "phase": "grid"}
+    for r in al["table"]:
+        r.update(reached=False, recommended=r["n_heads"] == 4, effect=20.0 if r["n_heads"] == 4 else 12.0, feasible=True, b_toward=0.01)
+        r["raise"] = [dict(pt(1.0, 14.0, 0.2, 0.02), phase="s1"), pt(1.41, 12.0, 0.6, 0.03), pt(1.97, 9.5, 1.0, 0.04), pt(2.77, 8.0, 6.0, 0.05, False)]
+        r["stop"] = "b_move" if r["n_heads"] == 4 else "no_gain"
+    us = [f"12:H5:s1@{name}", f"14:N100:s1@{name}", f"13:N7:s1@{name}", f"12:H3:s1@{name}"]
+    (hd / f"{name}.alloc-s1.yaml").write_text((hd / f"{name}.alloc-n4.yaml").read_text().replace("s: 2.0", "s: 1.0"))
+    al.update(recommended=4, recommended_by="best_effect", b_move_max=0.1, drift_max=0.5,
+              s1={"n_heads": 4, "n_used": 4, "units": us, "heads": [dict(h, s=1.0) for h in al["table"][0]["heads"]],
+                  "kinds": al["table"][0]["kinds"], "s_max": 1.0, "s_median": 1.0, "alpha": 1.0, "reached": False, "remain": 5,
+                  "a_mean": 14.0, "b_side_delta": 0.2, "b_drift_orth": 0.02, "effect": 15.8, "recipe": str(hd / f"{name}.alloc-s1.yaml")})
+    out["recommended"] = {"n_heads": 4, "units": al["table"][0]["units"], "recipe": al["table"][0]["recipe"], "reached": False,
+                          "by": "best_effect"}
+    # 層全体の部品(L13 attn)、選ぶのに使っていない質問での数(holdout)、層ごとの直接の書き込み
+    al["table"][0]["heads"][2] = {"layer": 13, "head": -1, "kind": "layer_attn", "s": 2.0}
+    al["table"][0]["kinds"] = {**al["table"][0]["kinds"], "layer_attn": 1}
+    for r in al["table"]:
+        r["holdout"] = {"a_mean": -2.0, "remain": 2, "b_side_delta": 0.3, "b_toward": 0.01, "b_drift_orth": 0.06, "effect": 31.7, "reached": False}
+    al["holdout"] = out["holdout"] = {"contrast": "x.yaml", "n_a": 3, "n_b": 3, "target": -9.5, "base_a_mean": 29.0, "base_b_mean": -9.5}
+    out["writes"]["layer_scores"] = [{"layer": 13, "attn": 4.0, "mlp": 6.0, "attn_share": 0.1, "mlp_share": 0.15},
+                                     {"layer": 12, "attn": 2.0, "mlp": 1.0, "attn_share": 0.05, "mlp_share": 0.025}]
+    out["spec"] = {"name": name, "system_a": "You are a pirate.", "system_b": "You are a helpful assistant.",
+                   "user_prompts": [f"Question {i}?" for i in range(6)]}            # 「入力欄に戻す」で、JSON と、その実行の設定を欄に戻す
+    out["settings"].update(n_units=[8, 3], verify_top=20, check_replies=0, check_tokens=128, holdout=True, unit_kinds="heads,layers")
+    (hd / f"{name}.pipeline.json").write_text(json.dumps(out, ensure_ascii=False))
+    return out
+
+
+@pytest.fixture(scope="module")
+def pipe_writes_server(tmp_path_factory):
+    """rank writes の一括の結果を開くテスト用のサーバ(CPU)。"""
+    if not MODEL.exists():
+        pytest.skip("モデルがありません")
+    from gne.api import Session
+    s = Session(MODEL, root=tmp_path_factory.mktemp("ui_pipe_w"), n_ctx=2048, n_seq_max=4, n_gpu_layers=0)
+    _seed_pipeline_writes(s)
+    _seed_pipeline_writes_081(s)
+    yield from _serve(s)
+
+
+@pytest.mark.model
+def test_pipeline_writes_result_panel(pipe_writes_server, browser):
+    """rank writes の結果: 3〜6 の段(順位づけ・1 個ずつの確かめ・s=1 からの組・応答での確かめ)を出し、組の行からヘッドとニューロンの
+    ユニットでレシピを置き換えられる。地図の「効き」のボタンは出さない。候補の探し方の欄が設定に戻る。英語の文言もすべて辞書にある。"""
+    url = pipe_writes_server
+    for lang in ("ja", "en"):
+        pg = browser.new_page(viewport={"width": 1600, "height": 1000})
+        errors = []
+        pg.on("pageerror", lambda e: errors.append(str(e)))
+        _dialogs(pg)
+        pg.goto(url + f"/?lang={lang}")
+        pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+        pg.evaluate("window.gne.recipe.clear(); try { localStorage.removeItem('gne.pipeline.draft') } catch {}")
+        pg.click("#views button[data-view=chips]")
+        pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode === 'pipe'", timeout=60000)
+        _step(pg, "chips", "past")
+        pg.wait_for_selector("#pp-past tr[data-pp=ppw]", timeout=30000)
+        pg.click("#pp-past tr[data-pp=ppw]")
+        _step(pg, "chips", "alloc")
+        pg.wait_for_selector("#pp-result table.pp-cmp", timeout=30000)
+        res = "#pp-result"
+        assert pg.evaluate(f"document.querySelectorAll('{res} section.pp-stage').length") == 5          # 1 + 3〜6
+        assert pg.evaluate(f"document.querySelectorAll('{res} table.pp-top tbody tr').length") == 3
+        assert pg.evaluate(f"document.querySelector('{res} #pp-map')") is None
+        assert "--rank writes" in pg.evaluate(f"document.querySelector('{res} .pp-res-head').innerText")   # どちらの選び方で流したか
+        assert pg.evaluate("[document.querySelector('#pp-rank').value, document.querySelector('#pp-kinds').value]") == ["writes", "heads"]
+        cmp = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp tbody tr')].map(tr => [tr.className, tr.dataset.n || ''])")
+        assert cmp == [["", "4"], ["rec", "2"]]
+        txt = pg.evaluate(f"document.querySelector('{res} table.pp-cmp').innerText")
+        assert "L14 N100" in txt and "L12 H5" in txt
+        _step(pg, "chips", "alloc")
+        pg.click(f"{res} table.pp-cmp [data-load='2']")
+        assert pg.evaluate("window.gne.recipe.specs()") == ["12:H5:s1@ppw", "14:N100:s1@ppw"]
+        assert pg.evaluate("window.gne.recipe.skipped") == 0
+        if lang == "en":
+            assert pg.evaluate("[...window.gneI18n.missing]") == []
+        assert not errors, errors
+        pg.close()
+
+
+@pytest.mark.model
+def test_pipeline_writes_raise_trace_panel(pipe_writes_server, browser):
+    """v0.8.1: 組の表のいちばん上に倍率を上げる前の組(s=1)の行、各行に倍率ごとの A 平均・B Δ・B ⊥、止めた理由(B 側が A 側へ動く /
+    上げても良くならない)、見出しに「どれも目標に届かないので組の効きで推した」。s=1 の行からレシピを置き換えられる。"""
+    url = pipe_writes_server
+    for lang in ("ja", "en"):
+        pg = browser.new_page(viewport={"width": 1600, "height": 1000})
+        errors = []
+        pg.on("pageerror", lambda e: errors.append(str(e)))
+        _dialogs(pg)
+        pg.goto(url + f"/?lang={lang}")
+        pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+        pg.evaluate("window.gne.recipe.clear(); try { localStorage.removeItem('gne.pipeline.draft') } catch {}")
+        pg.click("#views button[data-view=chips]")
+        pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode === 'pipe'", timeout=60000)
+        _step(pg, "chips", "past")
+        pg.wait_for_selector("#pp-past tr[data-pp=ppw81]", timeout=30000)
+        pg.click("#pp-past tr[data-pp=ppw81]")
+        _step(pg, "chips", "alloc")
+        pg.wait_for_selector("#pp-result table.pp-cmp", timeout=30000)
+        res = "#pp-result"
+        rows = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp > tbody > tr')].map(tr => [tr.className, tr.dataset.n || ''])")
+        assert rows == [["pp-s1", ""], ["rec", "4"], ["", "2"]]
+        assert pg.evaluate(f"document.querySelectorAll('{res} table.pp-cmp details').length") == 2
+        txt = pg.evaluate(f"document.querySelector('{res} table.pp-cmp').innerText")
+        head = pg.evaluate(f"document.querySelector('{res} .pp-res-head').innerText")
+        assert "L13 attn" in txt                                                           # 層全体の部品
+        if lang == "ja":
+            assert "B 側が A 側へ動くので止めた" in txt and "上げても良くならないので止めた" in txt and "倍率を上げる前" in txt
+            assert "どれも目標に届かないので" in head and "選ぶのに使っていない質問" in txt
+            whole = pg.evaluate(f"document.querySelector('{res}').textContent")              # 段の表示を畳んでいても見る
+            assert "層ごとの直接の書き込み" in whole and "L13" in whole and "質問を半分に分けました" in whole
+        _step(pg, "chips", "alloc")
+        pg.click(f"{res} table.pp-cmp [data-load='s1']")
+        assert pg.evaluate("window.gne.recipe.specs()") == ["12:H5:s1@ppw81", "14:N100:s1@ppw81", "13:N7:s1@ppw81", "12:H3:s1@ppw81"]
+        if lang == "en":
+            assert pg.evaluate("[...window.gneI18n.missing]") == []
+        assert not errors, errors
+        pg.close()
+
+
+@pytest.mark.model
+def test_pipeline_writes_fields(pipe_writes_server, browser):
+    """v0.8.2: rank writes の設定の欄(組の大きさの上限・確かめる部品の数・応答での確かめ・質問を分ける・ループの中の部品の方向)。
+    候補の探し方で使わないまとまりは無効になり、ジョブの引数には使う欄の値だけが入る。JSON の pipeline の値は読み込んだときに欄に入り、
+    欄を書き換えれば欄の値が使われる。過去の結果の「入力欄に戻す」でその実行の設定が欄に入る。ループの中の部品の方向は、
+    同じ層を 2 回実行するモデルのときだけ選べる。英語の文言もすべて辞書にある。"""
+    url = pipe_writes_server
+    for lang in ("ja", "en"):
+        pg = browser.new_page(viewport={"width": 1600, "height": 1000})
+        errors = []
+        pg.on("pageerror", lambda e: errors.append(str(e)))
+        _dialogs(pg)
+        pg.goto(url + f"/?lang={lang}")
+        pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+        pg.evaluate("window.gne.recipe.clear(); try { localStorage.removeItem('gne.pipeline.draft') } catch {}")
+        pg.click("#views button[data-view=chips]")
+        pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode === 'pipe'", timeout=60000)
+        dis = "[document.querySelector('#pp-fs-writes').disabled, document.querySelector('#pp-fs-causal').disabled, " \
+              "document.querySelector('#pp-fs-writes-off').hidden, document.querySelector('#pp-fs-causal-off').hidden]"
+        assert pg.evaluate(dis) == [False, True, True, False]                          # 既定(書き込みの量): 止めて選ぶ用の欄は無効
+        assert pg.evaluate("[document.querySelector('#pp-loopdir').disabled, document.querySelector('#pp-loopdir-off').hidden]") == [True, False]
+        for sel in ("#pp-nunits", "#pp-vtop", "#pp-ckn", "#pp-ckt", "#pp-holdout", "#pp-loopdir", "#pp-nheads", "#pp-tl", "#pp-hard"):
+            assert pg.evaluate(f"!!document.querySelector('{sel}').closest('label').title"), sel   # どの欄にも短い説明
+        assert pg.evaluate("document.querySelector('#pp-prio').textContent").strip()
+        spec = {"name": "fw", "system_a": "You are a pirate.", "system_b": "You are a helpful assistant.",
+                "user_prompts": [f"Question {i}?" for i in range(6)],
+                "pipeline": {"n_units": [8, 4], "verify_top": 12, "holdout": True, "check_replies": 0, "check_tokens": 64, "unit_kinds": "all"}}
+        _step(pg, "chips", "input")
+        pg.fill("#pp-text", json.dumps(spec))
+        pg.dispatch_event("#pp-text", "input")
+        vals = "[...['#pp-nunits', '#pp-vtop', '#pp-ckn', '#pp-ckt', '#pp-kinds']].map(s => document.querySelector(s).value)"
+        assert pg.evaluate(vals) == ["8,4", "12", "0", "64", "all"] and pg.evaluate("document.querySelector('#pp-holdout').checked")
+        p = pg.evaluate("window.gne.directionView.pipe.params()")
+        assert (p["rank"], p["n_units"], p["verify_top"], p["holdout"], p["check_replies"], p["check_tokens"], p["unit_kinds"]) == \
+            ("writes", [8, 4], 12, True, 0, 64, "all")
+        assert not ({"n_heads", "top_layers", "hard", "loop_direction"} & set(p))      # 止めて選ぶ用の欄・ループのモデルだけの欄は渡さない
+        pg.evaluate("document.querySelector('#pp-more').open = true")
+        pg.fill("#pp-vtop", "20")                                                     # 欄を書き換えれば欄の値(JSON の pipeline より優先)
+        pg.click("#pp-holdout")
+        p = pg.evaluate("window.gne.directionView.pipe.params()")
+        assert p["verify_top"] == 20 and p["holdout"] is False
+        pg.fill("#pp-nunits", "8,x")
+        assert pg.evaluate("window.gne.directionView.pipe.params()") is None          # 読めない値は投げない
+        pg.fill("#pp-nunits", "8,4")
+        pg.select_option("#pp-rank", "causal")                                       # 止めて選ぶ: 書き込みの量の欄は無効、渡すのは止めて選ぶ用の欄
+        assert pg.evaluate(dis) == [True, False, False, True]
+        p = pg.evaluate("window.gne.directionView.pipe.params()")
+        assert p["rank"] == "causal" and p["n_heads"] == [6, 5, 4] and not ({"n_units", "verify_top", "holdout", "unit_kinds"} & set(p))
+        pg.select_option("#pp-rank", "writes")
+        pg.evaluate("const v = window.gne.directionView.pipe; v.isLoop = () => true; v.rankFields()")   # 同じ層を 2 回実行するモデル
+        assert not pg.evaluate("document.querySelector('#pp-loopdir').disabled")
+        pg.select_option("#pp-loopdir", "second")
+        assert pg.evaluate("window.gne.directionView.pipe.params().loop_direction") == "second"
+        pg.evaluate("const v = window.gne.directionView.pipe; v.isLoop = () => false; v.rankFields()")
+        # 過去の結果の「入力欄に戻す」: JSON と、その実行の設定が欄に入る
+        _step(pg, "chips", "past")
+        pg.wait_for_selector("#pp-past tr[data-pp=ppw81]", timeout=30000)
+        pg.click("#pp-past tr[data-pp=ppw81]")
+        _step(pg, "chips", "alloc")
+        pg.wait_for_selector("#pp-respec", timeout=30000)
+        pg.click("#pp-respec")
+        assert pg.evaluate(vals) == ["8,3", "20", "0", "128", "heads,layers"] and pg.evaluate("document.querySelector('#pp-holdout').checked")
+        assert pg.evaluate("document.querySelector('#pp-rank').value") == "writes" and pg.evaluate(dis)[:2] == [False, True]
         if lang == "en":
             assert pg.evaluate("[...window.gneI18n.missing]") == []
         assert not errors, errors

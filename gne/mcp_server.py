@@ -119,7 +119,7 @@ gguf-neuron-explorer：研究 llama.cpp 上 GGUF 模型的 MLP 神经元，推�
    按分段统计的误写入问题数与平均写入量，以及仅位置 0 的数量）按组检查泄漏。
 11. 混合会话形式（第 2 轮及以后、带 system 提示词）的键：在对照集中混合多轮会话，以及仅该问题带 system（在开头放
    {"role": "system"}）的会话后创建。前文 assistant 回复若为 content: null，则由无干预模型填充（可用 nw_prior 查看
-   填充后的对照集）。只用第 1 轮创建的键，在第 2 轮及以后、带 system 提示词时会降到 69〜78%（Qwen3.5-4B）。
+   填充后的对照集）。只用第 1 轮创建的键，在第 2 轮及以后、带 system 提示词时会降到 69～78%（Qwen3.5-4B）。
    输入路由（用结束 token 不回复、用标记进行附和）时，用 direction_token_scan 选择层和 Δ，再用
    fish_pipeline(token、token_delta、segments="0"、key_fit="ridge"、alpha=1) 创建。可用 steer 的 first_token
    固定回复开头来定位问题。
@@ -466,18 +466,47 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             return _err(e)
 
     @srv.tool()
+    async def heads_writes(name: str, contrast: str | None = None, select_layer: int | None = None, unit_kinds: str = "all",
+                           verify_top: int = 64, verify_mode: str = "proj", max_examples: int | None = None) -> dict:
+        """全部の部品(注意ヘッド・線形注意のヘッド・MLP のニューロン)を、方向 name への書き込みの量で順位づけするジョブを投げる
+        (job_status で結果。生成なし)。質問 1 問につき 1 回流し、点数 = 選ぶ層(既定は最後に測れる層)での「s=1 の射影で直接に
+        縮まる A と B の差」。上位 verify_top 個を 1 個ずつ s=1 で射影して(verify_mode="ablate" なら止めて)確かめ、点数との順位相関を
+        返す。直接の書き込みしか見ないので、後ろの書き手を動かしているだけの部品は見落とす。層ごとの更新のベクトルは .writes.npz。"""
+        try:
+            p = {"direction": name, "select_layer": select_layer, "kinds": unit_kinds, "verify_top": verify_top,
+                 "verify_mode": verify_mode, "max_examples": max_examples,
+                 "contrast": None if contrast is None else str(_contrast_path(session, contrast, None, None, None, None))}
+            return jobs.start("heads_writes", {k: v for k, v in p.items() if v is not None}).view()
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @srv.tool()
     async def heads_pipeline(spec: dict[str, Any] | str, target: float | str | None = None, n_heads: list[int] | None = None,
-                             max_examples: int | None = None, resume: bool = True) -> dict:
+                             max_examples: int | None = None, resume: bool = True, rank: str | None = None,
+                             unit_kinds: str | None = None, n_units: list[int] | None = None,
+                             check_replies: int | None = None, holdout: bool | None = None,
+                             loop_direction: str | None = None) -> dict:
         """対照集合(name・user_prompts か側ごとの質問 prompts_a / prompts_b・system_a / system_b か recipe_a / recipe_b、
         任意で pipeline の設定。表か JSON / YAML の
-        パス)から、方向づくり → 基準層 → 因果スクリーニング → 強さの配分(効き目に比例した最初の組 → 効率で配り直す →
-        ヘッド数の比較)をジョブで 1 回で回す(job_status で結果)。質問は何百個でもよく、止めて測る段階は max_examples 個
+        パス)から、方向づくり → 基準層 → 候補づくり → 強さの配分 をジョブで 1 回で回す(job_status で結果)。質問は何百個でもよく、止めて測る段階は max_examples 個
         (既定 64)に間引く。target は数か "B"(B 側の平均まで消す)か "mid"(省いたときの既定、A と B の真ん中)。
         真ん中では振る舞いが半分ほどしか消えないことが多いので、消し切りたいときは "B"。結果の recommended が推す組のレシピ。resume(既定 True)なら、
-        同じ対照集合・同じ設定で作り済みの方向と因果の結果を使い回す(止めて流し直したとき、配分からやり直せる)。"""
+        同じ対照集合・同じ設定で作り済みの方向と因果の結果を使い回す(止めて流し直したとき、配分からやり直せる)。
+        3 段目からは 2 通り。rank="writes"(既定): 全部の部品(注意ヘッド・線形注意のヘッド。unit_kinds="all" で MLP のニューロンも)を
+        方向への書き込みの量で順位づけ → 上位を 1 個ずつ s=1 で射影して確かめる → 効き目の大きい順に s=1 で組に足し、足りなければ全体の
+        強さを上げる(n_units が組の部品の数の上限、既定 [24, 12, 6]。B 側が A 側へ動く量と直交成分のずれに上限があり、倍率ごとの
+        A 平均・B Δ・B ⊥ は allocate.table[].raise、上げる前の組は allocate.s1)→ 選んだ組で応答を書かせて validate.match を数える(check_replies 問、
+        既定 16、0 で切る)。どの組も目標に届かなければ、組の効き(A 側の下がり − B 側の動きの大きさ)がいちばん大きい組を推す
+        (recommended.reached が false)。推す組が無ければ no_recommend に理由と次の手。rank="causal" は v0.7.0 までの流れ(因果スクリーニング → 効率で配り直す。n_heads はこちらだけ)。
+        応答での確かめで A 側がほとんど変わらない(check.suggest)ときは、もう一方の rank も試す。結果の rank がどちらで流したか。
+        unit_kinds は heads / all / neurons / layers(層の注意の出力全体・MLP の出力全体、ユニット "L:attn:sS@NAME"・"L:ffn:sS@NAME")と、
+        そのカンマ区切り(例 "heads,layers")。holdout=True で質問を半分に分け、偶数番目で選び、奇数番目(選ぶのに使っていない質問)で
+        表の数(allocate.table[].holdout)と応答の確かめを測る。loop_direction は重みを 2 回使うモデルでループの中の部品に使う方向の段
+        (first / second)。"""
         try:
             p = {"spec": spec, "target": target, "n_heads": n_heads, "max_examples": max_examples,
-                 "resume": None if resume else False}
+                 "resume": None if resume else False, "rank": rank, "unit_kinds": unit_kinds, "n_units": n_units,
+                 "check_replies": check_replies, "holdout": holdout, "loop_direction": loop_direction}
             return jobs.start("head_pipeline", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -502,13 +531,16 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             return _err(e)
 
     @srv.tool()
-    async def heads_refine(name: str, n_heads: int | None = None, new_heads: list[int] | None = None, resume: bool = True) -> dict:
+    async def heads_refine(name: str, n_heads: int | None = None, new_heads: list[int] | None = None, resume: bool = True,
+                           rank: str | None = None, unit_kinds: str | None = None) -> dict:
         """組を当てても目標まで下がらない A 側の質問(残り)だけで、追加のヘッドを探すジョブを投げる(job_status で結果)。
         name は一括(heads_pipeline)か heads_allocate の名前、n_heads は残りを測る組(既定は推す組)。残りの質問と B 側の質問で、
         組を当てたまま方向を作り直し(方向 <name>_rK)、基準層 → 因果 → 配分で足すヘッドと強さ(new_heads、既定 [3, 2, 1])を決め、
-        元の組と合わせたレシピ(combined.recipe)を作って、元の方向で残りの数(remain_before → remain_after)と B 側のずれを測り直す。"""
+        元の組と合わせたレシピ(combined.recipe)を作って、元の方向で残りの数(remain_before → remain_after)と B 側のずれを測り直す。
+        rank="writes"(元の一括が writes なら既定でも)は、足す部品にニューロンも選べる(unit_kinds、new_heads は部品の数の上限)。"""
         try:
-            p = {"name": name, "n_heads": n_heads, "new_heads": new_heads, "resume": None if resume else False}
+            p = {"name": name, "n_heads": n_heads, "new_heads": new_heads, "resume": None if resume else False,
+                 "rank": rank, "unit_kinds": unit_kinds}
             return jobs.start("heads_refine", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1274,7 +1306,7 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def job_start(kind: str, params: dict[str, Any] | None = None, workers: str | None = None) -> dict:
-        """提交长时间处理。kind: stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast / heads_causal / heads_allocate / head_pipeline / heads_candidates / heads_refine / headproj_export / fieldtest / direction_key / direction_key_check / direction_key_experts / direction_key_pipeline / direction_key_verify / direction_key_causal / direction_key_causal_verify / behave。
+        """提交长时间处理。kind: stats_resid / stats_act / lens_logit / lens_steer / sweep / rank / reverse / eval / direction / ablate / heads_contrast / heads_causal / heads_allocate / heads_writes / head_pipeline / heads_candidates / heads_refine / headproj_export / fieldtest / direction_key / direction_key_check / direction_key_experts / direction_key_pipeline / direction_key_verify / direction_key_causal / direction_key_causal_verify / behave。
         params 是 gne.api 中同名方法的参数（例 sweep：{"layer": 22, "neurons": "random:64", "design": "quick"}）。
         预计超过 30 分钟的任务不会运行，而是返回 NEEDS_CONFIRM 与估算。在 params 中加入 budget("30m" 等)可按预算
         缩小范围（lens_steer 取靠近方向的上位神经元，sweep 用 quick 设计取 steer lens 前几名，reverse 减少

@@ -22,6 +22,20 @@ import numpy as np
 from .steer import GneError, Recipe
 
 
+def _idx(u) -> int:
+    """proj のユニットの番号(ヘッドはヘッドの番号、ニューロンはニューロンの番号、層全体の attn・ffn は −1)。"""
+    if u.kind in ("attn", "ffn"):
+        return -1
+    return int(u.neuron) if u.kind == "neuron" else int(u.head)
+
+
+def _vkey(lp, u) -> str:
+    """loop_visits の鍵: ヘッドは "21:H20"(今までと同じ)、ニューロンは "21:N4096"、層全体は "21:attn" / "21:ffn"。"""
+    if u.kind in ("attn", "ffn"):
+        return f"{lp.stored(int(u.layer))}:{u.kind}"
+    return f"{lp.stored(int(u.layer))}:{'N' if u.kind == 'neuron' else 'H'}{_idx(u)}"
+
+
 def _plan(session):
     lp = session.weights.loop
     if lp is None:
@@ -126,7 +140,7 @@ def loop_pipeline(session, spec, *, n_first: int = 3, n_second: int = 3, target=
                   how: str = "max", resume: bool = True, **pipe_over) -> dict:
     """1 回目で効くヘッドを選ぶ(段 0〜27 の候補、段 27 の射影の値で選ぶ)→ その組を 1 回目だけに当てた状態で、2 回目で効くヘッドを
     選ぶ(段 28〜53 の候補、段 54 で選ぶ)→ 2 つを合わせて、両方の回に当てるレシピに直して測り直す(loop_merge)。
-    どちらの段も heads pipeline(方向 → 基準層 → 因果 → 配分)。2 段目は、1 段目の組を対照集合の両側に重ねて当てる。"""
+    どちらの段も heads pipeline の rank causal(方向 → 基準層 → 因果 → 配分)。2 段目は、1 段目の組を対照集合の両側に重ねて当てる。"""
     import yaml
     lp = _plan(session)
     require_per_visit(session, "分别选择第一次和第二次运行注意力头的流程")
@@ -144,6 +158,9 @@ def loop_pipeline(session, spec, *, n_first: int = 3, n_second: int = 3, target=
         base_pipe.pop(k, None)
     base_pipe.update({k: v for k, v in pipe_over.items() if v is not None})
     base_pipe["target"] = target
+    # 2 段の流れは、回ごとの候補の層(candidate_layers)と、その回の出口の層での因果スクリーニングで作ったもの。
+    # 一括の既定(v0.8.0 から rank writes)に関係なく、v0.7.0 までの選び方(rank causal)で流す
+    base_pipe.setdefault("rank", "causal")
     name = str(name or raw.get("name") or "")
     if not re.fullmatch(r"[\w.\-]+", name):
         raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含字母、数字、_、-、.")
@@ -173,8 +190,7 @@ def loop_pipeline(session, spec, *, n_first: int = 3, n_second: int = 3, target=
                               for u in r.units]
         visits = {}
         for u in rec1.proj_units + rec2.proj_units:
-            k = f"{lp.stored(int(u.layer))}:H{u.head}"
-            visits.setdefault(k, []).append(lp.visit(int(u.layer)))
+            visits.setdefault(_vkey(lp, u), []).append(lp.visit(int(u.layer)))
         comb = rec1.like(explicit(rec1) + explicit(rec2), name=f"{name}_loop", loop_edits="per_visit",
                          default_direction=rec1.default_direction, loop_visits={k: sorted(v) for k, v in visits.items()})
         cpath = hd / f"{name}_loop.per_visit.yaml"
@@ -206,11 +222,11 @@ def merge_units(session, recipe: Recipe, how: str) -> tuple[Recipe, list[dict]]:
     lp = _plan(session)
     if how not in ("compose", "max"):
         raise GneError("BAD_ARGS", "how 必须是 compose（连续相乘）或 max（只保留较强项）")
-    groups: dict[tuple[int, int], list] = {}
-    for u in recipe.proj_units:
-        groups.setdefault((lp.stored(int(u.layer)), int(u.head)), []).append(u)
+    groups: dict[tuple[int, int, str], list] = {}
+    for u in recipe.proj_units:                      # ヘッドとニューロンは番号が重なっても別(種類も鍵に入れる)
+        groups.setdefault((lp.stored(int(u.layer)), _idx(u), u.kind), []).append(u)
     drop, twins = set(), []
-    for (Ls, h), us in groups.items():
+    for (Ls, h, kind), us in groups.items():
         if len(us) < 2:
             continue
         us = sorted(us, key=lambda u: int(u.layer))
@@ -228,7 +244,7 @@ def merge_units(session, recipe: Recipe, how: str) -> tuple[Recipe, list[dict]]:
         keep = max(us, key=lambda u: abs(float(u.k)))
         if how == "max":
             drop |= {id(u) for u in us if u is not keep}
-        twins.append({"head": f"{Ls}:H{h}", "units": [u.label() for u in us], "s": [float(u.k) for u in us],
+        twins.append({"head": f"{Ls}:{'N' if kind == 'neuron' else 'H'}{h}", "units": [u.label() for u in us], "s": [float(u.k) for u in us],
                       "layers": [int(u.layer) for u in us], "cos": c,
                       "compose_effective": {"along_r1": e1, "along_r2": e2}, "max_kept": keep.label(),
                       "max_s": float(keep.k)})
@@ -239,7 +255,7 @@ def merge_units(session, recipe: Recipe, how: str) -> tuple[Recipe, list[dict]]:
     visits = dict(recipe.loop_visits or {})
     if not visits:
         for u in recipe.proj_units:
-            visits.setdefault(f"{lp.stored(int(u.layer))}:H{u.head}", []).append(lp.visit(int(u.layer)))
+            visits.setdefault(_vkey(lp, u), []).append(lp.visit(int(u.layer)))
     out = recipe.like(units, loop_edits="shared", loop_visits={**{k: sorted(set(v)) for k, v in visits.items()},
                                                                "_merge": how})
     return out, twins
@@ -310,7 +326,7 @@ def loop_merge(session, recipe, *, how: str = "max", direction: str | None = Non
     merged[rep].like(merged[rep].units, name=f"{base}.shared").save(rp)
     out["recipe"] = str(rp)
     out["n_units"] = {"per_visit": len(r.proj_units), **{hw: len(m.proj_units) for hw, m in merged.items()}}
-    out["n_heads_distinct"] = len({(lp.stored(int(u.layer)), int(u.head)) for u in r.proj_units})
+    out["n_heads_distinct"] = len({(lp.stored(int(u.layer)), _idx(u), u.kind) for u in r.proj_units})
     if measure_it:
         d = direction or r.default_direction or next((u.direction for u in r.proj_units if u.direction), None)
         if not d:
