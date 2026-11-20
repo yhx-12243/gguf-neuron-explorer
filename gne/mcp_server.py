@@ -467,14 +467,16 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
 
     @srv.tool()
     async def heads_writes(name: str, contrast: str | None = None, select_layer: int | None = None, unit_kinds: str = "all",
-                           verify_top: int = 64, verify_mode: str = "proj", max_examples: int | None = None) -> dict:
+                           verify_top: int = 64, verify_mode: str = "proj", max_examples: int | None = None,
+                           save_q: bool = False) -> dict:
         """全部の部品(注意ヘッド・線形注意のヘッド・MLP のニューロン)を、方向 name への書き込みの量で順位づけするジョブを投げる
         (job_status で結果。生成なし)。質問 1 問につき 1 回流し、点数 = 選ぶ層(既定は最後に測れる層)での「s=1 の射影で直接に
         縮まる A と B の差」。上位 verify_top 個を 1 個ずつ s=1 で射影して(verify_mode="ablate" なら止めて)確かめ、点数との順位相関を
-        返す。直接の書き込みしか見ないので、後ろの書き手を動かしているだけの部品は見落とす。層ごとの更新のベクトルは .writes.npz。"""
+        返す。直接の書き込みしか見ないので、後ろの書き手を動かしているだけの部品は見落とす。層ごとの更新のベクトルは .writes.npz。
+        save_q=True なら質問ごとの更新を .writes_q.npz に保存する(heads_geometry の質問に沿った分解の材料)。"""
         try:
             p = {"direction": name, "select_layer": select_layer, "kinds": unit_kinds, "verify_top": verify_top,
-                 "verify_mode": verify_mode, "max_examples": max_examples,
+                 "verify_mode": verify_mode, "max_examples": max_examples, "save_q": save_q or None,
                  "contrast": None if contrast is None else str(_contrast_path(session, contrast, None, None, None, None))}
             return jobs.start("heads_writes", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
@@ -485,7 +487,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
                              max_examples: int | None = None, resume: bool = True, rank: str | None = None,
                              unit_kinds: str | None = None, n_units: list[int] | None = None,
                              check_replies: int | None = None, holdout: bool | None = None,
-                             loop_direction: str | None = None, strength: str | None = None) -> dict:
+                             loop_direction: str | None = None, strength: str | None = None,
+                             from_direction: str | None = None) -> dict:
         """対照集合(name・user_prompts か側ごとの質問 prompts_a / prompts_b・system_a / system_b か recipe_a / recipe_b、
         任意で pipeline の設定。表か JSON / YAML の
         パス)から、方向づくり → 基準層 → 候補づくり → 強さの配分 をジョブで 1 回で回す(job_status で結果)。質問は何百個でもよく、止めて測る段階は max_examples 個
@@ -497,17 +500,25 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         強さを上げる(n_units が組の部品の数の上限、既定 [24, 12, 6]。B 側が A 側へ動く量と直交成分のずれに上限があり、倍率ごとの
         A 平均・B Δ・B ⊥ は allocate.table[].raise、上げる前の組は allocate.s1)→ 選んだ組で応答を書かせて validate.match を数える(check_replies 問、
         既定 16、0 で切る)。どの組も目標に届かなければ、組の効き(A 側の下がり − B 側の動きの大きさ)がいちばん大きい組を推す
-        (recommended.reached が false)。推す組が無ければ no_recommend に理由と次の手。rank="causal" は v0.7.0 までの流れ(因果スクリーニング → 効率で配り直す。n_heads はこちらだけ)。
+        (recommended.reached が false)。推す組が無ければ no_recommend に理由と次の手。推す組は目安(合否の判定ではない): 規則は
+        射影の値(残りの数・B 側のずれ)で、応答は見ていない(応答での確かめは壊れていないかを見るだけ)。表の行の most_reduced と
+        結果の most_reduced が、A 側が最も下がった組(A 平均が最小。replies_break なら応答での確かめで壊れた)。推す組が無くても候補で、
+        強さを調整して使える。rank="causal" は v0.7.0 までの流れ(因果スクリーニング → 効率で配り直す。n_heads はこちらだけ)。
         応答での確かめで A 側がほとんど変わらない(check.suggest)ときは、もう一方の rank も試す。結果の rank がどちらで流したか。
+        注意の出力のあとに正規化があるモデル(LFM3・Gemma 系など。v0.9.0)では rank="writes" は実行せず、rank を省くと "causal" で
+        実行して rank_note に理由が入る(点数の補正が入るまでの扱い)。組の射影は、正規化を補正して当てる(v0.9.0。postnorm に、
+        補正つきで当てたことと、γ と r̂ がほぼ直交する層の副作用の警告が入る。v0.8.x と同じ計算にするのは CLI の --no-proj-correction だけ)。
         unit_kinds は heads / all / neurons / layers(層の注意の出力全体・MLP の出力全体、ユニット "L:attn:sS@NAME"・"L:ffn:sS@NAME")と、
         そのカンマ区切り(例 "heads,layers")。holdout=True で質問を半分に分け、偶数番目で選び、奇数番目(選ぶのに使っていない質問)で
         表の数(allocate.table[].holdout)と応答の確かめを測る。loop_direction は重みを 2 回使うモデルでループの中の部品に使う方向の段
         (first / second)。strength は s=1 の組が目標に届かないときの強さの決め方: "per_unit"(既定。部品ごとに、射影の値が残りやすい
-        質問での効率に応じて上げる。強さは部品ごとに違う)/ "uniform"(全部を同じ倍率、v0.8.2 まで)。"""
+        質問での効率に応じて上げる。強さは部品ごとに違う)/ "uniform"(全部を同じ倍率、v0.8.2 まで)。from_direction は作り済みの方向
+        ベクトルの名前(方向づくりを飛ばし、その向きで順位づけ・配分する。heads_geometry で保存した向きなど)。"""
         try:
             p = {"spec": spec, "target": target, "n_heads": n_heads, "max_examples": max_examples,
                  "resume": None if resume else False, "rank": rank, "unit_kinds": unit_kinds, "n_units": n_units,
-                 "check_replies": check_replies, "holdout": holdout, "loop_direction": loop_direction, "strength": strength}
+                 "check_replies": check_replies, "holdout": holdout, "loop_direction": loop_direction, "strength": strength,
+                 "from_direction": from_direction}
             return jobs.start("head_pipeline", {k: v for k, v in p.items() if v is not None}).view()
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -543,6 +554,8 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
         (remain_before → remain_after)・A 平均・B Δ・B ⊥ を測り直したもの。parts に部品ごとの何回目(0 = 元の組)、dups に 2 つの
         方向で入った同じ部品。足した組だけの値(added_only、pipeline.table)は新しい方向での参考で、単独では使わない。
         代表の合わせたレシピで応答での確かめ(check、check_replies 問。既定は元の一括の設定、0 で行わない)。
+        combined_rows[].most_reduced と most_reduced が、合わせたレシピの A 平均(元の方向・元の目標)が最小の行。推す行が無い
+        (no_recommend)ときも、行は候補として選べる(推す行は目安で、合否の判定ではない)。
         rank="writes"(元の一括が writes なら既定でも)は、足す部品にニューロンも選べる(unit_kinds、new_heads は部品の数の上限)。"""
         try:
             p = {"name": name, "n_heads": n_heads, "new_heads": new_heads, "resume": None if resume else False,
@@ -583,6 +596,43 @@ def build_server(model: str | Path, *, root: str | Path | None = None, ui_url: s
             return d
         except Exception as e:  # noqa: BLE001
             return _err(e)
+
+    @srv.tool()
+    async def heads_geometry(name: str, parts: str = "layer", normalize: str = "both", top_k: int | None = None,
+                             layers: str | None = None, min_half_cos: float | None = None, compare: str | None = None,
+                             exclude_dims: str | None = None, out_name: str | None = None,
+                             permutations: int | None = None, seed: int = 0, export_direction: str | None = None,
+                             export_from: str | None = None, export_force: bool = False) -> dict:
+        """heads writes の材料 name の、層ごとの更新ベクトル(A 側の平均の更新 − B 側の平均の更新)を比べる(GPU を使わない、数秒)。
+        層どうしのコサイン類似度(行列は保存した .geometry.json / .npz にあり、ここでは省く)、特異値分解(normalize: rows = 行の大きさを
+        そろえる / none / both。基準は行が直交していたときの値と、半分どうしの差から作る雑音の目安)、半分ずつの一致(min_half_cos 未満に
+        信用しない印、既定 0.5)、方向ベクトルとの cos、ループのモデルでは同じ重みの 1 回目と 2 回目、heads refine の方向との cos。
+        parts は layer / attn,mlp / layer,attn,mlp。heads_writes(save_q=True)で質問ごとの更新を保存してあれば、ラベル入れ替えの
+        基準(permutations 回、既定 200、0 で切る)と、同じ層の中の質問に沿った分解(within)も返す。かたまりや上位の向きは更新の差が
+        似ていることしか示さない(返り値の reading)。export_direction と export_from(svd-rows:K / svd-none:K / within:K /
+        update・update-attn・update-mlp = その層が新しく足した分の向き)を渡すと、
+        その向きを方向ベクトルとして保存する(direction_score・heads_writes・headproj ablate で使える。単位ベクトル)。"""
+        from .geometry import HALF_COS_MIN, PERMUTATIONS, TOP_K
+
+        def run():
+            d = session.heads_geometry(name, parts=parts, normalize=normalize, top_k=TOP_K if top_k is None else top_k,
+                                       layers=layers, min_half_cos=HALF_COS_MIN if min_half_cos is None else min_half_cos,
+                                       compare=compare, exclude_dims=exclude_dims, out_name=out_name,
+                                       permutations=PERMUTATIONS if permutations is None else permutations, seed=seed)
+            d = dict(d, similarity={k: v for k, v in d["similarity"].items() if k != "matrix"})
+            for s_ in d["svd"].values():                # 行ごとの配列は保存したファイルで読む(返り値を小さくする)
+                for k in ("U", "row_explained", "cos_own"):
+                    s_.pop(k, None)
+            d["material"] = {k: v for k, v in d["material"].items() if k != "cumsum"}
+            if export_direction or export_from:
+                if not (export_direction and export_from):
+                    raise GneError("BAD_ARGS", "export_direction 和 export_from 必须一起传递")
+                d["export"] = session.heads_geometry_export(d["name"], export_direction, export_from, force=export_force)
+            if d.get("within"):                          # 質問ごとの cos は保存したファイルで読む
+                d["within"] = [{k: v for k, v in x.items() if k != "q_cos"} for x in d["within"]]
+                d["within_summary"] = {k: v for k, v in d["within_summary"].items() if k != "q_mean_cos"}
+            return d
+        return await call(run, gpu=False)
 
     @srv.tool()
     async def headproj_export(recipe: str, bake: bool = False, requant: str | None = None, verify: bool = True,

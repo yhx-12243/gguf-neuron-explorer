@@ -717,9 +717,9 @@ def test_top_bar_opens_each_screen(server, browser):
     強さの候補は direction ビューの中身を入れ替えて出す(中の切り替えは無い)。地図の上の帯(層・並べ方・色・線・この層で計算)は地図だけ。
     方向の画面は開いただけでは測らない。英語の画面でも文言は辞書にある。"""
     # 地図の上の帯は地図のときだけ見える(地図の上に重ねるほかの画面と分ける)
-    want = {"map": "#map-bar", "layers": "#layers-view", "writers": "#writers-view", "embed": "#embed-view", "eval": "#eval-view",
-            "direction": "#dv-dir", "chips": "#dv-pipe", "keys": "#dv-key", "fish": "#dv-fish", "cand": "#dv-cand"}
-    assert len(want) == 10
+    want = {"map": "#map-bar", "layers": "#layers-view", "writers": "#writers-view", "embed": "#embed-view", "geometry": "#geometry-view",
+            "eval": "#eval-view", "direction": "#dv-dir", "chips": "#dv-pipe", "keys": "#dv-key", "fish": "#dv-fish", "cand": "#dv-cand"}
+    assert len(want) == 11
     for lang in ("ja", "en"):
         pg = browser.new_page(viewport={"width": 1500, "height": 860})
         errors, posts = [], []
@@ -729,7 +729,7 @@ def test_top_bar_opens_each_screen(server, browser):
         pg.goto(server + f"/?lang={lang}")
         pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
         groups = pg.evaluate("[...document.querySelectorAll('#views .grp')].map(g => [...g.querySelectorAll('button[data-view]')].map(b => b.dataset.view))")
-        assert groups == [["map", "layers", "writers", "embed"], ["direction", "chips", "keys", "fish"], ["eval", "cand"]]
+        assert groups == [["map", "layers", "writers", "embed", "geometry"], ["direction", "chips", "keys", "fish"], ["eval", "cand"]]
         assert not pg.evaluate("document.querySelector('#dv-mode')")
         for v, sel in [*want.items(), ("map", "#map-bar")]:
             pg.click(f"#views button[data-view={v}]")
@@ -2966,7 +2966,7 @@ def test_pipeline_api_and_panel(pipe_server, browser):
         assert ei.value.code == 400
     tpl = get("/api/pipeline-templates")                                   # 用途別のテンプレート(configs/pipeline/)
     assert [x["spec"]["name"] for x in tpl] == ["evil_sys", "cold_vs_warm", "evil_neurons_4b", "ja_vs_en", "repeat_vs_progress",
-                                                 "disclaimer_heads"]
+                                                 "disclaimer_heads", "pirate_tone"]
     assert all("about" not in x["spec"] and x["ja"]["title"] and x["en"]["text"] for x in tpl)
     for lang in ("ja", "en"):
         pg = browser.new_page(viewport={"width": 1600, "height": 1000})
@@ -2998,7 +2998,9 @@ def test_pipeline_api_and_panel(pipe_server, browser):
         assert pg.evaluate(f"document.querySelectorAll('{res} table.pp-init tbody tr').length") == 3
         assert pg.evaluate(f"document.querySelectorAll('{res} table.pp-eta tbody tr').length") == 3
         cmp = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp tbody tr')].map(tr => [tr.className, tr.dataset.n || ''])")
-        assert cmp == [["", "3"], ["rec", "2"], ["", ""]]                                # 多い順、推す組に印、作れなかった組は理由
+        assert cmp == [["", "3"], ["rec mr", "2"], ["", ""]]                             # 多い順、推す組に印、作れなかった組は理由
+        # A 側が最も下がった組の印(v0.9.0): A 平均が同じなら部品の少ない組。推す組と同じ行なら 2 つ並べる
+        assert pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp tbody tr[data-n=\"2\"] .badge')].map(b => b.className)") == ["badge pp-rec", "badge pp-mr"]
         _step(pg, "chips", "alloc")
         pg.click(f"{res} table.pp-cmp [data-load='2']")
         assert pg.evaluate("window.gne.recipe.specs()") == ["12:H5:s10@ppx", "12:H3:s7@ppx"] and pg.evaluate("window.gne.recipe.name") == "ppx-n2"
@@ -3061,7 +3063,7 @@ def test_pipeline_api_and_panel(pipe_server, browser):
         assert not pg.evaluate("document.querySelector('#pp-go').disabled") and pg.evaluate("document.querySelectorAll('#pp-check .err').length") == 0
         assert "pirate" in pg.evaluate("document.querySelector('#pp-check').textContent")
         # 用途別のひな形: 選ぶと入る(説明つき)。書き換えた入力欄は、確かめて断れば残る。小さな例に戻せる
-        pg.wait_for_function("document.querySelectorAll('#pp-tpl-sel option').length === 8", timeout=10000)   # (ひな形を選ぶ)・小さな例・6 つ
+        pg.wait_for_function("document.querySelectorAll('#pp-tpl-sel option').length === 9", timeout=10000)   # (ひな形を選ぶ)・小さな例・7 つ
         _step(pg, "chips", "input")
         pg.select_option("#pp-tpl-sel", "question_kinds.json")
         assert pg.evaluate("JSON.parse(document.querySelector('#pp-text').value).name") == "ja_vs_en"
@@ -3339,8 +3341,14 @@ def test_pipeline_writes_refine_rows_are_combined(pipe_writes_server, browser):
         assert [r["base"] for r in rows] == [["元の組(4)", "1 回目(1)"]] * 3 + [[]] and all(r["added"] for r in rows)
         assert "3 → 0" in rows[1]["text"] and "4.00 → -9.50" in rows[1]["text"]
         # 推す行は合わせたレシピの数で(上限 2)。上限 3 は合わせると B 側が A 側へ動くので推さない(足した組だけの値では推していた)
-        badges = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp > tbody > tr')].map(tr => !!tr.querySelector('.badge'))")
+        badges = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp > tbody > tr')].map(tr => !!tr.querySelector('.badge.pp-rec'))")
         assert badges == [False, False, True, False]
+        # A 側が最も下がった行は、合わせたレシピの A 平均(元の方向・元の目標)で決める(v0.9.0。前の版の結果にも開くときに付ける)
+        dd = pg.evaluate(f"fetch('/api/pipelines/{name}').then(r => r.json())")
+        crows = dd["refine"]["combined_rows"]
+        want = min(crows, key=lambda c: (c["a_mean_after"], c["n_heads"]))["key"]
+        mrs = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp > tbody > tr')].map(tr => !!tr.querySelector('.badge.pp-mr'))")
+        assert mrs == [k == want for k in ("s1", "3", "2", "1")] and dd["refine"]["most_reduced"]["key"] == want
         assert "合わせると悪くなる: B 側が A 側へ動く" in rows[1]["text"] and "足した組だけの値では推していた" in rows[1]["text"]
         assert "合わせても良くならない" in rows[0]["text"]
         assert "選ぶのに使っていない質問(合わせたレシピ): 残り 2 → 1 / 3" in rows[2]["text"]
@@ -3414,7 +3422,7 @@ def test_pipeline_writes_result_panel(pipe_writes_server, browser):
         assert "--rank writes" in pg.evaluate(f"document.querySelector('{res} .pp-res-head').innerText")   # どちらの選び方で流したか
         assert pg.evaluate("[document.querySelector('#pp-rank').value, document.querySelector('#pp-kinds').value]") == ["writes", "heads"]
         cmp = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp tbody tr')].map(tr => [tr.className, tr.dataset.n || ''])")
-        assert cmp == [["", "4"], ["rec", "2"]]
+        assert cmp == [["", "4"], ["rec mr", "2"]]
         txt = pg.evaluate(f"document.querySelector('{res} table.pp-cmp').innerText")
         assert "L14 N100" in txt and "L12 H5" in txt
         _step(pg, "chips", "alloc")
@@ -3422,6 +3430,73 @@ def test_pipeline_writes_result_panel(pipe_writes_server, browser):
         assert pg.evaluate("window.gne.recipe.specs()") == ["12:H5:s1@ppw", "14:N100:s1@ppw"]
         assert pg.evaluate("window.gne.recipe.skipped") == 0
         if lang == "en":
+            assert pg.evaluate("[...window.gneI18n.missing]") == []
+        assert not errors, errors
+        pg.close()
+
+
+@pytest.mark.model
+def test_pipeline_most_reduced_when_nothing_is_recommended(pipe_writes_server, browser):
+    """v0.9.0: 推す組が無い一括と、推す行が無い残りから追加の結果。表の「A 側が最も下がった」の印(A 平均が最小の行。応答が
+    壊れた組には警告を並べる)と、見出し・表の下の次の手(最も下がった組、チャットで強さを調整、「この強さをレシピに反映」)。
+    「推奨は目安」の注。英語の文言もすべて辞書にある。"""
+    url = pipe_writes_server
+    hd = None
+    for lang in ("ja", "en"):
+        pg = browser.new_page(viewport={"width": 1600, "height": 1000})
+        errors = []
+        pg.on("pageerror", lambda e: errors.append(str(e)))
+        _dialogs(pg)
+        pg.goto(url + f"/?lang={lang}")
+        pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+        if hd is None:                                   # 保存済みの結果を写して、推す組が無い形に書き換える(前の版の形: 印は開くときに付く)
+            d = pg.evaluate("fetch('/api/pipelines/ppw').then(r => r.json())")
+            hd = Path(d["path"]).parent
+            x = json.loads((hd / "ppw.pipeline.json").read_text(encoding="utf-8"))
+            x["name"] = "ppwn"
+            x["recommended"] = None
+            x["no_recommend"] = {"reason": "どの組も、A 側の下がりが B 側の動きより小さいか、B 側の動き・直交成分のずれの上限を超える",
+                                 "next": ["rank causal", "unit_kinds", "refine"]}
+            x.pop("check", None)
+            for r in x["allocate"]["table"]:
+                r.update(recommended=False, a_mean=-12.0 if r["n_heads"] == 4 else -9.0, replies_break=r["n_heads"] == 4)
+            x["allocate"]["recommended"] = None
+            (hd / "ppwn.pipeline.json").write_text(json.dumps(x, ensure_ascii=False), encoding="utf-8")
+            y = json.loads((hd / "ppw81_r1_r1.pipeline.json").read_text(encoding="utf-8"))
+            y["name"] = "ppwr0"
+            y["refine"].update(combined=None, no_recommend="no_better", check=None)
+            for c in y["refine"]["combined_rows"]:
+                c.update(recommended=False, verdict="no_gain" if c["verdict"] == "better" else c["verdict"])
+                c.pop("most_reduced", None)
+            y["refine"].pop("most_reduced", None)
+            (hd / "ppwr0.pipeline.json").write_text(json.dumps(y, ensure_ascii=False), encoding="utf-8")
+        pg.evaluate("window.gne.recipe.clear(); try { localStorage.removeItem('gne.pipeline.draft') } catch {}")
+        pg.click("#views button[data-view=chips]")
+        pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode === 'pipe'", timeout=60000)
+        res = "#pp-result"
+        pg.evaluate("window.gne.directionView.pipe.open('ppwn')")
+        pg.wait_for_function("window.gne.directionView.pipe.data && window.gne.directionView.pipe.data.name === 'ppwn'", timeout=30000)
+        _step(pg, "chips", "alloc")
+        pg.wait_for_selector(f"{res} table.pp-cmp", timeout=30000)
+        if lang == "ja":
+            rows = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp tbody tr')].map(tr => [tr.dataset.n, [...tr.querySelectorAll('.badge')].map(b => b.textContent)])")
+            assert rows == [["4", ["A 側が最も下がった", "応答が壊れた"]], ["2", []]], rows        # 推奨の印は無い。壊れた組には警告を並べる
+            head = pg.evaluate(f"document.querySelector('{res} .pp-res-head').innerText")
+            assert "道具の基準では 1 つに決められませんでした" in head and "A 側が最も下がったのは、4 個の組です(A 平均 -12.00)" in head
+            assert "この強さをレシピに反映" in head and "強さを下げてから使ってください" in head and "残りから追加" in head
+            note = pg.evaluate(f"document.querySelector('{res} table.pp-cmp').closest('section').textContent")   # 注は畳んである
+            assert "推奨は目安です(合否の判定ではありません)" in note and "応答は見ていません" in note
+        pg.evaluate("window.gne.directionView.pipe.open('ppwr0')")
+        pg.wait_for_function("window.gne.directionView.pipe.data && window.gne.directionView.pipe.data.name === 'ppwr0'", timeout=30000)
+        _step(pg, "chips", "alloc")
+        pg.wait_for_selector(f"{res} table.pp-cmp", timeout=30000)
+        if lang == "ja":
+            head = pg.evaluate(f"document.querySelector('{res} .pp-res-head').innerText")
+            assert "推す行なし: 道具の基準では、足す行を 1 つに決められませんでした" in head and "候補の行は表に残っていて選べます" in head
+            assert "足さないほうがよい" not in pg.evaluate(f"document.querySelector('{res}').innerText")
+            assert pg.evaluate(f"document.querySelectorAll('{res} table.pp-cmp .badge.pp-rec').length") == 0
+            assert pg.evaluate(f"document.querySelectorAll('{res} table.pp-cmp .badge.pp-mr').length") == 1
+        else:
             assert pg.evaluate("[...window.gneI18n.missing]") == []
         assert not errors, errors
         pg.close()
@@ -3449,7 +3524,7 @@ def test_pipeline_writes_raise_trace_panel(pipe_writes_server, browser):
         pg.wait_for_selector("#pp-result table.pp-cmp", timeout=30000)
         res = "#pp-result"
         rows = pg.evaluate(f"[...document.querySelectorAll('{res} table.pp-cmp > tbody > tr')].map(tr => [tr.className, tr.dataset.n || ''])")
-        assert rows == [["pp-s1", ""], ["rec", "4"], ["", "2"]]
+        assert rows == [["pp-s1", ""], ["rec", "4"], ["mr", "2"]]                        # A 平均が同じ 2 行のうち部品の少ない組に「最も下がった」
         assert pg.evaluate(f"document.querySelectorAll('{res} table.pp-cmp details').length") == 2
         txt = pg.evaluate(f"document.querySelector('{res} table.pp-cmp').innerText")
         head = pg.evaluate(f"document.querySelector('{res} .pp-res-head').innerText")
@@ -3655,6 +3730,263 @@ def test_pipeline_late_open_does_not_overwrite(pipe_server, browser):
     assert pg.evaluate("window.gne.directionView.pipe.data.name") == "ppx2"
     assert "ppx2" in pg.evaluate("document.querySelector('#pp-result h3').textContent")
     assert pg.evaluate("document.querySelector('#pp-past tr.on').dataset.pp") == "ppx2"
+    assert not errors, errors
+    pg.close()
+
+
+@pytest.fixture(scope="module")
+def spread_server(tmp_path_factory):
+    """残差の大きさが少数の次元に偏ったモデルの真似: 層 6 の統計の、大きい 8 成分を除いた大きさを中央値の 1/3 にしておく
+    (Qwen3-0.6B 自体は約 1.3 倍で偏っていない)。"""
+    if not MODEL.exists():
+        pytest.skip("モデルがありません")
+    from gne.api import Session
+    s = Session(MODEL, root=tmp_path_factory.mktemp("ui_spread"))
+    _seed(s)
+    s.stats_resid(tokens=512, layers=[6])
+    st = s.resid_stats()
+    st.p50_rest = (st.p50 / 3.0).astype(np.float32)
+    st.save(s.store.resid_path(s.meta.model_id))
+    yield from _serve(s)
+
+
+@pytest.mark.model
+def test_recipe_proj_correction_toggle(spread_server, browser):
+    """射影の補正(v0.9.0): 出力のあとに正規化があるモデル(構造の情報を真似る)で、記録の無い古いレシピを読み込むと、レシピの欄に
+    補正つきで当てている知らせが出続け、チャット・保存の要求に proj_correction が載る。保存の前に確かめる(やめれば保存しない)。
+    「補正なし」を選ぶと none を送る。正規化の無いモデルでは欄を出さない。"""
+    errors = []
+    pg = _open_page(browser, errors)
+    pg.goto(spread_server + "/")
+    pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+    bodies = []
+    pg.on("request", lambda rq: bodies.append((rq.url, rq.post_data)) if rq.method == "POST" else None)
+    pg.evaluate("window.gne.recipe.load('oldr', [{layer: 6, kind: 'head', head: 0, mode: 'proj', s: 2, direction: 'dx'}], null, null, 'own',"
+                " {proj_correction: 'unrecorded'})")
+    _recipe_tab(pg)
+    assert not pg.evaluate("!!document.querySelector('#rc-pc')")                  # 正規化の無いモデル(Qwen3)では出さない
+    pg.evaluate("for (const li of window.gne.arch.layers) if (li.mixer === 'attention') li.post_norm_mixer = 'post_attention_norm';"
+                " window.gne.recipe._save()")
+    _recipe_tab(pg)
+    pg.wait_for_selector("#rc-pc", timeout=10000)
+    note = pg.evaluate("[...document.querySelectorAll('.rc-pc-warn')].map(e => e.textContent).join(' ')")
+    assert "記録がありません" in note and "補正つき" in note
+    _dialogs(pg, "dismiss", once=True)                                                # 保存の前に確かめる: やめれば送らない
+    pg.fill("#rc-name", "oldr")
+    pg.click("#rc-save")
+    pg.wait_for_timeout(500)
+    assert any("記録がありません" in x for x in _asked(pg)) and not any("/api/recipes/oldr" in u for u, _ in bodies)
+    pg.select_option("#rc-pc", "none")
+    assert pg.evaluate("window.gne.recipe.projCorrection") == "none"
+    assert not pg.evaluate("[...document.querySelectorAll('.rc-pc-warn')].length")   # 選んだら知らせは消える(記録が決まった)
+    _recipe_tab(pg, "try")                                                           # チャットの要求にも載る
+    pg.click("#rc-chat")
+    pg.wait_for_selector("#ch-text", timeout=30000)
+    pg.click("[data-cols='1']")
+    pg.fill("#ch-text", "Hello")
+    pg.click("#ch-send")
+    pg.wait_for_function("!document.querySelector('#ch-send').disabled", timeout=60000)
+    steer = [json.loads(b) for u, b in bodies if u.endswith("/api/steer") and b]
+    assert steer and steer[-1]["columns"][-1]["proj_correction"] == "none"
+    _recipe_tab(pg)
+    pg.click("#rc-save")
+    pg.wait_for_timeout(800)
+    sent = [json.loads(b) for u, b in bodies if "/api/recipes/oldr" in u and b]
+    assert sent and sent[-1]["proj_correction"] == "none"
+    assert not errors, errors
+    pg.close()
+
+
+@pytest.mark.model
+def test_chat_keeps_warning_after_reply(spread_server, browser):
+    """実物の生成: 偏りの大きい層を rel で押すと、レシピの欄に強さの注意が出て、チャットの警告(steer の偏りの知らせ)が
+    生成のあとの状態の文にも残る(v0.8.5 までは「… 秒で … 列を生成」に上書きされて消えた)。"""
+    errors = []
+    pg = _open_page(browser, errors)
+    pg.goto(spread_server + "/")
+    pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+    pg.evaluate("window.gne.recipe.clear()")
+    pg.fill("#jump", "L6 N100")
+    pg.press("#jump", "Enter")
+    pg.wait_for_function("document.querySelector('#neuron-body .n-id')", timeout=30000)
+    pg.click("#neuron-body [data-rc='1']")
+    _recipe_tab(pg)
+    note = pg.evaluate("[...document.querySelectorAll('.rc-spread-warn')].map(e => e.textContent).join(' ')")
+    assert "約 3.0 倍" in note, note
+    _recipe_tab(pg, "try")
+    pg.click("#rc-chat")
+    pg.wait_for_selector("#ch-text", timeout=30000)
+    pg.click("[data-cols='1']")
+    pg.fill("#ch-max", "6")
+    pg.dispatch_event("#ch-max", "change")
+    pg.fill("#ch-text", "Hello")
+    pg.click("#ch-send")
+    pg.wait_for_function("!document.querySelector('#ch-send').disabled", timeout=120000)
+    stt = pg.evaluate("document.querySelector('#ch-status').textContent")
+    assert "秒で 1 列を生成" in stt and "警告" in stt and "集中" in stt, stt
+    assert not errors, errors
+    pg.close()
+
+
+@pytest.mark.model
+def test_pipeline_no_result_note_after_late_open(pipe_server, browser):
+    """これまでの実行から結果を開き、読み込みが終わる前に手順を替えても、結果が届いたあとに「まだ結果がありません」が残らない
+    (v0.4.0 の手順の画面から v0.8.5 まで、読み込み中に手順 4 を開くと結果の上に残った)。"""
+    url = pipe_server
+    late = _Late(_path_key("/api/pipelines"), {}, hold="ppx")
+    errors = []
+    pg = _open_page(browser, errors)
+    pg.route("**/api/pipelines**", late)
+    pg.goto(url + "/")
+    pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+    pg.click("#views button[data-view=chips]")
+    pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode === 'pipe'", timeout=60000)
+    pg.evaluate("window.gne.directionView.pipe.data = null")
+    _step(pg, "chips", "past")
+    pg.wait_for_selector("#pp-past tr[data-pp=ppx]", timeout=30000)
+    pg.click("#pp-past tr[data-pp=ppx]")
+    late.wait_held(pg)
+    _step(pg, "chips", "alloc")                                                       # 読み込み中: まだ結果が無いので知らせが出る
+    vis = "(() => { const e = document.querySelector('#pp-nores'); return !e.hidden && e.offsetParent !== null; })()"
+    assert pg.evaluate(vis)
+    late.release(pg, "**/api/pipelines/ppx")
+    pg.wait_for_function("window.gne.directionView.pipe.data && window.gne.directionView.pipe.data.name === 'ppx'", timeout=30000)
+    for st in ("alloc", "dir", "causal", "cand"):
+        _step(pg, "chips", st)
+        assert not pg.evaluate(vis), st
+    assert not errors, errors
+    pg.close()
+
+
+@pytest.mark.model
+def test_pipeline_from_direction_field(pipe_server, browser):
+    """v0.9.0: 「作り済みの方向で一括を流す」(--from-direction)。細かい設定(どちらの探し方でも)の中に、保存済みの方向の一覧。
+    方向を作った位置が違う方向・一括と同じ名前の方向は理由を出して押せない。使えるときは方向を作った対照集合を知らせ、
+    ジョブに from_direction を渡す(止めて選ぶでも)。結果の見出しに、どの方向から流したかと、対照集合が違うときの知らせ。英語の文言も辞書にある。"""
+    import numpy as np
+    url = pipe_server
+    made = []
+    try:
+        for lang in ("ja", "en"):
+            pg = browser.new_page(viewport={"width": 1600, "height": 1000})
+            errors, posts = [], []
+            pg.on("pageerror", lambda e: errors.append(str(e)))
+            _dialogs(pg)
+            pg.goto(url + f"/?lang={lang}")
+            pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+            if not made:                                    # 保存済みの方向を 2 つ(最後のトークンで作ったもの・応答で作ったもの)と、それから流した結果
+                d = pg.evaluate("fetch('/api/pipelines/ppx').then(r => r.json())")
+                hd = Path(d["path"]).parent
+                ddir = hd.parent.parent / "directions" / hd.name
+                ddir.mkdir(parents=True, exist_ok=True)
+                rng = np.random.default_rng(0)
+                for nm, pos in (("gdir", "last"), ("rdir", "response")):
+                    f = ddir / f"{nm}.npz"
+                    np.savez(f, layers=np.array([10, 12], np.int32), layer_10=rng.standard_normal(16).astype(np.float32),
+                             layer_12=rng.standard_normal(16).astype(np.float32), method=np.array("mean_diff"), positions=np.array(pos),
+                             contrast_sha=np.array("x"), source=np.array("/somewhere/geo_src.yaml"), n_rows_A=np.array(6), n_rows_B=np.array(6))
+                    made.append(f)
+                x = json.loads((hd / "ppx.pipeline.json").read_text(encoding="utf-8"))
+                x["name"] = "ppxf"
+                x["direction"] = {**x["direction"], "from": "gdir", "from_note": "方向 gdir を作った対照集合と、この一括の対照集合の…"}
+                (hd / "ppxf.pipeline.json").write_text(json.dumps(x, ensure_ascii=False), encoding="utf-8")
+                made.append(hd / "ppxf.pipeline.json")
+
+            def on_jobs(route, req):
+                if req.method != "POST":
+                    route.continue_()
+                    return
+                body = json.loads(req.post_data)
+                posts.append(body)
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                    "id": "fake-fd", "kind": body["kind"], "params": body["params"], "status": "queued", "done": 0, "total": 0, "stage": "",
+                    "eta_s": None, "yields": 0, "seconds": None, "result": None, "error": None}))
+            pg.route("**/api/jobs", on_jobs)
+            pg.evaluate("try { localStorage.removeItem('gne.pipeline.draft') } catch {}")
+            pg.click("#views button[data-view=chips]")
+            pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode === 'pipe'", timeout=60000)
+            _step(pg, "chips", "input")
+            pg.select_option("#pp-tpl-sel", "small")
+            pg.wait_for_function("[...document.querySelectorAll('#pp-fromdir option')].some(o => o.value === 'gdir')", timeout=30000)
+            assert pg.evaluate("!!document.querySelector('#pp-more-dir #pp-fromdir')")          # 細かい設定(どちらの探し方でも)の中
+            pg.evaluate("document.querySelector('#pp-more-dir').open = true")
+            opts = pg.evaluate("[...document.querySelectorAll('#pp-fromdir option')].map(o => o.value)")
+            assert opts[0] == "" and {"gdir", "rdir"} <= set(opts)
+            pg.select_option("#pp-fromdir", "rdir")                                         # 応答で作った方向: 位置が違うので押せない
+            assert pg.evaluate("document.querySelector('#pp-go').disabled")
+            if lang == "ja":
+                assert "「response」の位置で作った方向で" in pg.evaluate("document.querySelector('#pp-fromdir-note').textContent")
+            pg.select_option("#pp-fromdir", "gdir")
+            assert not pg.evaluate("document.querySelector('#pp-go').disabled")
+            if lang == "ja":
+                assert "方向を作った対照集合: geo_src.yaml" in pg.evaluate("document.querySelector('#pp-fromdir-note').textContent")
+            spec = json.loads(pg.evaluate("document.querySelector('#pp-text').value"))
+            pg.fill("#pp-text", json.dumps({**spec, "name": "gdir"}))                         # 一括と同じ名前: 押せない
+            pg.dispatch_event("#pp-text", "input")
+            assert pg.evaluate("document.querySelector('#pp-go').disabled")
+            if lang == "ja":
+                assert "一括の名前 gdir と同じ方向は使えません" in pg.evaluate("document.querySelector('#pp-fromdir-note').textContent")
+            pg.fill("#pp-text", json.dumps({**spec, "name": "fdrun"}))
+            pg.dispatch_event("#pp-text", "input")
+            pg.select_option("#pp-fromdir", "gdir")
+            pg.select_option("#pp-rank", "causal")                                         # 止めて選ぶでも使える
+            assert not pg.evaluate("document.querySelector('#pp-go').disabled")
+            pg.click("#pp-go")
+            pg.wait_for_function("window.__asked !== undefined", timeout=10000)
+            pg.wait_for_timeout(500)
+            pp = [b for b in posts if b["kind"] == "head_pipeline"]
+            assert pp and pp[-1]["params"]["from_direction"] == "gdir" and pp[-1]["params"]["rank"] == "causal"
+            # 結果: どの方向から流したかと、対照集合が違うときの知らせ(見出しなので、どの手順でも見える)
+            pg.evaluate("window.gne.directionView.pipe.open('ppxf')")
+            pg.wait_for_function("window.gne.directionView.pipe.data && window.gne.directionView.pipe.data.name === 'ppxf'", timeout=30000)
+            _step(pg, "chips", "alloc")
+            head = pg.evaluate("document.querySelector('#pp-result .pp-res-head').innerText")
+            if lang == "ja":
+                assert "方向: 作り済みの方向 gdir を写して使いました" in head and "同じとは確かめられません" in head
+            else:
+                assert "copied the saved direction gdir" in head
+                assert pg.evaluate("[...window.gneI18n.missing]") == []
+            assert not errors, errors
+            pg.close()
+    finally:
+        for f in made:
+            f.unlink(missing_ok=True)
+
+
+@pytest.mark.model
+def test_pipeline_rank_default_when_writes_cannot_run(pipe_server, browser):
+    """書き込みの量での順位づけを実行しないモデル(残差が複数本の流れ・注意の出力のあとに正規化)では、CHiPS の欄の既定が
+    「止めて選ぶ」になり、書き込みの量は選べず、理由が出る。既定のまま流すときは rank を送らない(サーバーが切り替えて、結果に
+    rank_note を入れる)。自分で「止めて選ぶ」を選んだら rank を送る。構造の情報を真似て確かめる(実物の qwen4exp では確かめていない)。"""
+    url = pipe_server
+    errors = []
+    pg = _open_page(browser, errors)
+    pg.goto(url + "/")
+    pg.wait_for_function("window.gne && window.gne.overlayReady", timeout=60000)
+    pg.click("#views button[data-view=chips]")
+    pg.wait_for_function("window.gne.directionView && window.gne.directionView.mode === 'pipe'", timeout=60000)
+    _step(pg, "chips", "input")
+    pg.select_option("#pp-tpl-sel", "small")
+    assert pg.evaluate("document.querySelector('#pp-rank').value") == "writes"         # ふつうのモデル(Qwen3)では書き込みの量が既定
+    assert pg.evaluate("document.querySelector('#pp-rank-blocked').hidden")
+    state = "(() => ({ v: document.querySelector('#pp-rank').value, dis: document.querySelector('#pp-rank option[value=writes]').disabled, "\
+            "note: document.querySelector('#pp-rank-blocked').hidden ? null : document.querySelector('#pp-rank-blocked').textContent, "\
+            "p: window.gne.directionView.pipe.params() }))()"
+    refresh = "document.querySelector('#pp-rank').value = 'writes'; window.gne.directionView.pipe.rankForced = false; window.gne.directionView.pipe.rankFields()"
+    for mimic, word in (("window.gne.arch.hc_streams = 4", "hyper-connections"),
+                        ("window.gne.arch.hc_streams = 0; for (const li of window.gne.arch.layers) if (li.mixer === 'attention') li.post_norm_mixer = 'post_attention_norm'",
+                         "正規化")):
+        pg.evaluate(mimic)
+        pg.evaluate(refresh)
+        st = pg.evaluate(state)
+        assert st["v"] == "causal" and st["dis"] and word in (st["note"] or ""), st
+        assert st["p"] and "rank" not in st["p"] and st["p"]["n_heads"], st["p"]           # 既定のまま: rank は送らない
+        pg.select_option("#pp-rank", "causal")                                           # 自分で選んだら送る
+        assert pg.evaluate(state)["p"]["rank"] == "causal"
+    pg.evaluate("for (const li of window.gne.arch.layers) li.post_norm_mixer = ''")
+    pg.evaluate(refresh)
+    st = pg.evaluate(state)
+    assert st["v"] == "writes" and not st["dis"] and st["note"] is None and st["p"]["rank"] == "writes"
     assert not errors, errors
     pg.close()
 
@@ -3939,6 +4271,8 @@ def refine_server(tmp_path_factory):
                                "rows": {k: {sd: {"n": 4, "finished": 4, "match_finished": (3 if k == "none" else 1) if sd == "A" else 0,
                                                  "empty": 0, "loop": 1 if k == "recipe" and sd == "B" else 0, "at_limit": 0} for sd in "AB"}
                                         for k in ("none", "recipe")}}}}
+    r1["rank_note"] = "書き込みの量での順位づけを実行できないので、既定の選び方を rank causal(止めて選ぶ)に切り替えて実行しました(テスト)"           # 選び方を切り替えた知らせ(v0.9.0)
+    r1["postnorm"] = {"layers": [12], "unsure_layers": [], "note": "テストの知らせ"}                 # 出力のあとの正規化の知らせ
     (hd / "ppx_r1.pipeline.json").write_text(json.dumps(r1, ensure_ascii=False))
     yield from _serve(s)
 
@@ -3987,6 +4321,8 @@ def test_pipeline_refine_button_and_note(refine_server, browser):
     note = pg.evaluate("document.querySelector('#pp-result .pp-refine').textContent")
     assert "ppx" in note and "3 問" in note and "残り 3 → 1 問" in note and "4 問で作りました" in note
     assert "無介入 3/4 / 0/4 → 合わせたレシピ 1/4 / 0/4" in note                      # 代表の合わせたレシピでの応答での確かめ
+    warns = pg.evaluate("[...document.querySelectorAll('#pp-result .pp-res-head .pp-warn')].map(e => e.textContent)")
+    assert any("選び方を切り替えました" in w for w in warns) and any("層 12 は" in w and "テストの知らせ" in w for w in warns)
     _step(pg, "chips", "alloc")
     pg.click("#pp-rf-load")
     assert pg.evaluate("window.gne.recipe.specs()") == ["12:H5:s10@ppx", "12:H3:s7@ppx", "16:H2:s4@ppx_r1"]
@@ -4093,7 +4429,7 @@ def test_recipe_lora_bake_panel(refine_server, browser):
         pg.wait_for_function("document.querySelector('#lx-result a[download]')", timeout=10000)
         assert posts[0]["kind"] == "headproj_export" and posts[0]["params"] == {
             "units": ["12:H5:s10@ppx", "12:H3:s7@ppx"], "name": "ppx-n2", "bake": False, "file_stem": "ppx-n2", "overwrite": False,
-            "adapter_name": "tone adapter"}
+            "adapter_name": "tone adapter", "proj_correction": "postnorm"}                 # 射影の補正の記録(v0.9.0、正規化の無いモデルでも書く)
         assert "--lora" in pg.evaluate("document.querySelector('#lx-result').textContent")
         pg.check("input[name=lx-kind][value=bake]")
         assert pg.evaluate("document.querySelector('#lx-file').placeholder") == "ppx-n2-headproj"
@@ -4110,7 +4446,7 @@ def test_recipe_lora_bake_panel(refine_server, browser):
         p = posts[1]["params"]
         assert p["file_stem"] == "My-Model_v1" and p["overwrite"] is False
         assert p["bake"] is True and p["via_f16"] is True and p["llama_quantize"] == "/opt/llama-quantize" and p["verify"] is True \
-            and p["contrast"] == "/c/x.yaml" and "requant" not in p and p["strip_meta"] is True
+            and p["contrast"] == "/c/x.yaml" and "requant" not in p and p["strip_meta"] is True and p["proj_correction"] == "postnorm"
         assert "strip_meta" not in posts[0]["params"]                                   # 既定は記録を入れる
         assert "adapter_name" not in p and pg.evaluate("document.querySelector('#lx-adname')") is None   # 焼き込みには名前の欄が無い
         txt = pg.evaluate("document.querySelector('#lx-result').textContent")

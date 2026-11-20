@@ -165,20 +165,37 @@ class Verifier:
         act = pick_act_name(names, L)
         if act is None:
             return VResult("V2", "FFN 线性性", "fail", f"找不到 ffn_down 的输入张量：{sorted(names)}")
-        caps = [self.capture({act, f"ffn_out-{L}"}, [ids]) for ids in self.prompt_ids]
+        # MLP の出力: ffn_out-L。名前の無い arch(LFM3)で MLP の出力のあとに正規化があれば、その出力(post_ffn_norm)と
+        # γ ⊙ y / rms(y) で比べる(正規化の掛かり方も同時に確かめる)
+        li = self.w.arch.layers[L]
+        out_name, post = f"ffn_out-{L}", None
+        if out_name not in names:
+            cand = [n for n in (f"model.layers.{{}}.post_ffn_norm-{L}", f"ffn_post_norm-{L}") if n in names]
+            if not cand or li.post_norm_ffn in ("", "?"):
+                return VResult("V2", "FFN 线性", "skip", f"计算图的名称中没有 L{L} 的 MLP 输出张量（ffn_out-{L}）"
+                               "（此 arch 的名称对应关系未确认）。W_down 的方向可用 V11（gain）验证")
+            out_name, post = cand[0], li.post_norm_ffn
+        caps = [self.capture({act, out_name}, [ids]) for ids in self.prompt_ids]
         a = np.concatenate([c[act] for c in caps])
-        out = np.concatenate([c[f"ffn_out-{L}"] for c in caps])
+        out = np.concatenate([c[out_name] for c in caps])
         W = self.w.down_matrix(L)
         s = (self.w.meta.ffn_down_scale or {}).get(L, 1.0)
         pred = s * (a @ W.T)
+        if post:
+            from .weights import tensor_to_f32
+            g = np.asarray(tensor_to_f32(self.w.tensor(f"blk.{L}.{post}.weight")), dtype=np.float32).reshape(-1)
+            eps = float(self.w.field(f"{self.w.meta.arch}.attention.layer_norm_rms_epsilon", 1e-6) or 1e-6)
+            norm = lambda y: g * y / np.sqrt((y * y).mean(axis=1, keepdims=True) + eps)   # noqa: E731
+            pred = norm(pred)
         rel = np.linalg.norm(pred - out, axis=1) / np.linalg.norm(out, axis=1)
         # 対照: ニューロン添字をずらすと一致しないこと(テストが添字の違いを見分けられる)
-        rel_shift = np.linalg.norm(s * (np.roll(a, 1, axis=1) @ W.T) - out, axis=1) / np.linalg.norm(out, axis=1)
+        shifted = s * (np.roll(a, 1, axis=1) @ W.T)
+        rel_shift = np.linalg.norm((norm(shifted) if post else shifted) - out, axis=1) / np.linalg.norm(out, axis=1)
         tol_med, tol_max = V2_TOL.get(self.w.meta.ffn_down_qtype, V2_TOL_DEFAULT)
         med, mx = float(np.median(rel)), float(rel.max())
         ok = med < tol_med and mx < tol_max and float(np.median(rel_shift)) > 0.5
         return VResult("V2", "FFN 线性性（W_down 的方向、下标，down 之后无变换）", "pass" if ok else "fail",
-                       f"L{L} `{act}` → W_down@a vs `ffn_out-{L}`：相对误差 中位数 {med:.4f} / 最大 {mx:.4f}"
+                       f"L{L} `{act}` → {'γ ⊙ y / rms(y)、y = W_down@a' if post else 'W_down@a'} vs `{out_name}`：相对误差 中位数 {med:.4f} / 最大 {mx:.4f}"
                        f"（允许 {tol_med}/{tol_max}，{len(rel)} 个 token）。将下标错开 1 后中位数为 {np.median(rel_shift):.2f}",
                        {"act_name": act, "median": med, "max": mx, "shift_median": float(np.median(rel_shift)),
                         "n_tokens": int(len(rel))})
@@ -281,6 +298,15 @@ class Verifier:
 
     # --- V13(§6.17 方向の射影消去、LoRA 版)--------------------------------------------------------------
 
+    def embed_component(self, ids: list[int], r: np.ndarray) -> np.ndarray:
+        """位置 1 以降の、層に入る前の残差(埋め込み)の r 成分。埋め込みを拡大する arch(Gemma 系などの inp_scaled)は捕捉した
+        値を使う(v0.9.0。それまでは token_embd の行のままで、Gemma では V13 の期待値がずれていた)。"""
+        names = set(self.e.list_names(ids[:16]))
+        if "inp_scaled" in names:
+            x = self.capture({"inp_scaled"}, [ids])["inp_scaled"]
+            return x[1:].astype(np.float64) @ r
+        return self.w.embed_rows(ids)[1:].astype(np.float64) @ r
+
     def _resid_all(self, engine: Engine, ids: list[int], lora=None) -> dict[int, np.ndarray]:
         """所有层（不含最后一层）的 l_out-L（不含位置 0 = attention sink）。"""
         Ls = list(range(engine.n_layer - 1))                    # 最終層は行が間引かれ得るので除く
@@ -306,7 +332,7 @@ class Verifier:
         from .ablate import bake_ablation_gguf, embed_in_lora, export_ablation_lora, unit
         r = unit(self.rng.standard_normal(self.w.meta.n_embd) if r is None else r)
         ids = self.prompt_ids[0]
-        er = self.w.embed_rows(ids)[1:].astype(np.float64) @ r    # 埋め込みの r 成分(inp_embd は捕捉できない)
+        er = self.embed_component(ids, r)                          # 埋め込みの r 成分(inp_embd は捕捉できない。拡大する arch は inp_scaled)
         base = self._resid_all(self.e, ids)
         variants = []
         with tempfile.TemporaryDirectory() as td:
@@ -463,22 +489,27 @@ class Verifier:
             data_out = {"neuron": n, "same_buf": bool(same_buf), "same_capture": bool(same_cap)}
             ok = same_buf and same_cap
             if llama_completion:
-                prompt = self.e.render_chat([{"role": "user", "content": PROMPTS[0]}])
-                ctx = self.e.steer_ctx()
-                gen = {}
-                for tag, vec in (("base", None), ("steer", {L: v})):
-                    self.e.set_cvec(ctx, vec)
-                    r = self.e.generate_greedy(ctx, [self.prompt_ids[0]], max_tokens=n_tokens)[0]
-                    ours = self.e.detokenize(r.token_ids[:-1] if r.finish == "eog" else r.token_ids)
-                    theirs = run_llama_completion(llama_completion, self.e, prompt, n_tokens,
-                                                  path if tag == "steer" else None)
-                    gen[tag] = {"ours": ours, "llama": theirs, "match": ours == theirs}
-                self.e.set_cvec(ctx, None)
-                differs = gen["steer"]["ours"] != gen["base"]["ours"]
-                ok = ok and gen["base"]["match"] and gen["steer"]["match"] and differs
-                detail += (f"。llama-completion --control-vector 的 greedy {n_tokens} 个 token：无干预 一致 {gen['base']['match']}、"
-                           f"干预 一致 {gen['steer']['match']}（干预后输出变化：{differs}）")
-                data_out["generation"] = gen
+                try:
+                    prompt = self.e.render_chat([{"role": "user", "content": PROMPTS[0]}])
+                    ctx = self.e.steer_ctx()
+                    gen = {}
+                    for tag, vec in (("base", None), ("steer", {L: v})):
+                        self.e.set_cvec(ctx, vec)
+                        r = self.e.generate_greedy(ctx, [self.prompt_ids[0]], max_tokens=n_tokens)[0]
+                        ours = self.e.detokenize(r.token_ids[:-1] if r.finish == "eog" else r.token_ids)
+                        theirs = run_llama_completion(llama_completion, self.e, prompt, n_tokens,
+                                                      path if tag == "steer" else None)
+                        gen[tag] = {"ours": ours, "llama": theirs, "match": ours == theirs}
+                    self.e.set_cvec(ctx, None)
+                    differs = gen["steer"]["ours"] != gen["base"]["ours"]
+                    ok = ok and gen["base"]["match"] and gen["steer"]["match"] and differs
+                    detail += (f"。llama-completion --control-vector 的 greedy {n_tokens} 个 token：无干预 一致 {gen['base']['match']}、"
+                               f"干预 一致 {gen['steer']['match']}（干预后输出变化：{differs}）")
+                    data_out["generation"] = gen
+                except RuntimeError as ex:                   # llama-completion を実行できない(この arch を読めない版など)
+                    self.e.set_cvec(self.e.steer_ctx(), None)
+                    detail += f"。省略生成比较：{ex}"
+                    data_out["generation_error"] = str(ex)[:500]
             else:
                 detail += "。缺少 llama-completion，因此省略生成比较"
         return VResult("V4", "direction.N 对应（GGUF 导出 → 原生加载器）", "pass" if ok else "fail", detail, data_out)
@@ -595,7 +626,10 @@ def run_llama_completion(binary: str, engine: Engine, prompt: str, n_tokens: int
     env = dict(os.environ)
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
     if p.returncode != 0:
-        raise RuntimeError(f"llama-completion 执行失败：{p.stderr[-2000:]}")
+        tail = (p.stderr or p.stdout or "").strip()[-800:]
+        raise RuntimeError(f"llama-completion（{binary}）失败，退出码 {p.returncode}"
+                           + (f"：{tail}" if tail else "（没有输出日志。此 llama-completion 的 llama.cpp 可能无法读取该 arch。"
+                              "请用 --llama-completion 传入能读取此模型的 llama-completion）"))
     # completion.cpp は生成の後に必ず "\n\n" を、EOG で止まったときはその前に " [end of text]\n" を出す
     out = p.stdout.removesuffix("\n\n")
     return out.removesuffix(" [end of text]\n")

@@ -200,8 +200,24 @@ class Weights:
     def check_arch(self) -> list[str]:
         """警告メッセージ一覧(§12 のマトリクスに対応)。"""
         m, out = self.meta, []
-        if m.has_post_ffn_norm:
-            out.append("存在 post_ffw_norm（Gemma 系）：它可作为方向加法生效，但不等价于“推动神经元 n”（§2.1）")
+        pf = [li.index for li in self.arch.layers if li.post_norm_ffn or li.has_post_ffn_norm]
+        pm = [li.index for li in self.arch.layers if li.post_norm_mixer not in ("", "?")]
+        pu = [li.index for li in self.arch.layers if li.post_norm_mixer == "?"]
+        if pf:
+            nm = sorted({li.post_norm_ffn if li.post_norm_ffn not in ("", "?") else "post_ffw_norm" for li in self.arch.layers
+                         if li.post_norm_ffn or li.has_post_ffn_norm})
+            out.append(f"MLP 的输出之后有归一化（{', '.join(nm)}）（{len(pf)} 层）：神经元的 add 仍起沿方向推动的作用，但进入残差的"
+                       "是经过归一化的部分，因此不等价于“推动了神经元 n”。神经元和整个 MLP 的投影与 ablate 会按归一化"
+                       "校正后应用（从写入中减去 normalize(γ⊙r̂)。用 --no-proj-correction 可按 v0.8.x 的相同计算）")
+        if pm:
+            nm = sorted({li.post_norm_mixer for li in self.arch.layers if li.post_norm_mixer not in ("", "?")})
+            out.append(f"注意力（混合层）的输出之后有归一化（{', '.join(nm)}）（{len(pm)} 层）：头和整个注意力的投影会按归一化"
+                       "校正后应用（s=1 时恰好移除方向成分。其他 s 不成比例，较大的 s 会遇到上限。用 --no-proj-correction 可按 v0.8.x 的"
+                       "相同计算）。不执行按写入量排序（--rank writes / heads writes）。请改用 --rank causal"
+                       "（在分数校正加入前按此处理）")
+        if pu:
+            out.append(f"层 {', '.join(map(str, pu[:6]))}{' …' if len(pu) > 6 else ''} 的 post_attention_norm 是注意力输出之后的归一化还是"
+                       "MLP 之前的归一化，此 arch 尚未确认（不在 configs/arch/residual_writers.yaml 的 output_norm 中）")
         if m.n_expert or any(n.endswith("ffn_down_exps.weight") for n in self._tensors):
             out.append(f"MoE（n_expert={m.n_expert}）：专家神经元使用 L:Ee:Nn 格式。add 是“沿写入方向推动”，"
                        "只有选中专家时才生效的真正神经元推动是 gain（CHANGE-05 §C）")

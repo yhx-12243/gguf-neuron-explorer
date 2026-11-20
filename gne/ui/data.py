@@ -639,7 +639,9 @@ class UIData:
             if not isinstance(d, dict):
                 d = {}
             return {"default_direction": d.get("default_direction") or None, "direction_layer": str(d.get("direction_layer") or "own"),
-                    "default_key": None if d.get("default_key") in (None, "") else str(d["default_key"])}
+                    "default_key": None if d.get("default_key") in (None, "") else str(d["default_key"]),
+                    # v0.9.0: 射影の補正の記録(postnorm / none)。記録の無い古いレシピは "unrecorded"(画面で知らせ続ける)
+                    "proj_correction": d.get("proj_correction") if d.get("proj_correction") in ("postnorm", "none") else "unrecorded"}
         return self._get(("recipe_extras", name), [p], build)
 
     # --- CHiPS で残った場面から keyed の JSON を作る(鍵のタブの「CHiPS で残った場面から作る」) --------------------------------
@@ -875,7 +877,8 @@ class UIData:
         p = self._pipeline_path(name)
         if not p.exists():
             raise GneError("NOT_FOUND", f"批处理结果 {name} 不存在", "可在 direction 视图的“从 JSON 创建方向和注意力头”中创建")
-        x = self._pipeline(name, p)
+        from ..causal import fill_most_reduced
+        x = fill_most_reduced(json.loads(json.dumps(self._pipeline(name, p))))   # 前の版の結果にも「A 側が最も下がった」の印(写しに付ける)
         spec = None
         c = Path(str(x.get("contrast") or ""))
         try:

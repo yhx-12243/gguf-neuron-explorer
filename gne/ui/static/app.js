@@ -15,6 +15,7 @@ import { EmbedView } from "./embed.js";
 import { DirectionView } from "./direction.js";
 import { EvalView } from "./eval.js";
 import { WritersView } from "./writers.js";
+import { GeometryView } from "./geometry.js";
 import { FiresPanel } from "./fires.js";
 import { JobsBar, KIND, computeMenu } from "./jobs.js";
 import { LayersView } from "./layers.js";
@@ -42,8 +43,16 @@ const state = {
 };
 window.gne = state;                       // 自動テスト(playwright)と開発用
 
-const MIXER = { attention: "attention", linear_attention: t("線形注意"), recurrent: t("回帰"), none: t("mixer なし") };
+const MIXER = { attention: "attention", linear_attention: t("線形注意"), recurrent: t("回帰"), conv: t("畳み込み"), none: t("mixer なし") };
 const mixerLabel = (li) => MIXER[li.mixer];
+// このモデルで書き込みの量での順位づけ(rank writes)を実行しない理由(実行できれば null)。サーバーの既定の切り替え(_rank_fallback)と同じ条件
+function writesBlocked(arch) {
+  if (!arch) return null;
+  if (arch.hc_streams) return t("このモデルは残差が {n} 本の流れ(hyper-connections)なので、書き込みの量での順位づけは実行しません(未対応)。止めて選ぶ流れで実行し、切り替えたことを結果に出します。", { n: arch.hc_streams });
+  const pn = (arch.layers || []).filter((li) => li.mixer === "attention" && li.post_norm_mixer && li.post_norm_mixer !== "?").length;
+  if (pn) return t("このモデルでは注意の層 {n} 個で出力のあとに正規化があるので、書き込みの量での順位づけは実行しません(点数が残差での寄与を表さないため)。止めて選ぶ流れで実行し、切り替えたことを結果に出します。正規化を補正した点数が次の版で入るまでの扱いです。", { n: pn });
+  return null;
+}
 const isMoE = () => state.arch.layers.some((li) => li.ffn.startsWith("moe"));
 const moeLayer = (L) => { const li = state.arch.layers[L]; return li && li.ffn.startsWith("moe") ? li : null; };
 // MoE の層の通し番号 → { expert, neuron }(MoE でなければ null)
@@ -235,6 +244,7 @@ function legend() {
   if (kinds.has("attention")) parts.push(it(sw("#9fb3cf"), t("attention(太い縁)")));
   if (kinds.has("linear_attention")) parts.push(it(sw("#3a4656"), t("線形注意(細い縁)")));
   if (kinds.has("recurrent")) parts.push(it(sw("#3a4656"), t("回帰(細い縁)")));
+  if (kinds.has("conv")) parts.push(it(sw("#3a4656"), t("畳み込み(細い縁)")));
   const floors = [...o.metas.values()].map((m) => m.floor);
   const color = o.field === "none" ? it(sw("#10141b"), t("データ無し"))
     : `<b>${esc(fieldLabel(o.field))}</b> ${legendHTML(o.field, o.scale || {}, { threshold: o.threshold, nHits: o.hits ? o.hits.length : 0, floors })}`;
@@ -680,7 +690,7 @@ function closeSearch() {
 }
 
 // --- LIST・NEURON ----------------------------------------------------------------------------------------
-let rank, neuron, layersView, searchList, chat, firesPanel, recipePanel, jobsBar, embedView, evalView, agent, headPanel, writersView, expertPanel, directionView;
+let rank, neuron, layersView, searchList, chat, firesPanel, recipePanel, jobsBar, embedView, evalView, agent, headPanel, writersView, expertPanel, directionView, geometryView;
 
 // パネル(左の LIST、右の「くわしく見る」と「レシピ」)を開く。真ん中の画面が狭くなりすぎたときだけ、ほかのパネルを細くたたむ:
 // くわしく見るを開くときはレシピ → LIST の順(レシピは足せば開き直す)、LIST を開くときはレシピを、レシピを開くときは LIST を。見ている「くわしく見る」はたたまない
@@ -854,6 +864,7 @@ async function onJobFinished(j) {
   if (j.kind === "layout") { layoutCache.clear(); if (state.layout === j.params.kind) applyLayout(state.layout); }
   if (j.kind === "connections" && state.focus) { showLinks(); neuron.render(); }
   if (j.kind === "eval" && evalView) evalView.refresh(j.result && j.result.name);
+  if (j.kind === "heads_writes" && j.status === "done" && geometryView) geometryView.refresh(j.result && j.result.name);   // 層の幾何の材料
   if (j.kind === "writers" && j.status === "done") {                      // 書き手の分析: overlay の選択肢と writers ビュー
     await refreshModel();
     fillColorSelect();
@@ -943,6 +954,7 @@ async function setView(v) {
   ev.classList.toggle("hidden", v !== "embed");
   xv.classList.toggle("hidden", v !== "eval");
   wv.classList.toggle("hidden", v !== "writers");
+  $("#geometry-view").classList.toggle("hidden", v !== "geometry");
   dv.classList.toggle("hidden", !dm);
   if (dm) {                                                                // 方向・CHiPS・鍵・FiSH・強さの候補
     if (!state.model) { dv.innerHTML = `<p class="muted view-empty">${t("合成の構造には direction ビューのデータがありません")}</p>`; return; }
@@ -958,6 +970,7 @@ async function setView(v) {
           onEval: (params, label) => sendToEval(params, label),           // 評価へ送る(評価の画面で確かめてから始める)
           onOverlay: (field) => { setView("map"); applyOverlay(field); },
           isLoop: () => !!(state.arch && state.arch.loop),               // 同じ層を 2 回実行するモデル(ループの中の部品の方向の欄)
+          writesBlocked: () => writesBlocked(state.arch),               // 書き込みの量での順位づけを実行しないモデル(既定は止めて選ぶ流れ)
         },
         candidates: {                                                     // 強さの候補(heads_candidates)の候補を使う
           onLoadCandidate: (c) => loadCandidate(c),
@@ -988,6 +1001,16 @@ async function setView(v) {
     await directionView.refresh();
     return;
   }
+  if (v === "geometry") {                                                  // 層の幾何(gne heads geometry)
+    const gv = $("#geometry-view");
+    if (!state.model) { gv.innerHTML = `<p class="muted view-empty">${t("合成の構造には層の幾何の材料がありません")}</p>`; return; }
+    if (!geometryView) {
+      geometryView = new GeometryView(gv, { onRun: (kind, p) => jobsBar.start(kind, p) });   // 質問ごとの更新を作る(heads_writes)
+      state.geometryView = geometryView;                                 // 自動テスト用
+    }
+    await geometryView.refresh();
+    return;
+  }
   if (v === "writers") {                                                   // 書き手の強さ(gne writers)
     if (!state.model) { wv.innerHTML = `<p class="muted view-empty">${t("合成の構造には writers がありません")}</p>`; return; }
     if (!writersView) {
@@ -1012,7 +1035,8 @@ async function setView(v) {
                                       return replaceRecipe(rd.name || "", () => {
                                         state.recipe.load(rd.name || "", us, rd.ablate, rd.sampling, rd.direction_layer,
                                                           { default_direction: rd.default_direction, default_key: rd.default_key,
-                                                            loop_edits: rd.loop_edits });   // keyed の既定・2 回実行するモデルの当て方
+                                                            loop_edits: rd.loop_edits,       // keyed の既定・2 回実行するモデルの当て方
+                                                            proj_correction: rd.proj_correction || "unrecorded" });   // 射影の補正の記録(v0.9.0)
                                         if (scale !== 1) state.recipe.applyScale(scale);
                                       });
                                     } });
@@ -1234,6 +1258,9 @@ async function main() {
       nLayer: state.arch.n_layer,
       onAdded: () => recipeTouched(true),
       onReplaced: () => showRecipe("units"),
+      doseSpread: () => (state.model ? state.model.dose_spread : null),
+      postNorm: () => !!(state.arch && (state.arch.layers || []).some((li) => (li.post_norm_mixer && li.post_norm_mixer !== "?")
+                                                                         || (li.post_norm_ffn && li.post_norm_ffn !== "?"))),
     });
     headPanel = new HeadPanel($("#head-body"), {
       onRecipe: (L, h, k) => {

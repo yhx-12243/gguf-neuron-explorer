@@ -90,6 +90,11 @@ class Setup:
         return out
 
 
+
+def _corr_label(session) -> str:
+    """配分で保存するレシピに記録する射影の補正(v0.9.0。セッションの --no-proj-correction に従う)。"""
+    return "postnorm" if getattr(session, "proj_correction", True) else "none"
+
 def prepare(session, direction: str | DirectionSet, contrast, *, score_layers=None, primary: int | None = None,
             positions: str = "last", subset: str = "all", b_examples: int = 16, direction_layer: str = "own",
             max_examples: int | None = None) -> Setup:
@@ -111,7 +116,8 @@ def prepare(session, direction: str | DirectionSet, contrast, *, score_layers=No
     b_idx = list(range(nb)) if b_examples <= 0 or b_examples >= nb else \
         [int(x) for x in np.linspace(0, nb - 1, b_examples).round().astype(int)]
     st = Setup(session, ds, cs, sc, Ls, prim, ProjBuilder(session.weights, session.direction_set,
-                                                          direction_layer=direction_layer),
+                                                          direction_layer=direction_layer,
+                                                          correction=getattr(session, "proj_correction", True)),
                TmpLora(session), sorted(set(b_idx)))
     st.base = st.measure(None)
     return st
@@ -180,19 +186,27 @@ def screen_layers(session, ds, cs, *, mode: str = "ablate", layers=None, score_l
 # --- 直接の寄与 ------------------------------------------------------------------------------------------
 
 def head_contrib(st: Setup, heads: list[tuple[int, int]], *, chunk: int = 4) -> dict[tuple[int, int], dict[str, float]]:
-    """無介入の A 側で、ヘッドが書く r̂_Sᵀ W[:, blk_h] x_h の平均(層 S ごと。S より後ろのヘッドは 0)。"""
+    """無介入の A 側で、ヘッドが書く r̂_Sᵀ W[:, blk_h] x_h の平均(層 S ごと。S より後ろのヘッドは 0)。注意の出力のあとに
+    正規化がある層(v0.9.0)は、残差に入る分 (γ ⊙ r̂_S)ᵀ W[:, blk_h] x_h / rms_t(rms_t はトークン t の層全体の書き込みの rms)。"""
     from .attn import capture_attention
+    from .postnorm import eps_of
+    from .postnorm import gamma as _pn_gamma
     s, w = st.session, st.session.weights
     # 2 回の重みが共有されているヘッドは、両方の回の書き込みを足す(1 回目の層の番号で表したヘッドが、2 回目の層でも書く)
     vis = {L: _visits(s, L) for L in {L for L, _ in heads}}
     Ls = sorted({V for vs in vis.values() for V in vs})
     U = {}                                        # (S, L) → (n_head, head_dim)
+    G = {L: (_pn_gamma(w, L, "mixer") if getattr(s, "proj_correction", True) else None) for L in Ls}
+    WL = {}
     for L in Ls:
         li = w.arch.layers[L]
         W = st.builder.W(L)
+        if G[L] is not None:
+            WL[L] = W.astype(np.float64)
         for S in st.score_layers:
             if L <= S:
-                U[(S, L)] = (st.scorer.r[S] @ W).reshape(li.n_head, li.head_dim)
+                rr = st.scorer.r[S] if G[L] is None else st.scorer.r[S] * G[L]
+                U[(S, L)] = (rr @ W).reshape(li.n_head, li.head_dim)
     acc = {hk: {str(S): 0.0 for S in st.score_layers} for hk in heads}
     # 直接の書き込みはヘッドの出力を捕まえて測るので、捕捉の上限より長い質問は除く(止めて測る段階は長さの制限がない)
     items = [x for x in st.scorer.items["A"] if len(x[0]) <= s.engine.probe_ubatch]
@@ -205,6 +219,11 @@ def head_contrib(st: Setup, heads: list[tuple[int, int]], *, chunk: int = 4) -> 
         caps = capture_attention(s, [ids for ids, _ in part], layers=Ls, want_pattern=False)
         for ac, (_, rows) in zip(caps, part, strict=True):
             n += 1
+            inv = {}                                                       # 正規化のある層: トークンごとの 1/rms(層全体の書き込み)
+            for V in WL:
+                if V in ac.head_out:
+                    y = ac.head_out[V][rows].reshape(len(ac.head_out[V][rows]), -1).astype(np.float64) @ WL[V].T
+                    inv[V] = 1.0 / np.sqrt(np.mean(y * y, axis=1) + eps_of(w))
             for (L, h) in heads:
                 for V in vis[L]:
                     if V not in ac.head_out:
@@ -212,7 +231,8 @@ def head_contrib(st: Setup, heads: list[tuple[int, int]], *, chunk: int = 4) -> 
                     x = ac.head_out[V][rows, h, :].astype(np.float64)      # (P, head_dim)
                     for S in st.score_layers:
                         if (S, V) in U:
-                            acc[(L, h)][str(S)] += float((x @ U[(S, V)][h]).mean())
+                            c = x @ U[(S, V)][h]
+                            acc[(L, h)][str(S)] += float((c * inv[V]).mean() if V in inv else c.mean())
     s.engine.free_attn_probe()
     return {hk: {k: v / max(n, 1) for k, v in d.items()} for hk, d in acc.items()}
 
@@ -297,6 +317,67 @@ def screen_heads(session, ds, cs, *, layers=None, candidates=None, mode: str = "
         if progress:
             progress(i + 1, len(heads), f"causal {mode}: L{L} H{h}")
     return rows
+
+
+def mark_most_reduced(rows: list[dict], key: str = "a_mean") -> dict | None:
+    """組の比較表の行のうち、A 側が最も下がった行(元の方向・元の目標で測った A 側の射影の値の平均 key が最小)に
+    most_reduced: True を付け、その行を返す(v0.9.0)。推す規則(推奨)とは別の印で、推す行は変えない。同じ値なら部品の少ない行。
+    飛ばした行(skipped)と値の無い行は数えない。"""
+    cand = [r for r in rows if isinstance(r, dict) and not r.get("skipped") and r.get(key) is not None]
+    for r in rows:
+        if isinstance(r, dict) and not r.get("skipped"):
+            r["most_reduced"] = False
+    if not cand:
+        return None
+    best = min(cand, key=lambda r: (float(r[key]), int(r.get("n_heads") or r.get("n_used") or 0)))
+    best["most_reduced"] = True
+    return best
+
+
+def most_reduced_summary(out: dict) -> dict | None:
+    """一括・配分の結果(allocate の表と s1 の行)に most_reduced の印を付け、結果に載せる要約を返す。応答での確かめで
+    壊れたと分かった行(replies_break)は replies_break: True を添える(印は付けたまま、警告を並べて出す)。"""
+    a = out.get("allocate") if "allocate" in out else out
+    if not isinstance(a, dict):
+        return None
+    s1 = a.get("s1")
+    rows = ([dict(s1, n_heads=None, s1=True)] if isinstance(s1, dict) and s1.get("a_mean") is not None else []) + list(a.get("table") or [])
+    best = mark_most_reduced(rows)
+    if isinstance(s1, dict) and rows and rows[0].get("s1"):
+        s1["most_reduced"] = bool(rows[0].get("most_reduced"))
+    if best is None:
+        return None
+    ck = out.get("check") or {}
+    broke = bool(best.get("replies_break")) or bool(ck.get("break_warning") and ck.get("n_heads") == best.get("n_heads")
+                                                    and not best.get("s1"))
+    return {"n_heads": best.get("n_heads"), "s1": bool(best.get("s1")), "units": best.get("units"), "recipe": best.get("recipe"),
+            "a_mean": best.get("a_mean"), "remain": best.get("remain"), "reached": bool(best.get("reached")),
+            "recommended": bool(best.get("recommended")), "replies_break": broke}
+
+
+def refine_most_reduced(rows: list[dict], comb_key=None, has_comb: bool = False) -> dict | None:
+    """残りから追加の合わせたレシピの行(combined_rows)に most_reduced の印を付け、要約を返す。A 平均は合わせたレシピを
+    元の方向・元の目標で測った値(a_mean_after)。応答での確かめで壊れた行は replies_break: True。"""
+    mr = mark_most_reduced(rows, "a_mean_after")
+    if mr is None:
+        return None
+    return {"key": mr.get("key"), "n_heads": mr.get("n_heads"), "n_added": mr.get("n_added"), "recipe": mr.get("recipe"),
+            "a_mean_after": mr.get("a_mean_after"), "remain_after": mr.get("remain_after"), "verdict": mr.get("verdict"),
+            "recommended": bool(has_comb and mr.get("key") == comb_key),
+            "replies_break": mr.get("verdict") == "replies_break" or bool((mr.get("check") or {}).get("break_warning"))}
+
+
+def fill_most_reduced(res: dict) -> dict:
+    """v0.9.0 より前に保存した一括の結果(印の無いもの)にも、画面で開くときに most_reduced の印を付ける(ファイルは書き換えない)。"""
+    a = res.get("allocate") or {}
+    rows = [r for r in (a.get("table") or []) if isinstance(r, dict) and not r.get("skipped")]
+    if rows and not any("most_reduced" in r for r in rows):
+        res["most_reduced"] = most_reduced_summary(res)
+    R = res.get("refine")
+    if isinstance(R, dict) and R.get("combined_rows") and not any("most_reduced" in c for c in R["combined_rows"]):
+        comb = R.get("combined")
+        R["most_reduced"] = refine_most_reduced(R["combined_rows"], (comb or {}).get("key"), comb is not None)
+    return res
 
 
 def spearman(a: list[float], b: list[float]) -> float | None:
@@ -523,7 +604,7 @@ def allocate(session, ds, cs, *, candidates, target: float, score_layer: int, ha
         init = {"heads": [p.spec() for p in cur], "alpha": alpha, "mean_a": val, "reached": reached}
         ipath = session.store.heads_dir(session.meta.model_id) / f"{name}.alloc-initial.yaml"   # 効率で配り直す前の組も試せるように残す
         Recipe(heads_to_units(cur, ds.name), session.meta.model_id, name=f"{name}-initial", default_direction=ds.name,
-               direction_layer=direction_layer).save(ipath)
+               direction_layer=direction_layer, proj_correction=_corr_label(session)).save(ipath)
         init["recipe"] = str(ipath)
     # 効きにくい例
     if hard_subset is not None:
@@ -621,7 +702,7 @@ def allocate(session, ds, cs, *, candidates, target: float, score_layer: int, ha
         par, orth = drift(st.base["B_resid"][S], gb["B"]["resid"][S], st.scorer.r[S])
         units = heads_to_units(heads, ds.name)
         rec = Recipe(units, session.meta.model_id, name=f"{name}-n{n}", default_direction=ds.name,
-                     direction_layer=direction_layer)
+                     direction_layer=direction_layer, proj_correction=_corr_label(session))
         rpath = session.store.heads_dir(session.meta.model_id) / f"{name}.alloc-n{n}.yaml"
         rec.save(rpath)
         table.append({"n_heads": n, "heads": [{"layer": p.layer, "head": p.head, "s": p.s,
@@ -648,6 +729,7 @@ def allocate(session, ds, cs, *, candidates, target: float, score_layer: int, ha
         rec_n = min(r["n_heads"] for r in same)
     for r in table:
         r["recommended"] = r.get("n_heads") == rec_n and rec_n is not None
+    mark_most_reduced(table)                       # A 側が最も下がった組(推す組とは別の印、v0.9.0)
     # 5. 知らせるだけ(推す組と強さは変えない): 最初の組(効き目に比例)を同じ物差しで測った 1 行と、効率で配り直した組から
     #    外れた最初の組のヘッド。配り直しで、止めたときの効き目が大きいヘッドが外れることがある
     initial_row, dropped = None, []

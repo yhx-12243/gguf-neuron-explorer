@@ -108,7 +108,7 @@ class _Acc:
                 pb = np.concatenate([Pb[:, :, :sb].sum(axis=2, keepdims=True), Pb[:, :, sb:]], axis=2)
                 self.js[L].append(_js_bits(pa, pb).mean(axis=1))
 
-    def metrics(self, weights, dirs: dict[int, np.ndarray] | None) -> dict[int, dict[str, np.ndarray | None]]:
+    def metrics(self, weights, dirs: dict[int, np.ndarray] | None, correction: bool = True) -> dict[int, dict[str, np.ndarray | None]]:
         out = {}
         for L in self.layers:
             m: dict[str, np.ndarray | None] = {k: None for k in METRICS}
@@ -121,12 +121,16 @@ class _Acc:
                 typ = self.nsum[L] / self.rows
                 m["out_shift"] = np.linalg.norm(delta, axis=1) / np.maximum(typ, 1e-9)
                 if dirs is not None and L in dirs:
+                    from .postnorm import gamma as _pn_gamma
                     W = weights.head_writer_matrix(L)                 # (n_embd, n_head·head_dim)
                     hd = delta.shape[1]
                     r = dirs[L] / max(float(np.linalg.norm(dirs[L])), 1e-12)
+                    g = _pn_gamma(weights, L, "mixer") if correction else None   # 正規化のある層: 残差に入る向きは γ ⊙ W_O,h Δ(v0.9.0)
                     cos = []
                     for h in range(delta.shape[0]):
                         v = W[:, h * hd:(h + 1) * hd] @ delta[h]
+                        if g is not None:
+                            v = g * v
                         nv = float(np.linalg.norm(v))
                         cos.append(float(v @ r) / nv if nv > 0 else 0.0)
                     m["dir_cos"] = np.array(cos)
@@ -219,8 +223,8 @@ def heads_contrast(session, contrast: str | Path, *, name: str | None = None, di
                         "triggers": [text[offs[t][0]:offs[t][1]] for t in trig_a]})
         tick(f"heads: {i + 1}/{n}")
     e.free_attn_probe()
-    rows = _flatten(main.metrics(w, dirs), kinds)
-    nrows = _flatten(null.metrics(w, dirs), kinds)
+    rows = _flatten(main.metrics(w, dirs, getattr(session, "proj_correction", True)), kinds)
+    nrows = _flatten(null.metrics(w, dirs, getattr(session, "proj_correction", True)), kinds)
     if not rows:
         raise GneError("BAD_CONTRAST", "没有可测量的注意力头")
     stats = {}
@@ -336,12 +340,14 @@ def parse_heads(spec: str, weights, *, any_mixer: bool = False) -> list[tuple[in
 _POST_NORM_W = "blk.{L}.post_attention_norm.weight"
 
 
-def _post_norm_out(arch: str, extra: dict, L: int) -> str | None:
-    """attention の出力の後の norm の出力の捕捉名(LFM3 の post_operator_norm、Gemma 系の attn_post_norm)。無ければ None。"""
-    for nm in extra:
-        if nm.endswith(f"post_operator_norm-{L}") or (arch.startswith("gemma") and nm == f"attn_post_norm-{L}"):
-            return nm
-    return None
+def _post_norm_out(weights, extra: dict, L: int) -> str | None:
+    """attention の出力の後の norm の出力の捕捉名(捕捉の表の mixer_post。LFM3 の post_operator_norm、Gemma 系の attn_post_norm)。
+    構造で正規化が無い層・表に無い arch は None(Qwen3.5 などの attn_post_norm は MLP の手前の正規化なので拾わない)。"""
+    from .postnorm import layer_names
+    if weights.arch.layers[L].post_norm_mixer in ("", "?"):
+        return None
+    nm = layer_names(weights, L).get("mixer_post")
+    return nm if nm in extra else None
 
 
 def listen_view(session, user: str, *, heads: str | list[tuple[int, int]], system: str | None = None,
@@ -379,7 +385,9 @@ def listen_view(session, user: str, *, heads: str | list[tuple[int, int]], syste
         extra += [nm for nm in names if nm.endswith(f"-{L}") and "gate" in nm and "ffn" not in nm]
         extra += [nm for nm in (f"kqv_out-{L}", f"attn_pregate-{L}", f"attn_gated-{L}", f"attn_output-{L}", f"attn_post_norm-{L}")
                   if nm in names]
-        extra += [nm for nm in names if nm.endswith(f"post_operator_norm-{L}")]
+        from .postnorm import layer_names
+        mp = layer_names(w, L).get("mixer_post")
+        extra += [mp] if mp in names and mp not in extra else []
         if f"ffn_inp-{L}" in names and L > 0 and f"l_out-{L - 1}" in names:   # attention の出力 = ffn_inp − 層の入力
             extra += [f"ffn_inp-{L}", f"l_out-{L - 1}"]
     ac = capture_attention(session, [ids], layers=Ls, want_pattern=True, want_head_out=False, want_qkv=bool(direction),
@@ -428,8 +436,8 @@ def listen_view(session, user: str, *, heads: str | list[tuple[int, int]], syste
             Vh = V[:, np.arange(H) // grp, :].astype(np.float64)          # (T, H, hd)
             O = np.einsum("hts,shk->thk", P[:, st:, :].astype(np.float64), Vh)
             out = np.einsum("dhk,thk->td", WO, O * G)                     # (Tr, n_embd) 書き込み行列の出力(norm の前)
-            gname = _POST_NORM_W.format(L=L)
-            ref_nm = _post_norm_out(w.meta.arch, ac.extra, L)
+            gname = f"blk.{w.stored(L)}.{li.post_norm_mixer}.weight" if li.post_norm_mixer not in ("", "?") else _POST_NORM_W.format(L=L)
+            ref_nm = _post_norm_out(w, ac.extra, L)
             post = ref_nm is not None and w.has_tensor(gname)
             if post:
                 gam = np.asarray(tensor_to_f32(w.tensor(gname)), np.float64).reshape(-1)
@@ -591,6 +599,30 @@ def static_dims(weights, L: int, frac: float = 0.25) -> np.ndarray:
     return np.concatenate([np.arange(half - m, half), np.arange(hd - m, hd)])
 
 
+def query_capture_names(session, cs, L: int) -> tuple[str, str, str]:
+    """heads query が捕捉する名前: 注意の層に入る値を正規化したもの・正規化の後で RoPE の前の K・正規化の前の Q。捕捉の表
+    (configs/arch/residual_writers.yaml の attn_in・k_normed)にあればそれ、無ければ llama.cpp のふつうの名前(attn_norm・Kcur_normed)。
+    グラフに見えない名前があれば、内部のエラーではなく理由を添えて止める(v0.9.0。LFM2・LFM3 は名前が違い KeyError で落ちていた)。"""
+    from .postnorm import layer_names
+    w, e = session.weights, session.engine
+    nm = layer_names(w, L)
+    in_nm = nm.get("attn_in") or f"attn_norm-{L}"
+    k_nm = nm.get("k_normed") or f"Kcur_normed-{L}"
+    qname = f"Qcur_full-{L}" if w.meta.arch in GATED_Q_ARCHS else f"Qcur-{L}"
+    msgs = [{"role": "system", "content": cs.system_a}, {"role": "user", "content": cs.user_prompts[0]}]
+    seen = set(e.list_names(e.tokenize_prompt(e.render_chat(msgs))[:16]))
+    what = {in_nm: "进入注意力层的值的归一化结果", k_nm: "逐头归一化之后、RoPE 之前的 K", qname: "归一化之前的 Q"}
+    missing = [f"{what[x]}({x})" for x in (in_nm, k_nm, qname) if x not in seen]
+    if missing:
+        raise GneError("ARCH_UNSUPPORTED", f"heads query 无法执行。原因：此模型（arch {w.meta.arch}）的计算图中找不到层 {L} 的 "
+                                           + "、".join(missing) + " 的名称",
+                       "请在 configs/arch/residual_writers.yaml 的 capture 表中填写此 arch 的 attn_in、k_normed 名称")
+    if not w.has_tensor(f"blk.{L}.attn_norm.weight"):
+        raise GneError("ARCH_UNSUPPORTED", f"heads query 无法执行。原因：层 {L} 没有注意力层输入归一化的权重"
+                                           f"（blk.{L}.attn_norm.weight）（输入不归一化的结构）")
+    return in_nm, k_nm, qname
+
+
 def query_vectors(session, L: int, h: int, *, direction: str, seek: str | Path, frac: float = 0.25) -> dict:
     """クエリ操作の u・v と、倍率の目安。
     v: 層 L に入る残差のペルソナ方向 r(gne direction の r_{L-1})を attn_norm の重み γ で割った向き(v·norm(x) ∝ r·x)から、
@@ -613,15 +645,18 @@ def query_vectors(session, L: int, h: int, *, direction: str, seek: str | Path, 
         raise GneError("BAD_CONTRAST", f"{seek} 中没有 triggers（需要用于查找的词）")
     ds = session.direction_set(direction)
     src = L - 1 if (L - 1) in ds.raw else L
+    if li.mixer != "attention" or not li.head_dim:
+        raise GneError("BAD_ARGS", f"heads query 无法执行。原因：层 {L} 不是注意力层（混合层类型：{li.mixer}）")
+    in_nm, k_nm, qname = query_capture_names(session, cs, L)
     gamma = w.tensor(f"blk.{L}.attn_norm.weight")
     from .weights import tensor_to_f32
     g = np.asarray(tensor_to_f32(gamma), dtype=np.float32).reshape(-1)
-    v = ds.raw[src] / np.where(np.abs(g) > 1e-6, g, 1e-6)
+    from .direction import require_length
+    v = require_length(ds, src, f"层 {L} 头的 query 向量").astype(np.float32) / np.where(np.abs(g) > 1e-6, g, 1e-6)
     v = (v / np.linalg.norm(v)).astype(np.float32)
     grp = kv_group(h, li.n_head, li.n_head_kv)
     dims = static_dims(w, L, frac)
-    qname = f"Qcur_full-{L}" if w.meta.arch in GATED_Q_ARCHS else f"Qcur-{L}"
-    names = [f"attn_norm-{L}", f"Kcur_normed-{L}", qname]
+    names = [in_nm, k_nm, qname]
     kt, ko, xa, xb, qn = [], [], [], [], []
     for side, system in (("A", cs.system_a), ("B", cs.system_b)):
         for u_text, tr in zip(cs.user_prompts, trig, strict=True):
@@ -634,11 +669,11 @@ def query_vectors(session, L: int, h: int, *, direction: str, seek: str | Path, 
                 continue
             user = [i for i, (a, b) in enumerate(offs) if b > a and a >= at and b <= at + len(u_text)]
             tail = [len(ids) - 1]                                           # 返事を書き始める位置(最後のトークン)
-            xs = ac.extra[f"attn_norm-{L}"]
+            xs = ac.extra[in_nm]
             (xa if side == "A" else xb).append(xs[tail])
             if side != "A":
                 continue
-            K = ac.extra[f"Kcur_normed-{L}"].reshape(len(ids), -1, li.head_dim)[:, grp, :]
+            K = ac.extra[k_nm].reshape(len(ids), -1, li.head_dim)[:, grp, :]
             tt = set(spans_to_tokens(offs, [(s + at, t + at) for s, t in find_spans(u_text, tr)]))
             kt += [K[i] for i in user if i in tt]
             ko += [K[i] for i in user if i not in tt]

@@ -546,34 +546,47 @@ class AttnCapture(TargetCapture):
     def __init__(self, session, layers):
         super().__init__(session, layers)
         w = session.weights
+        self.pn: list[int] = []
         for L in self.layers:
             li = w.arch.layers[L]
             if li.mixer not in ("attention", "linear_attention") or not li.head_writer or not li.head_dim:
                 raise GneError("ARCH_UNSUPPORTED", f"层 {L}（{li.mixer}）中没有把注意力头输出写入残差的权重矩阵（attn_output / ssm_out）。attn 键只适用于 attention / 线性注意力层")
-            K.post_norm_gamma(w, L, "attn")                       # post-norm の arch は断る
+            if li.post_norm_mixer in ("", "?"):
+                K.post_norm_gamma(w, L, "attn")                   # 表で決まらない post-norm の arch は鍵も作らない
+            else:                                                 # 注意の出力のあとに正規化がある層(v0.9.0): 鍵は作れる(書き込みは keyed_plan が止める)
+                self.pn.append(L)
             K.writer_out_scale(w, L, "attn")                      # .scale と LoRA の掛かり方が分からなければ断る
             n_in = K.writer_in_dim(w, L, "attn")
             if n_in != li.n_head * li.head_dim:
                 raise GneError("ARCH_UNSUPPORTED", f"层 {L}：{li.head_writer} 的输入 {n_in} 与 n_head·head_dim = {li.n_head}·{li.head_dim} 不一致")
             self.in_dim[L] = n_in
         self._name: dict[int, str] = {}
+        self._gate: dict[int, str | None] = {}
         self._layer_of: dict[str, int] = {}
+        if self.pn:
+            session.warn(f"层 {', '.join(map(str, self.pn))} 在注意力输出之后有归一化。仍会构建 attn 的键（可用 key-check "
+                         "验证拆分方式），但在确认归一化部分的校正之前，不会执行 keyed 的 attn 写入")
 
     def bind(self, seen: set[str]) -> None:
-        from .attn import head_out_names
-        heads = head_out_names(self.session, seen, self.layers)
-        arch = self.session.weights.arch
-        self._name, self._layer_of = {}, {}
+        from .postnorm import head_out_parts, require_writer_sums
+        w = self.session.weights
+        arch = w.arch
+        self._name, self._gate, self._layer_of = {}, {}, {}
         for L in self.layers:
-            nm = f"attn_sub_norm-{L}" if (arch.layers[L].mixer == "attention" and f"attn_sub_norm-{L}" in seen) else heads.get(L)
-            if nm is None:
+            if arch.layers[L].mixer == "attention" and f"attn_sub_norm-{L}" in seen:
+                p = (f"attn_sub_norm-{L}", None)
+            else:
+                p = head_out_parts(w, seen, L)
+            if p is None:
                 li = arch.layers[L]
                 raise GneError("ARCH_UNSUPPORTED", f"层 {L} 的 {li.head_writer} 输入（注意力头输出拼接 {' / '.join(f'{b}-{L}' for b in li.head_out)}）无法捕获")
-            self._name[L] = nm
-            self._layer_of[nm] = L
+            self._name[L], self._gate[L] = p
+            self._layer_of[p[0]] = L
+        if any(self._gate.values()):                      # ゲートを掛けて作る出力(LFM3): 名前と式を先に確かめる
+            require_writer_sums(self.session, "attn 键构建")
 
     def names(self, L: int) -> list[str]:
-        return [self._name[L]]
+        return [self._name[L]] + ([self._gate[L]] if self._gate.get(L) else [])
 
     def token_rows(self, nm, arr, T):
         L = self._layer_of.get(nm)
@@ -588,7 +601,21 @@ class AttnCapture(TargetCapture):
         x = got[self._name[L]]
         if x.shape[1] != self.in_dim[L]:
             raise GneError("ARCH_UNSUPPORTED", f"层 {L}：捕获到的 {self._name[L]} 宽度 {x.shape[1]} 与权重矩阵输入维度 {self.in_dim[L]} 不一致")
+        if self._gate.get(L):                             # ヘッドごとのゲートを掛ける(LoRA の A が読むのはゲートの後の連結)
+            from .postnorm import gated
+            li = self.session.weights.arch.layers[L]
+            x = gated(x, got[self._gate[L]], li.n_head, li.head_dim).reshape(x.shape[0], -1).astype(np.float32)
         return x[sel], None
+
+    def post_norm(self, L: int) -> bool:
+        return L in self.pn
+
+    def rms(self, x, L):
+        if L not in self.pn:
+            return None
+        from .postnorm import eps_of
+        w = self.session.weights
+        return rms_rows(x, w.head_writer_matrix(L), eps=eps_of(w))
 
 
 class SharedCapture(TargetCapture):

@@ -120,6 +120,8 @@ class Session:
         self._engine_kw = dict(n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, n_seq_max=n_seq_max, verbose=verbose,
                                mmproj=mmproj)       # mmproj: 音声の入力(media.py)。無ければモデルの横の mmproj*.gguf
         self._engine: Engine | None = None
+        # v0.9.0: 出力のあとに正規化がある層の射影(proj)・ablate を補正するか(--no-proj-correction で False。レシピの記録が優先)
+        self.proj_correction = True
         self._resid: ResidStats | None = None
         self.last_patch_reload_s: float | None = None   # パッチを当てたコピーの読み直しにかかった秒(CHANGE-05)
 
@@ -233,9 +235,15 @@ class Session:
         sp = Speed(self)
         speed = {**sp.to_dict(), "cpu_layers": m.n_layer - sp.gpu_layers,
                  "decode_tok_s": 1000.0 / sp.step1, "large": is_large(self)}
-        return {"meta": meta, "arch_warnings": self.weights.check_arch(), "llama_cpp": llama,
+        aw = self.weights.check_arch()
+        ds = self.dose_spread()
+        if ds and ds.get("warn"):
+            aw = [*aw, f"此模型中残差的大小集中在少数维度上（去掉最大的 {ds['top']} 个成分后，残差大小的中位数"
+                       f"约为 1/{ds['median']:.1f}）。因此强度（rel）1 相当于去掉偏斜后大小的约 {ds['median']:.1f} 倍"
+                       "（偏斜较少的模型约为 1.3 倍）。请从较弱的强度开始尝试"]
+        return {"meta": meta, "arch_warnings": aw, "llama_cpp": llama,
                 "bake": {"supported": mode is not None, "mode": mode, "reason": reason, "checked_llama_cpp": checked},
-                "stats": {"resid": str(rp) if rp.exists() else None, "act_layers": acts},
+                "stats": {"resid": str(rp) if rp.exists() else None, "act_layers": acts, "dose_spread": ds},
                 "residual_writers": writer_info(self.weights), "speed": speed,
                 "workflow": recommended_workflow(self) if speed["large"] else None}
 
@@ -323,7 +331,8 @@ class Session:
     def recipe(self, *, units: list[str] | None = None, path: str | Path | None = None,
                dose_unit: str | None = None, scale: float = 1.0, name: str | None = None,
                when: str | None = None, ablate: str | dict | None = None, default_direction: str | None = None,
-               direction_layer: str | None = None, default_key: str | None = None) -> Recipe:
+               direction_layer: str | None = None, default_key: str | None = None,
+               proj_correction: str | None = None) -> Recipe:
         """ablate 表示方向的投影消除（§6.17）。格式为 "NAME[@层][:倍率]" 或 {direction, scale, layers, from_layer}。
         也可以创建仅含 ablate（不含单元）的配方。default_key は #KEY を省いた keyed のユニットの鍵(CHANGE-07)。
         keyed のユニットは方向と鍵があるか・層が鍵にあるか・長さ・書ける層か(MTP・最終層は断る)をここで確かめる。"""
@@ -352,6 +361,12 @@ class Session:
             r.default_key = default_key
         if direction_layer:
             r.direction_layer = direction_layer
+        if proj_correction == "unrecorded":                    # 画面で読み込んだ古いレシピ(記録なし)をユニットで送ってくるとき
+            r.proj_correction = None
+        elif proj_correction:                                  # v0.9.0: 射影の補正(postnorm / none)。画面の切り替え・API から
+            r.proj_correction = proj_correction
+        elif units and not path:                               # その場で作るレシピは、いまの当て方を記録する(記録の無い扱いにしない)
+            r.proj_correction = self.proj_correction_label(None)
         r.validate()
         if r.ablate is not None:
             self.direction_path(r.ablate.direction)              # 方向が無ければここで返す
@@ -392,7 +407,7 @@ class Session:
                 self.direction_set(u.direction or r.default_direction)
                 if u.kind in ("neuron", "ffn"):                     # ニューロン・MLP 全体の射影: dense の MLP の層だけ
                     from .headproj import neuron_layer_ok
-                    neuron_layer_ok(self.weights, u.layer)
+                    neuron_layer_ok(self.weights, u.layer, allow_post_norm=self.proj_correction_for(r))
                 if u.kind == "attn":                                # 注意の出力全体の射影: ヘッドが残差に書く行列のある層だけ
                     self.weights.head_block(u.layer, 0)
             if u.layer <= 2:
@@ -415,6 +430,39 @@ class Session:
         if msg not in self.warnings:
             self.warn(msg)
 
+    def proj_correction_for(self, recipe: Recipe | None) -> bool:
+        """このレシピの射影・ablate を補正つきで当てるか(v0.9.0)。セッションで切った(--no-proj-correction)か、レシピの記録が
+        none なら補正なし。記録の無い古いレシピは補正つき(proj_record_note が知らせる)。"""
+        return bool(self.proj_correction) and not (recipe is not None and recipe.proj_correction == "none")
+
+    def _keyed_corr(self, recipe: Recipe) -> Recipe:
+        """keyed の計画に渡すレシピ: セッションで補正を切ったとき(--no-proj-correction)は記録を none にした写し
+        (注意の出力のあとに正規化がある層の attn の keyed は、補正なしでは実行しない = v0.8.x・B1 と同じ)。"""
+        return recipe if self.proj_correction_for(recipe) or recipe.proj_correction == "none" else recipe.like(recipe.units, proj_correction="none")
+
+    def proj_correction_label(self, recipe: Recipe | None = None) -> str:
+        return "postnorm" if self.proj_correction_for(recipe) else "none"
+
+    def proj_record_note(self, recipe: Recipe) -> str | None:
+        """記録の無い古いレシピを、出力のあとに正規化がある層の射影・ablate に補正つきで当てるときの知らせ(無ければ None)。
+        使うたびに警告に入れる(画面・MCP・API の結果にも出る)。"""
+        from .headproj import proj_heads
+        from .postnorm import writer_side
+        if recipe.proj_correction is not None or not self.proj_correction:
+            return None
+        Ls = sorted({p.layer for p in proj_heads(recipe) if p.s
+                     and (self.weights.arch.layers[p.layer].post_norm_mixer if writer_side(p.kind) == "mixer"
+                          else self.weights.arch.layers[p.layer].post_norm_ffn) not in ("", "?")})
+        abl = recipe.ablate is not None and any(li.post_norm_mixer not in ("", "?") or li.post_norm_ffn not in ("", "?")
+                                                for li in self.weights.arch.layers)
+        if not Ls and not abl:
+            return None
+        what = "、".join(([f"层 {', '.join(map(str, Ls[:8]))}{' …' if len(Ls) > 8 else ''} 的投影"] if Ls else []) + (["ablate"] if abl else []))
+        who = f"配方 {recipe.name} 中" if recipe.name else "此配方中"
+        return (f"{who}没有投影校正的记录（v0.8.x 及之前创建的配方）。{what}会按输出之后的"
+                "归一化校正后应用（之前版本不带校正。相同强度下作用方式也会改变，s=1 时更强）。若要使用与以前相同的作用方式，"
+                "请在配方中写入 proj_correction: none，或加上 --no-proj-correction（界面中为配方栏的「投影校正」）")
+
     def _key_of(self, name: str):
         """鍵の名前("NAME" か比較用の鍵 "NAME~j")→ KeySet(<root>/keys/<model_id>/、CHANGE-07)。"""
         from .keyed import load_key
@@ -426,7 +474,8 @@ class Session:
         鍵の入力 x を変える、同じ方向の ablate は焼き込みの順によっては keyed を消す。"""
         from .keyed import keyed_plan, keyed_units
         ku = keyed_units(r)
-        keyed_plan(self.weights, r, self._key_of, self.direction_set, direction_layer=r.direction_layer, warn=self._warn_once)
+        keyed_plan(self.weights, self._keyed_corr(r), self._key_of, self.direction_set, direction_layer=r.direction_layer,
+                   warn=self._warn_once)
         same_input = {"ffn": ("neuron",), "attn": ("head",), "shared": ("shared",), "expert": ("expert_neuron",)}
         for k in ku:
             hit = [g.label() for g in r.gain_units if g.layer == k.layer and g.kind in same_input[k.kind]
@@ -452,8 +501,28 @@ class Session:
         sv = self.stats_view(Recipe(recipe.add_units, recipe.model_id, recipe.dose_unit, recipe.name))
         if keyed:
             sv = self._keyed_stats(recipe, sv)
+        if recipe.dose_unit == "rel" and sv.resid is not None:
+            self._warn_spread(sv.resid, sorted({u.layer for u in recipe.add_units}))
         return (recipe_vectors(self.weights, sv, recipe, self.direction_vec),
                 unit_details(self.weights, sv, recipe, self.direction_vec))
+
+    def _warn_spread(self, resid: ResidStats, layers: list[int]) -> None:
+        """rel の強さを使う層で、残差の大きさが少数の次元に偏っていれば(偏りの量 ≥ SPREAD_WARN)知らせる(v0.9.0)。"""
+        from .stats import SPREAD_WARN
+        hit = [(L, x) for L in layers if (x := resid.spread(L)) is not None and x >= SPREAD_WARN]
+        if hit:
+            x = max(v for _, v in hit)
+            self._warn_once(f"层 {', '.join(str(L) for L, _ in hit[:6])}{' …' if len(hit) > 6 else ''} 中，残差的大小集中在少数维度上，"
+                            f"因此强度（rel）1 相当于去掉偏斜后残差大小的约 {x:.1f} 倍（偏斜较少的模型约为"
+                            "1.3 倍）。请从较弱的强度（例如 0.1～0.2）开始尝试")
+
+    def dose_spread(self) -> dict | None:
+        """残差の大きさの偏り(info・画面用)。統計が無ければ None、v0.9.0 より前の統計なら {"old": True}。"""
+        rs = self.resid_stats()
+        if rs is None:
+            return None
+        sm = rs.spread_summary()
+        return sm if sm is not None else ({"old": True} if rs.p50_rest is None else None)
 
     def _keyed_stats(self, recipe: Recipe, sv: StatsView | None = None) -> StatsView:
         """keyed の行に要る ρ_L(残差ノルム統計)。α は raw なので書き込みには要らず、統計が無い層は計算せずに注意だけ出す。"""
@@ -498,6 +567,8 @@ class Session:
         ds = self.direction_set(name)
         if L not in ds.raw:
             raise GneError("BAD_RECIPE", f"方向 {name} 中不存在第 {L} 层（0～{max(ds.raw)}）")
+        from .direction import require_length
+        require_length(ds, L, f"方向单元 {L}:dir:{name}")
         return ds.raw[L]
 
     @staticmethod
@@ -568,7 +639,8 @@ class Session:
                                lora_when=lora_when, first_token=first_token)
         return {"messages": msgs, "recipe": recipe.to_dict(), "units": details, "layer_norms": self._norms(vecs),
                 "when": when or recipe.when, "sampling": None if sampling is None else sampling.to_dict(),
-                "baseline": base, "steered": st, "differs": None if base is None else base["token_ids"] != st["token_ids"]}
+                "baseline": base, "steered": st, "differs": None if base is None else base["token_ids"] != st["token_ids"],
+                **({"proj_correction": self.proj_correction_label(recipe)} if recipe.proj_units or recipe.ablate else {})}
 
     # --- export / import ------------------------------------------------------------------------
 
@@ -597,8 +669,14 @@ class Session:
                 export_gain_lora(self.weights, gr, tmp)
                 tmp.replace(path)
             out.append((str(path), 1.0))
+        note = self.proj_record_note(recipe)                    # 記録の無い古いレシピを補正つきで当てる知らせ(使うたびに)
+        if note:
+            self._warn_once(note)
+            fc = self.proj_forecast_text(recipe, old=True)       # 補正なし・補正つきの効きの見込み(くわしく)
+            if fc:
+                self._warn_once(fc)
         if recipe.ablate is not None and recipe.ablate.scale != 0:
-            out.append((str(self.ablation_lora(recipe.ablate)), float(recipe.ablate.scale)))
+            out.append((str(self.ablation_lora(recipe.ablate, correction=self.proj_correction_for(recipe))), float(recipe.ablate.scale)))
         if recipe.proj_units and any(u.k for u in recipe.proj_units):     # CHANGE-06: ヘッドの方向成分の射影
             out.append((str(self.proj_lora(recipe)), 1.0))
         if recipe.keyed_units and any(u.k for u in recipe.keyed_units):   # CHANGE-07: 鍵つきの書き込み
@@ -672,14 +750,71 @@ class Session:
         ヘッド・s・方向の中身(作り直したら LoRA も作り直す)・direction_layer で決まる。"""
         from .headproj import ProjBuilder, export_proj_lora, proj_cache_key, proj_heads
         heads = [p for p in proj_heads(recipe) if p.s]
-        b = ProjBuilder(self.weights, self.direction_set, direction_layer=recipe.direction_layer)
+        corr = self.proj_correction_for(recipe)
+        for msg in self.proj_notes(heads, corr, recipe.direction_layer):   # 補正の有無ごとの知らせ(使うたびに)
+            self._warn_once(msg)
+        if corr and any(abs(p.s) > 2 for p in heads):           # 大きな s: 頭打ちの見込み(正規化のある層だけ、短い文 1 つで)
+            fc = self.proj_forecast_text(recipe, old=False)
+            if fc:
+                self._warn_once(fc)
+        b = ProjBuilder(self.weights, self.direction_set, direction_layer=recipe.direction_layer, correction=corr)
         path = self._pv_path(self.store.heads_dir(self.meta.model_id) / f"proj-{proj_cache_key(heads, b)}.lora.gguf")
         if not path.exists():
             tmp = path.with_suffix(".part")
             export_proj_lora(self.weights, recipe.like([u for u in recipe.proj_units if u.k]), tmp, self.direction_set,
-                             warn=self.warn)
+                             warn=self.warn, correction=corr)
             tmp.replace(path)
         return path
+
+    def proj_forecast(self, recipe: Recipe, scales=(1.0,)) -> list[dict]:
+        """postnorm.projection_forecast(レシピと倍率ごとに覚えておく)。正規化の無いモデル・射影の無いレシピは空。"""
+        from .postnorm import projection_forecast, writer_layers
+        if not recipe.proj_units or not writer_layers(self.weights):
+            return []
+        key = (json.dumps(recipe.to_dict(), sort_keys=True, default=str), tuple(float(x) for x in scales))
+        cache = self.__dict__.setdefault("_proj_forecast", {})
+        if key not in cache:
+            try:
+                cache[key] = projection_forecast(self, recipe, scales)
+            except GneError as ex:                            # 見込みが計算できなくても、当てること自体は止めない
+                self._warn_once(f"无法计算投影效果的预估（{ex.message}）")
+                cache[key] = []
+        return cache[key]
+
+    def proj_forecast_text(self, recipe: Recipe, *, old: bool) -> str | None:
+        from .postnorm import forecast_text
+        return forecast_text(self.proj_forecast(recipe), old)
+
+    def proj_notes(self, heads, correction: bool, direction_layer: str = "own") -> list[str]:
+        """射影のユニットが出力のあとに正規化がある層に当たるときの知らせ。補正つき: γ と r̂ がほぼ直交する層の副作用の警告と、
+        強さが比例しないこと。補正なし: 成分が残ること(v0.8.x と同じ計算、A の知らせ)。"""
+        from .headproj import head_direction, postnorm_mixer_warning
+        from .postnorm import side_warning, writer_side
+        w = self.weights
+        pn = [p for p in heads if p.s and (w.arch.layers[p.layer].post_norm_mixer if writer_side(p.kind) == "mixer"
+                                            else w.arch.layers[p.layer].post_norm_ffn) not in ("", "?")]
+        if not pn:
+            return []
+        if not correction:
+            msg = postnorm_mixer_warning(w, [p for p in heads if writer_side(p.kind) == "mixer"])
+            return [msg] if msg else []
+        out = []
+        items = []
+        for p in pn:
+            try:
+                r, _ = head_direction(self.direction_set(p.direction), p.layer, direction_layer)
+            except GneError:
+                continue
+            items.append((p.layer, writer_side(p.kind), r))
+        sw = side_warning(w, items)
+        if sw:
+            out.append(sw)
+        Ls = sorted({p.layer for p in pn})
+        if any(abs(p.s) not in (1.0, 2.0) for p in pn):
+            out.append(f"层 {', '.join(map(str, Ls[:8]))}{' …' if len(Ls) > 8 else ''} 的投影会按输出之后的归一化校正后应用。"
+                       "强度 s=1 会移除该单元的部分，s=2 会恰好反向，但其他 s 时效果不与 s 成比例，较大的 s 会"
+                       "达到上限（可用 gne headproj check 验证各 s 的预测与实测）")
+        return out
 
     def keyed_lora(self, recipe: Recipe) -> tuple[Path, float]:
         """レシピの keyed のユニット → 実行時の LoRA(<root>/keys/<model_id>/lora/keyed-<鍵>.lora.gguf に作って使い回す)と
@@ -688,7 +823,7 @@ class Session:
         決まる(鍵や方向を作り直したら別のパス。Engine は同じパスの LoRA を 1 回しか読まないため、レビュー P15)。
         .part に書いてから置き換える。"""
         from .keyed import export_keyed_lora, keyed_cache_key, keyed_lora_path, keyed_plan
-        kr = recipe.like([u for u in recipe.keyed_units if u.k])
+        kr = self._keyed_corr(recipe.like([u for u in recipe.keyed_units if u.k]))
         if not kr.units:
             raise GneError("BAD_RECIPE", "没有 keyed 单元（α 不为 0。例 --unit 19:ffn:keyed:a1@NAME#KEY）")
         rows = keyed_plan(self.weights, kr, self._key_of, self.direction_set, direction_layer=kr.direction_layer,
@@ -789,16 +924,25 @@ class Session:
             return q
         raise GneError("FILE_NOT_FOUND", f"对照集 {name} 不存在（请使用 configs/contrast/ 中的名称或路径）")
 
-    def ablation_lora(self, spec) -> Path:
-        """AblateSpec → 倍率 1 的消除 LoRA（在 <root>/ablate/<model_id>/ 中创建并复用）。"""
-        from .ablate import export_ablation_lora, layer_list, vector_key
+    def ablation_lora(self, spec, *, correction: bool = True) -> Path:
+        """AblateSpec → 倍率 1 的消除 LoRA（在 <root>/ablate/<model_id>/ 中创建并复用）。correction: 出力のあとに正規化がある
+        層の書き込みから normalize(γ⊙r̂) を引くか(v0.9.0)。正規化のあるモデルで補正したものは名前に -pn を付ける(補正なしは
+        v0.8.x までと同じ名前・同じ中身)。"""
+        from .ablate import ablation_side_warning, export_ablation_lora, layer_list, vector_key
+        from .postnorm import writer_layers
         r, meta = self.ablation_vector(spec.direction, from_layer=spec.from_layer)
         Ls = layer_list(spec.layers)
         tag = "" if Ls is None else "-L" + hashlib.sha256(json.dumps(Ls).encode()).hexdigest()[:8]
+        if correction and writer_layers(self.weights):
+            tag += "-pn"
+            from .ablate import _select_layers, unit
+            sw = ablation_side_warning(self.weights, _select_layers(self.weights, Ls), {L: unit(r) for L in range(self.meta.n_layer)}, True)
+            if sw:
+                self._warn_once(sw)
         path = self._pv_path(self.store.ablate_dir(self.meta.model_id) / f"{spec.direction}-{vector_key(r)}{tag}.lora.gguf")
         if not path.exists():
             tmp = path.with_suffix(".part")
-            export_ablation_lora(self.weights, r, tmp, layers=Ls, meta=meta)
+            export_ablation_lora(self.weights, r, tmp, layers=Ls, meta=meta, correction=correction)
             tmp.replace(path)
         return path
 
@@ -859,9 +1003,9 @@ class Session:
         if recipe.proj_units:                            # CHANGE-06: ヘッドの方向成分の射影も同じ LoRA / 焼き込みに入れる
             from .headproj import ProjBuilder, layer_summary, proj_heads, proj_meta
             heads = proj_heads(recipe)
-            b = ProjBuilder(W, self.direction_set, direction_layer=recipe.direction_layer)
+            b = ProjBuilder(W, self.direction_set, direction_layer=recipe.direction_layer, correction=self.proj_correction_for(recipe))
             ptens = b.tensors(heads, self.warn)
-            extra_meta = proj_meta(heads, b)
+            extra_meta = {**proj_meta(heads, b), "proj_correction": self.proj_correction_label(recipe)}
             summary = layer_summary(W, heads, ptens)
             if bake and requant == "patch":
                 raise GneError("UNSUPPORTED_QUANT", "方向分量投影无法用缩放补丁写入（按列方向，不是简单倍率）",
@@ -961,14 +1105,15 @@ class Session:
             rep["query_loras"] = q
             if rep["path"] is None:
                 rep["path"], rep["bytes"] = q[0], Path(q[0]).stat().st_size
-        return {"kind": "bake" if bake else "lora", "recipe": recipe.to_dict(), **rep}
+        return {"kind": "bake" if bake else "lora", "recipe": recipe.to_dict(), **rep,
+                **({"proj_correction": self.proj_correction_label(recipe)} if recipe.proj_units else {})}
 
     def _keyed_bundle(self, recipe: Recipe, W=None) -> dict:
         """書き出し用の keyed の LoRA(α そのまま、倍率 1)と記録。W(焼き込む先)は構造が同じことだけ確かめる
         (ΔW = α d κᵀ は W に依らないので、行列はこのモデルで作る)。"""
         from .keyed import keyed_bundle
-        kb = keyed_bundle(self.weights, recipe, self._key_of, self.direction_set, direction_layer=recipe.direction_layer,
-                          warn=self._warn_once)
+        kb = keyed_bundle(self.weights, self._keyed_corr(recipe), self._key_of, self.direction_set,
+                          direction_layer=recipe.direction_layer, warn=self._warn_once)
         if W is not None and W is not self.weights:
             miss = [n for n in kb["tensors"] if not W.has_tensor(n)]
             if miss:
@@ -1535,7 +1680,8 @@ class Session:
     def recipe_save(self, name: str, units: list[str] | Recipe, *, dose_unit: str = "rel",
                     ablate: str | dict | None = None, when: str | None = None, sampling: dict | None = None,
                     default_direction: str | None = None, direction_layer: str | None = None,
-                    default_key: str | None = None, loop_edits: str | None = None) -> dict:
+                    default_key: str | None = None, loop_edits: str | None = None,
+                    proj_correction: str | None = None) -> dict:
         """sampling 是尝试该配方时使用的采样设置（不含 seed）。default_direction・direction_layer・default_key は
         @方向・#鍵を省いた proj・keyed のユニットの既定(CHANGE-06・07)。"""
         from .steer import sampling_values
@@ -1543,17 +1689,27 @@ class Session:
             raise GneError("BAD_ARGS", f"配方名 {name!r} 只能包含字母、数字、_、-、.")
         r = units if isinstance(units, Recipe) else self.recipe(units=list(units), dose_unit=dose_unit, name=name,
                                                                ablate=ablate, when=when, default_direction=default_direction,
-                                                               direction_layer=direction_layer, default_key=default_key)
+                                                               direction_layer=direction_layer, default_key=default_key,
+                                                               proj_correction=proj_correction)
         if sampling:
             r.sampling = sampling_values(sampling, seed=False)
         if loop_edits is not None:                 # 同じ層を 2 回実行するモデルの当て方(shared / per_visit)
             if loop_edits not in ("shared", "per_visit"):
                 raise GneError("BAD_ARGS", f"loop_edits 必须是 shared 或 per_visit（{loop_edits!r}）")
             r.loop_edits = loop_edits
+        note = None
+        if proj_correction in ("postnorm", "none"):          # v0.9.0: 画面の「射影の補正」
+            r.proj_correction = proj_correction
+        if r.proj_correction is None:                        # 記録の無い古いレシピ: いま当てている方(補正つき)で記録する
+            was = self.proj_record_note(r)
+            r.proj_correction = self.proj_correction_label(None)
+            if was:
+                note = ("已将无记录的旧配方按当前使用的「带校正」（proj_correction: postnorm）保存。与之前版本的"
+                        "作用方式不同。若要保留与以前相同的作用方式，请将「投影校正」设为「不带校正」后重新保存")
         r.name = name
         path = self.store.recipes_dir() / f"{name}.yaml"
         r.save(path)
-        return {"name": name, "path": str(path), "recipe": r.to_dict()}
+        return {"name": name, "path": str(path), "recipe": r.to_dict(), **({"note": note} if note else {})}
 
     def recipe_path(self, name_or_path: str | Path) -> Path:
         p = Path(name_or_path)
@@ -1687,30 +1843,33 @@ class Session:
             from_layer = int(chosen)
         if from_layer not in ds.raw:
             raise GneError("BAD_ARGS", f"方向 {ds.name} 中不存在第 {from_layer} 层（0～{max(ds.raw)}）")
+        from .direction import require_length
+        require_length(ds, from_layer)
         return ds.raw[from_layer], {"direction": ds.name, "from_layer": from_layer}
 
     def ablate(self, direction: str, out: str | Path, *, from_layer: int | None = None, per_layer: bool = False,
                layers: list[int] | None = None, scale: float = 1.0, embed: bool = True, bake: bool = False,
                requant: str = "q8_0", via_f16: bool = False, imatrix: str | None = None,
-               llama_quantize: str | None = None, verify: bool = False) -> dict:
+               llama_quantize: str | None = None, verify: bool = False, correction: bool | None = None) -> dict:
         """将方向的投影消除导出为 LoRA 适配器 GGUF（默认）或改写权重的 GGUF（bake）（§6.17）。
         verify 时，对 LoRA 检查 V13（r 分量是否只按应有部分残留），对 bake 检查 V13 与 V14（LoRA 与 greedy 是否一致）。"""
         from .ablate import bake_ablation_gguf, bake_via_f16, export_ablation_lora
         if not 0 < scale <= 1.5:
             raise GneError("BAD_ARGS", "--scale 须大于 0 且不超过 1.5（1 表示完全消除）")
         r, meta = self.ablation_vector(direction, from_layer=from_layer, per_layer=per_layer)
+        corr = self.proj_correction if correction is None else bool(correction)
         t0 = time.perf_counter()
         if not bake:
             rep = export_ablation_lora(self.weights, r, out, layers=layers, scale=scale, embed=embed, meta=meta,
-                                       progress=self.progress)
+                                       progress=self.progress, correction=corr)
             kind = "lora"
         elif via_f16:
             rep = bake_via_f16(self.weights, r, out, layers=layers, scale=scale, embed=embed, meta=meta,
-                               llama_quantize=llama_quantize, imatrix=imatrix, progress=self.progress)
+                               llama_quantize=llama_quantize, imatrix=imatrix, progress=self.progress, correction=corr)
             kind = "bake"
         else:
             rep = bake_ablation_gguf(self.weights, r, out, layers=layers, scale=scale, embed=embed, requant=requant,
-                                     meta=meta, progress=self.progress)
+                                     meta=meta, progress=self.progress, correction=corr)
             kind = "bake"
         for w_ in rep.get("warnings", []):
             self.warn(w_)
@@ -1729,7 +1888,7 @@ class Session:
         ids = v.prompt_ids[0]
         layers = rep.get("layers")
         full = layers == sorted(residual_writers(self.weights))
-        er = self.weights.embed_rows(ids)[1:].astype(np.float64) @ ru
+        er = v.embed_component(ids, ru)                  # 埋め込みを拡大する arch(Gemma 系)は捕捉した inp_scaled から
         if kind == "lora":
             res = v._resid_all(self.engine, ids, [(out, 1.0)])
             expect = 0.0 if rep.get("embed") else er
@@ -1739,7 +1898,8 @@ class Session:
                 res = v._resid_all(e2, ids)
                 lp = out.with_name(out.name + ".v14.lora.gguf")
                 export_ablation_lora(self.weights, r, lp, layers=layers, scale=rep["scale"],
-                                     embed=rep["embed"] and embed_in_lora(self.weights))
+                                     embed=rep["embed"] and embed_in_lora(self.weights),
+                                     correction=rep.get("proj_correction", "postnorm") != "none")
                 seqs = v.prompt_ids[:2]
 
                 def run(engine, lora=None):
@@ -1830,6 +1990,14 @@ class Session:
             name += "@" + re.sub(r"[^\w.\-]+", "_", d["when"])
         path = self.store.eval_dir(self.meta.model_id) / f"{name}.json"
         d = {"name": name, "path": str(path), "created": time.strftime("%Y-%m-%dT%H:%M:%S"), **d}
+        fc = self.proj_forecast(recipe, scales=[x for x in doses if x])   # v0.9.0: 正規化のある層の射影の、倍率ごとの効きの見込み
+        if fc:
+            d["proj_forecast"] = fc
+        d["proj_correction"] = self.proj_correction_label(recipe)
+        old = self.proj_record_note(recipe)                           # 記録の無い古いレシピ・頭打ちの知らせを結果の notes にも残す(画面の評価に出る)
+        extra_notes = [x for x in (old, self.proj_forecast_text(recipe, old=bool(old))) if x]
+        if extra_notes:
+            d["notes"] = [*(d.get("notes") or []), *extra_notes]
         path.write_text(json.dumps(d, ensure_ascii=False, indent=1))
         return d
 
@@ -2282,7 +2450,7 @@ class Session:
     PIPELINE_DEFAULTS = {"positions": "last", "score_positions": "last", "target": None, "n_heads": [6, 5, 4], "hard": 16,
                          "top_layers": 4, "max_examples": 64, "s_max": 30.0, "direction_layer": "own", "resume": True,
                          "include_score_layers": False, "same_reply": False, "score_layers": None, "select_layer": None,
-                         "candidate_layers": None, "always_layers": None}
+                         "candidate_layers": None, "always_layers": None, "from_direction": None}
     # rank: writes(v0.8.0 からの既定: 全部の部品を書き込みの量で順位づけ → 上位を s=1 で確かめる → s=1 から組を作る)/
     # causal(v0.7.0 までの既定: 層 → ヘッドを止めて測る因果スクリーニング → 効率で配り直す)。unit_kinds の既定は heads(ニューロンは
     # 指定で足す)。rank 以外は writes のときだけ使う設定(causal の結果の settings には rank だけを載せる)
@@ -2321,11 +2489,17 @@ class Session:
     def _rank_fallback(self, pipe: dict, rank_given: bool) -> str | None:
         """rank を指定していない(既定の writes)のに、書き込みの順位づけに未対応のモデル(残差が複数本の流れ = hyper-connections)なら、
         pipe の rank を causal にして理由を返す(モデルは読み込まず、GGUF のメタデータで決める)。指定したときは何もしない。"""
-        hc = int(self.weights.field(f"{self.meta.arch}.hyper_connection.count", 0) or 0)
-        if pipe.get("rank") == "writes" and not rank_given and hc:
+        if pipe.get("rank") != "writes" or rank_given:
+            return None
+        why = writes_block_reason(self.weights, self.meta.arch)
+        if why:
             pipe["rank"] = "causal"
-            return "残差位于多条流的模型（hyper-connections）不支持写入排序，因此已改用 rank causal 运行"
+            until = _writes_block_until(why)
+            return f"{why}，因此已将默认选择方式切换为 rank causal（停用后选择）并执行" + (f"（{until}）" if until else "")
         return None
+
+    def _writes_block_reason(self) -> str | None:
+        return writes_block_reason(self.weights, self.meta.arch)
 
     @staticmethod
     def _layers_of(spec) -> list[int] | None:
@@ -2448,7 +2622,9 @@ class Session:
         self.engine.free_steer()                   # 生成しないので、生成用のコンテキストを空けて VRAM を使えるようにする
         ts = time.perf_counter()                                   # 1. 方向(全部の質問)
         d = None
-        if pipe["resume"] and pipe["positions"] != "response":
+        if pipe.get("from_direction"):             # 作り済みの方向ベクトルを使う(heads geometry で保存した向きなど。方向づくりを飛ばす)
+            d = self._pipeline_from_direction(str(pipe["from_direction"]), name, path, cs, pipe["positions"])
+        elif pipe["resume"] and pipe["positions"] != "response":
             try:
                 m = self.direction_set(name).meta
                 if m.get("contrast_sha") == cs.sha and m.get("positions") == pipe["positions"]:
@@ -2460,7 +2636,8 @@ class Session:
         if d is None:                                      # same_reply は positions response のときだけ(違えば direction が断る)
             d = self.direction(contrast=path, name=name, positions=pipe["positions"], same_reply=bool(pipe["same_reply"]))
         out["direction"] = {"path": d["path"], "positions": d["positions"], "n_rows": d["n_rows"],
-                            "seconds": time.perf_counter() - ts, "reused": "direction" in reused}
+                            "seconds": time.perf_counter() - ts, "reused": "direction" in reused,
+                            **({"from": d["from"]} if d.get("from") else {}), **({"from_note": d["note"]} if d.get("note") else {})}
         ts = time.perf_counter()                                   # 2. 基準層(cohen_d が最大の層)
         sc = self.direction_score(name, contrast=path, positions=sp, record_base=True, max_examples=mx)
         out["score"] = {"base_layer": sc["base_layer"], "best_layer": sc["best_layer"], "n": sc["n"],
@@ -2473,7 +2650,7 @@ class Session:
                 if rank_given or e.code != "ARCH_UNSUPPORTED":
                     raise
                 # 既定(rank を指定していない)で、この arch の捕捉に未対応だったときは、v0.7.0 までの選び方で続ける
-                self.warn(f"此模型不支持写入排序，因此改用 rank causal 运行（{e.message}）")
+                self.warn(f"此模型无法按写入量排序，因此改用停用后选择的流程（rank causal）执行。原因：{e.message}")
                 pipe["rank"] = "causal"
                 for k in self.PIPELINE_WRITES:
                     if k != "rank":
@@ -2481,7 +2658,8 @@ class Session:
                 more = self._loop_pipeline_defaults(pipe)
                 if more:
                     out["arch_defaults"] = {**(out.get("arch_defaults") or {}), **more}
-                out.update(settings=dict(pipe), rank="causal", rank_note=f"不支持写入排序（{e.message}），因此已改用 rank causal 运行")
+                out.update(settings=dict(pipe), rank="causal",
+                           rank_note=f"无法按写入量排序，因此已将默认选择方式切换为 rank causal（停用后选择）并执行。原因：{e.message}")
                 out.pop("unused_settings", None)
                 for k in ("writes", "verify"):
                     out.pop(k, None)
@@ -2517,6 +2695,9 @@ class Session:
         out["target"], out["target_from"] = float(tgt), tgt_from
         rec = next((r for r in a["table"] if r.get("recommended")), None)
         out["recommended"] = None if rec is None else {"n_heads": rec["n_heads"], "units": rec["units"], "recipe": rec["recipe"]}
+        from .causal import most_reduced_summary
+        out["most_reduced"] = most_reduced_summary(out)            # A 側が最も下がった組(推す組とは別の印、v0.9.0)
+        self._postnorm_pipeline_note(out)
         out["seconds"] = time.perf_counter() - t0
         out["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         p = self.store.heads_dir(self.meta.model_id) / f"{name}.pipeline.json"
@@ -2584,7 +2765,7 @@ class Session:
                                       direction_layer=pipe["direction_layer"], candidate_layers=candidate_layers,
                                       loop_direction=self._loop_direction(pipe), progress=self.progress)
         out["writes"] = {k: summ[k] for k in ("select_layer", "kinds", "n", "skipped_long", "gap", "base", "n_units",
-                                               "totals", "totals_share", "check")}
+                                               "totals", "totals_share", "check", "zero_layers", "zero_note")}
         out["writes"]["layer_scores"] = summ["layer_scores"][:12]          # 層ごとの直接の書き込みの上位(層全体の部品の選び方の目安)
         out["writes"]["seconds"] = time.perf_counter() - ts
         ts = time.perf_counter()                                   # 4. 上位を 1 個ずつ s=1 で確かめる(因果スクリーニングと同じ物差し)
@@ -2635,6 +2816,9 @@ class Session:
             out["check"].update(n_heads=chk["n_heads"], recommended=rec is not None)
             if rec is not None and out["check"].get("break_warning"):
                 self._recommend_without_broken(out, a, rec, cs_chk, val_chk, n_check, int(pipe["check_tokens"]))
+        from .causal import most_reduced_summary
+        out["most_reduced"] = most_reduced_summary(out)            # A 側が最も下がった組(推す組とは別の印、v0.9.0)
+        self._postnorm_pipeline_note(out)
         out["seconds"] = time.perf_counter() - t0
         out["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         p = self.store.heads_dir(self.meta.model_id) / f"{name}.pipeline.json"
@@ -2679,6 +2863,33 @@ class Session:
                                   "reached": bool(new["reached"]), "by": by, "after_replies_break": [t_["n_heads"] for t_ in tried[:-1]]}
         p_ = Path(a["path"])
         p_.write_text(json.dumps({k: v for k, v in a.items() if k != "path"}, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    def _postnorm_pipeline_note(self, out: dict) -> None:
+        """組にヘッド・層全体(attn)の射影が入り、その層の注意の出力のあとに正規化があれば、結果に知らせ(postnorm)を入れる
+        (B の補正が入るまで、射影は式どおりでない。組の数は残差で測ったものなので本物)。警告にも入れる。"""
+        from .headproj import POSTNORM_MIXER_NOTE, postnorm_mixer_layers, proj_heads
+        rows = [r for r in (out.get("allocate") or {}).get("table") or [] if not r.get("skipped") and r.get("recipe")]
+        s1 = (out.get("allocate") or {}).get("s1")
+        sure, unsure = set(), set()
+        for r in rows + ([s1] if s1 and s1.get("recipe") else []):
+            try:
+                a_, b_ = postnorm_mixer_layers(self.weights, proj_heads(Recipe.load(r["recipe"])))
+            except (GneError, OSError):
+                continue
+            sure |= set(a_)
+            unsure |= set(b_)
+        if not sure and not unsure:
+            return
+        if self.proj_correction:                     # v0.9.0: 補正つき(既定)
+            from .postnorm import SIDE_RATIO_WARN
+            note = ("由于注意力（混合层）的输出之后有归一化，投影会按归一化校正后应用（从写入中减去 normalize(γ⊙r̂)。"
+                    "s=1 时恰好移除该单元的部分，其他 s 不成比例，较大的 s 会达到上限）。在此结构的模型中，移除时"
+                    f"残差容易也向 r̂ 以外的方向移动（中位数约为沿 r̂ 变化的 1 倍，超过 {SIDE_RATIO_WARN:g} 倍的层会警告）")
+            out["postnorm"] = {"layers": sorted(sure), "unsure_layers": sorted(unsure), "note": note, "proj_correction": "postnorm"}
+        else:
+            out["postnorm"] = {"layers": sorted(sure), "unsure_layers": sorted(unsure), "note": POSTNORM_MIXER_NOTE,
+                               "proj_correction": "none"}
+        self._warn_once(f"组中头部和整层（attn）的投影里，层 {', '.join(map(str, sorted(sure | unsure)[:8]))} 是{out['postnorm']['note']}")
 
     def reply_check(self, cs, val, recipe: str | Path | Recipe | None, *, n: int = 16, max_tokens: int = 512,
                     prompts: dict | None = None) -> dict:
@@ -2739,11 +2950,12 @@ class Session:
                      kinds="all", positions: str = "last", subset: str = "all", max_examples: int | None = None,
                      verify_top: int = 64, verify_sample: int = 16, verify_mode: str = "proj", verify_examples: int | None = 64,
                      score_layers: list[int] | None = None, direction_layer: str = "own", name: str | None = None,
-                     top_q: int = 256, loop_direction: str = "first") -> dict:
+                     top_q: int = 256, loop_direction: str = "first", save_q: bool = False) -> dict:
         """全部の部品(注意ヘッド・線形注意のヘッド・MLP のニューロン。kinds に layers を足すと層の書き込み全体も)を、方向への
         書き込みの量で順位づけし、上位を 1 個ずつ
         s=1 で射影して(verify_mode ablate なら止めて)確かめる(gne/unitwrites.py)。結果は <root>/heads/<model_id>/<name>.writes.json
-        と .writes.npz(層ごとの更新のベクトル・部品ごとの書き込み)。verify_top 0 で確かめを飛ばす。"""
+        と .writes.npz(層ごとの更新のベクトル・部品ごとの書き込み)。verify_top 0 で確かめを飛ばす。save_q なら、質問ごと・層ごとの
+        更新を別のファイル <name>.writes_q.npz に保存する(gne heads geometry の質問に沿った分解・ラベル入れ替えの基準の材料)。"""
         from .causal import prepare
         from .direction import base_layer_of, score_layers_default
         from .unitwrites import measure_writes, parse_kinds, save_writes, verify_rows, verify_units
@@ -2756,7 +2968,11 @@ class Session:
         S = int(select_layer) if select_layer is not None else self.weights.n_main - 2
         summ, arrays = measure_writes(self, ds, cs, select_layer=S, positions=positions, subset=subset,
                                       max_examples=max_examples, kinds=parse_kinds(kinds), direction_layer=direction_layer,
-                                      top_q=top_q, loop_direction=loop_direction, progress=self.progress)
+                                      top_q=top_q, loop_direction=loop_direction, keep_q=bool(save_q), progress=self.progress)
+        qarr = {k: arrays.pop(k) for k in [k for k in arrays if k.startswith("q_")]}   # .writes.npz の形は変えない
+        if qarr:                                       # 質問の文を引くための対照集合(geometry が同じものか sha で確かめる)
+            src = Path(contrast).resolve() if contrast else ds.meta.get("source")
+            qarr.update(q_contrast=np.array(str(src or "")), q_contrast_sha=np.array(str(cs.sha)))
         ver = None
         if verify_top and verify_top > 0:
             b = base_layer_of(ds)
@@ -2767,8 +2983,13 @@ class Session:
             ver = verify_units(self, st, verify_rows(summ["rows"], int(verify_top), int(verify_sample)), mode=verify_mode,
                                progress=self.progress)
         pz, pj = save_writes(self, name, summ, arrays, ver)
+        pq = None
+        if qarr:
+            from .geometry import save_q
+            pq = save_q(self.store.heads_dir(self.meta.model_id), name, qarr)
         return {**{k: v for k, v in summ.items() if k != "rows"}, "rows": summ["rows"][:200], "verify": ver, "name": name,
-                "path": str(pj), "npz": str(pz), "seconds": time.perf_counter() - t0}
+                "path": str(pj), "npz": str(pz), **({"q_npz": str(pq), "q_bytes": pq.stat().st_size} if pq else {}),
+                "seconds": time.perf_counter() - t0}
 
     def _refine_chain(self, name: str, row: dict) -> dict:
         """残りから追加の土台。name が一括の結果なら土台はその行の組(0 回目 = 元の組)。name が残りから追加の結果なら、
@@ -2962,6 +3183,13 @@ class Session:
         if isinstance(st.get("target"), str):                           # B / mid は、残りの一括でも同じ意味
             pipe["target"] = st["target"]
         rk = rank or st_prev.get("rank") or st.get("rank") or "causal"
+        rank_note = None
+        if rank is None and rk == "writes":                             # 前の回が writes でも、出力のあとに正規化があるモデルでは止めて選ぶ
+            probe = {"rank": "writes"}
+            rank_note = self._rank_fallback(probe, False)
+            if rank_note:
+                rk = "causal"
+                self._warn_once(rank_note)
         if rk == "writes":                                              # 新しい選び方で足す部品を探す(ニューロンも選べる)
             pipe.pop("top_layers", None)
             pipe.update(rank="writes", unit_kinds=unit_kinds or st_prev.get("unit_kinds") or st.get("unit_kinds") or "heads",
@@ -2972,7 +3200,14 @@ class Session:
                 pipe["hard"] = max(1, min(int(st["hard"]), len(qa)))
         elif rk == "causal":                                            # 元が v0.7.0 までの流れ(rank の記録が無い古い結果も)
             if unit_kinds not in (None, "heads"):
-                raise GneError("BAD_ARGS", "若要追加神经元，请使用 rank writes（rank causal 只支持注意力头）")
+                why = self._writes_block_reason()
+                if why:                                                 # 書き込みの量で選べないモデル: 行き止まりにしない
+                    until = _writes_block_until(why)
+                    raise GneError("ARCH_UNSUPPORTED", f"此模型中不能使用添加神经元或整层的选择方式。原因：{why}"
+                                   "（只有按写入量选择的流程 --rank writes 才能添加神经元和整层）" + (f"。{until}" if until else ""),
+                                   "若只添加头部，请去掉 --unit-kinds（将在停用后选择的流程中添加）")
+                raise GneError("BAD_ARGS", "只有按写入量选择的流程（--rank writes）才能添加神经元或整层",
+                               "请加上 --rank writes。若只添加头部，请去掉 --unit-kinds")
             pipe.pop("loop_direction", None)
             pipe.update(rank="causal", n_heads=[int(x) for x in new_heads], hard=max(1, min(int(st.get("hard") or 16), len(qa))))
         else:
@@ -3030,7 +3265,8 @@ class Session:
         comb_rows = []
         for key, n_new, r in rows_new:
             new_units = explicit(Recipe.load(r["recipe"]))
-            cr = prior_r.like(prior_units + new_units, name=f"{out_name}-{'s1' if n_new is None else f'n{n_new}'}-combined")
+            cr = prior_r.like(prior_units + new_units, name=f"{out_name}-{'s1' if n_new is None else f'n{n_new}'}-combined",
+                              proj_correction=self.proj_correction_label(prior_r))     # 合わせたレシピは当てた方を記録する
             cpath = hd / f"{out_name}.combined-{'s1' if n_new is None else f'n{n_new}'}.yaml"
             cr.save(cpath)
             a2, b2 = measure(cr)
@@ -3084,6 +3320,8 @@ class Session:
             break
         if comb is None and order:
             why_none = "replies_break"
+        from .causal import refine_most_reduced                 # A 側が最も下がった行(合わせたレシピの A 平均、元の方向・元の目標)
+        most_reduced = refine_most_reduced(comb_rows, (comb or {}).get("key"), comb is not None)
         stale = hd / f"{out_name}.combined.yaml"
         if comb is not None:
             comb["recommended"] = True
@@ -3092,7 +3330,7 @@ class Session:
             if check is not None:
                 check["recommended"] = True
         else:
-            stale.unlink(missing_ok=True)           # 推す行が無い(足さないほうがよい): 前の代表を残さない
+            stale.unlink(missing_ok=True)           # 推す行が無い(土台のままが無難。候補の行は選べる): 前の代表を残さない
         by_round: dict[int, int] = {}
         for q in (comb or {}).get("parts") or parts_of(prior_units, rounds0):
             by_round[q["round"]] = by_round.get(q["round"], 0) + 1
@@ -3100,20 +3338,21 @@ class Session:
                "direction": ds.name, "n_heads": int(row["n_heads"]), "base_units": [proj_spec(u) for u in prior_units],
                "base_parts": parts_of(prior_units, rounds0), "base_recipe": ch["recipe"], "base_measure": before,
                "none_measure": {"a_mean": a0m, "b_mean": b0m}, "score_layer": S, "threshold": thr, "loop_exit": X,
-               "rank": rk, "units_by_round": {str(k_): v for k_, v in sorted(by_round.items())},
+               "rank": rk, **({"rank_note": rank_note} if rank_note else {}), **({"postnorm": p["postnorm"]} if p.get("postnorm") else {}),
+               "units_by_round": {str(k_): v for k_, v in sorted(by_round.items())},
                "remaining": {"n": len(rem), "n_a": int(len(a)), "used": len(pick),
                              "padded": len(pick) > len(rem), "questions": qa, "scores": [float(a[i]) for i in pick]},
                "pipeline": {"path": p["path"], "direction": out_name, "recommended": p.get("recommended"),
                             "reused": p.get("reused") or [],
                             "table": [{k_: r.get(k_) for k_ in ("n_heads", "units", "s_max", "remain", "reached", "recommended", "skipped")}
                                       for r in alloc["table"]]},
-               "combined": comb, "combined_rows": comb_rows, "check": check, "no_recommend": why_none,
+               "combined": comb, "combined_rows": comb_rows, "check": check, "no_recommend": why_none, "most_reduced": most_reduced,
                "updated": time.strftime("%Y-%m-%dT%H:%M:%S"), "seconds": time.perf_counter() - t0}
         (hd / f"{out_name}.refine.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
         pd = json.loads(Path(p["path"]).read_text(encoding="utf-8"))      # 一括の結果にも、どの組の残りから作ったかを書く
         pd["refine"] = {k_: out[k_] for k_ in ("base", "root", "round", "chain", "direction", "n_heads", "base_units", "base_parts",
                                                "base_measure", "none_measure", "threshold", "score_layer", "loop_exit", "units_by_round",
-                                               "remaining", "combined", "combined_rows", "check", "no_recommend")}
+                                               "remaining", "combined", "combined_rows", "check", "no_recommend", "most_reduced")}
         Path(p["path"]).write_text(json.dumps(pd, ensure_ascii=False, indent=1), encoding="utf-8")
         out["path"] = str(hd / f"{out_name}.refine.json")
         return out
@@ -3547,6 +3786,13 @@ class Session:
         name は LoRA の名前の欄(general.name。省くと「<元のモデルの名前> gain <レシピの名前>」、strip_meta では "adapter")。"""
         recipe = self._as_recipe(recipe)
         self._no_nw(recipe, bake=bake)                   # nw は焼き込めない(LoRA には入る)
+        if recipe.proj_units:                            # 出力のあとに正規化がある層の射影: 補正の有無ごとの知らせ(v0.9.0)
+            from .headproj import proj_heads
+            for msg in self.proj_notes(proj_heads(recipe), self.proj_correction_for(recipe), recipe.direction_layer):
+                self._warn_once(msg)
+        note = self.proj_record_note(recipe)
+        if note:
+            self._warn_once(note)
         if name is not None and bake:
             raise GneError("BAD_ARGS", "名称字段指定（name）只能用于 LoRA 导出（烧录会原样复制原始模型的元数据）")
         if not recipe.proj_units and not recipe.gain_units and not recipe.keyed_units and not recipe.nw_units:
@@ -3565,8 +3811,9 @@ class Session:
             rq = requant
             kb = self._keyed_bundle(recipe) if recipe.keyed_units else None
             d = bake_proj_split(self.weights, recipe, out, self.direction_set, requant=rq, warn=self.warn,
-                                extra=kb["tensors"] if kb else None, extra_meta={"keyed": kb["meta"]} if kb else None)
-            d.update(kind="bake", requant=rq, recipe=recipe.to_dict())
+                                extra=kb["tensors"] if kb else None, extra_meta={"keyed": kb["meta"]} if kb else None,
+                                correction=self.proj_correction_for(recipe))
+            d.update(kind="bake", requant=rq, recipe=recipe.to_dict(), proj_correction=self.proj_correction_label(recipe))
             if kb is not None:
                 d.update(keyed_layers=kb["layers"], keyed_rank=kb["rank"])
                 self._warn_requant(d)
@@ -3833,6 +4080,58 @@ class Session:
         baselines = {f"L{L}": texts.get((L, None), "") for L in sorted(by_layer)}
         return {"design": design_name, "runs": runs, "examples": examples, "baselines": baselines}
 
+    def _pipeline_from_direction(self, src: str, name: str, contrast_path: Path, cs, positions: str) -> dict:
+        """一括(heads pipeline)で、作り済みの方向ベクトル src を使う。src を一括の名前 name の方向として写し、対照集合の sha と
+        出どころを一括の対照集合に付け替える(以降の段は今までどおり name の方向を使う)。src の対照集合と質問・system が違えば知らせる。"""
+        if src == name:
+            raise GneError("BAD_ARGS", f"from_direction 不能使用与批量相同的名称 {name}（批量会重写该名称的方向）",
+                           "请为批量的 name 使用其他名称")
+        sp = self.direction_path(src)
+        z = np.load(sp)
+        pos = str(z["positions"]) if "positions" in z.files else None
+        if pos and pos != positions:
+            raise GneError("BAD_ARGS", f"方向 {src} 的测量位置（{pos}）与批量的测量位置（{positions}）不同")
+        srcs = str(z["source"]) if "source" in z.files else ""
+        try:
+            from .reverse import ContrastSet
+            c0 = ContrastSet.load(srcs) if srcs and Path(srcs).exists() else None
+        except GneError:
+            c0 = None
+        def side_units(c, x) -> list[list[str]] | None:
+            """その側のレシピのユニット(レシピの並びごと)。読めなければ None。"""
+            try:
+                return [[repr(u) for u in r.units] for r in c.recipes(self, x)]
+            except (GneError, OSError, ValueError):
+                return None
+        same = c0 is not None and all(c0.prompts(x) == cs.prompts(x) and c0.system(x) == cs.system(x) for x in "AB")
+        if same and (c0.has_recipes or cs.has_recipes):           # レシピで側を作る対照集合: 当てるユニットも比べる
+            same = all((ua := side_units(c0, x)) is not None and ua == side_units(cs, x) for x in "AB")
+        note = None
+        if not same:
+            note = (f"无法确认生成方向 {src} 的对照集合与此批量的对照集合在问题、system、配方上相同。用不同对照集合"
+                    "生成的方向，其投影值和目标的含义会改变")
+            self.warn(note)
+        arrs = {k: z[k] for k in z.files}
+        arrs.update(contrast_sha=np.array(cs.sha), source=np.array(str(contrast_path)), from_direction=np.array(src))
+        dst = self.store.direction_dir(self.meta.model_id) / f"{name}.npz"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(dst, **arrs)
+        return {"path": str(dst), "positions": pos or positions, "from": src, "note": note,   # note は結果にも残す(画面に出す)
+                "n_rows": {"A": int(arrs.get("n_rows_A", 0) or 0), "B": int(arrs.get("n_rows_B", 0) or 0)}}
+
+    def heads_geometry(self, name: str, **kw) -> dict:
+        """heads writes の材料 name の層ごとの更新ベクトル(A 側と B 側の差)を、層どうしのコサイン類似度・特異値分解・半分ずつの
+        一致・方向ベクトルとの cos で比べる(gne/geometry.py)。モデルは流さない(GPU を使わない)。結果は
+        <root>/heads/<model_id>/<保存名>.geometry.json と .geometry.npz。"""
+        from .geometry import analyze
+        return analyze(self, name, **kw)
+
+    def heads_geometry_export(self, result: str, out: str, source: str, *, force: bool = False) -> dict:
+        """heads geometry の結果 result の向き(svd-rows:K / svd-none:K / within:K / update / update-attn / update-mlp)を方向ベクトル out
+        として保存する(gne/geometry.py)。"""
+        from .geometry import export_direction
+        return export_direction(self, result, out, source, force=force)
+
 
 def bake_score_check(lora: dict, baked: dict, layers, *, last: int | None = None, noise: float = 0.0) -> tuple[dict, bool]:
     """V26・V33 の射影の値の判定。lora・baked は Scorer.run の結果({側: {"values": {L: 例ごとの射影の値}}})。層ごと・側ごとに
@@ -3941,6 +4240,24 @@ def _merge_logit(old, new):
                      cat(old.down_ids, new.down_ids)[o], cat(old.down_z, new.down_z)[o])
 
 
+def writes_block_reason(weights, arch: str) -> str | None:
+    """このモデルで書き込みの量での順位づけ(rank writes)を実行しない理由(「…ので」の前に置く文)。実行できれば None。
+    残差が複数本の流れ(hyper-connections)と、注意の出力のあとに正規化がある層(v0.9.0、補正した点数が入るまで)。
+    UI の CHiPS の欄(app.js の writesBlocked)も同じ条件。"""
+    hc = int(weights.field(f"{arch}.hyper_connection.count", 0) or 0)
+    if hc:
+        return f"此模型的残差是 {hc} 条流（hyper-connections），因此不支持按写入量排序"
+    pn = [li.index for li in weights.arch.layers[:weights.n_main] if li.mixer == "attention" and li.post_norm_mixer not in ("", "?")]
+    if pn:
+        return f"有 {len(pn)} 个注意力层在输出之后有归一化，按写入量的分数（归一化之前）不代表在残差中的贡献"
+    return None
+
+
+def _writes_block_until(why: str) -> str:
+    """writes_block_reason の文に添える、いつまでの扱いか(出力のあとの正規化だけ。補正した点数が入れば実行する)。"""
+    return "在校正归一化的分数进入下一版本前按此处理" if "归一化" in why else ""
+
+
 def _merge_resid(old: ResidStats, new: ResidStats) -> ResidStats:
     """指定层计算时，保留已有统计中的其他层（仅当语料相同）。"""
     if old.corpus_sha != new.corpus_sha or old.chunk_tokens != new.chunk_tokens:
@@ -3948,9 +4265,13 @@ def _merge_resid(old: ResidStats, new: ResidStats) -> ResidStats:
     keep = [i for i, L in enumerate(old.layers) if L not in set(new.layers.tolist())]
     cat = lambda a, b: np.concatenate([a[keep], b])  # noqa: E731
     order = np.argsort(cat(old.layers, new.layers))
+    nan = lambda st: (st.p50_rest if st.p50_rest is not None                       # noqa: E731  古い統計(偏りの量が無い)は NaN
+                      else np.full(len(st.layers), np.nan, dtype=np.float32))
+    rest = cat(nan(old), nan(new))[order]
     return ResidStats(cat(old.layers, new.layers)[order], cat(old.p10, new.p10)[order],
                       cat(old.p50, new.p50)[order], cat(old.p90, new.p90)[order], cat(old.mean, new.mean)[order],
-                      new.n_tokens, new.corpus_sha, new.chunk_tokens)
+                      new.n_tokens, new.corpus_sha, new.chunk_tokens,
+                      p50_rest=None if old.p50_rest is None and new.p50_rest is None else rest)
 
 
 def _version() -> str:

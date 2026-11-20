@@ -289,10 +289,10 @@ def check_layer_ok(weights, L: int, kind: str = "ffn", expert: int | None = None
 @lru_cache(maxsize=1)
 def _post_norm_archs() -> frozenset[str]:
     from .ablate import writers_table
-    return frozenset(writers_table().get("post_norm", []) or [])
+    return frozenset(writers_table().get("post_norm", []) or [])          # v0.9.0 でも広げない(LFM3 などの attn の keyed は警告で知らせる)
 
 
-def post_norm_gamma(weights, L: int, kind: str = "ffn") -> np.ndarray | None:
+def post_norm_gamma(weights, L: int, kind: str = "ffn", *, attn_correction: bool = True) -> np.ndarray | None:
     """書き込みの後に掛かる post-norm の γ(無ければ None)。確かめていない組み合わせは ARCH_UNSUPPORTED。
     ffn は blk.L.post_ffw_norm.weight(writers.py と同じ)。attention の post-norm と、MoE(shared・expert)の
     post-norm は重みの名前と掛かり方を確かめていないので断る(qwen35 の post_attention_norm は FFN の前の norm で
@@ -305,12 +305,23 @@ def post_norm_gamma(weights, L: int, kind: str = "ffn") -> np.ndarray | None:
         if weights.has_tensor(name):
             return np.asarray(tensor_to_f32(weights.tensor(name)), dtype=np.float64).reshape(-1)
         if pn:
-            raise GneError("ARCH_UNSUPPORTED", f"{arch} 是 post-norm，但找不到层 {L} 的 FFN post-norm 权重（post_ffw_norm）。该 arch 的 keyed 修正尚未验证")
+            raise GneError("ARCH_UNSUPPORTED", f"{arch} 是 MLP 输出之后有归一化的 arch，但找不到层 {L} 的归一化权重（post_ffw_norm），"
+                                               "因此不执行 keyed。原因：尚未确认该层的校正")
         return None
     if kind == "attn":
+        ai = getattr(weights, "arch", None)
+        li = ai.layers[weights.stored(L) if hasattr(weights, "stored") else L] if ai is not None else None
+        if li is not None and li.post_norm_mixer not in ("", "?"):   # 構造で見た注意の出力のあとの正規化(v0.9.0。LFM3 も)
+            if attn_correction:                       # v0.9.0 B2: FFN と同じ補正(d = rms̄_A·(r ⊘ γ)、γ は注意の後の正規化)
+                from .postnorm import gamma as _pn_gamma
+                return _pn_gamma(weights, L, "mixer")
+            raise GneError("ARCH_UNSUPPORTED", f"层 {L} 在注意力输出之后有归一化（{li.post_norm_mixer}），且已关闭校正"
+                                               "（proj_correction: none / --no-proj-correction），因此不执行 attn 的 keyed 写入",
+                           "使用带校正（默认）即可执行。或者请使用 FFN（kind: ffn）的 keyed")
         if pn:
-            raise GneError("ARCH_UNSUPPORTED", f"{arch} 是 post-norm。attention 写入的 post-norm 修正尚未验证",
-                           "请使用 FFN（kind: ffn）的 keyed")
+            raise GneError("ARCH_UNSUPPORTED", f"{arch} 在注意力输出之后有归一化，因此不执行 attn 的 keyed。"
+                                               "原因：尚未确认归一化部分的校正",
+                           "请改用 FFN（kind: ffn）的 keyed")
         if arch in _ATTN_OUT_RESCALED:
             raise GneError("ARCH_UNSUPPORTED", f"{arch} 会在 attention 输出（含 LoRA 差分）之后乘以倍率。attn 的 keyed 大小修正尚未验证", "请使用 FFN（kind: ffn）的 keyed")
         return None
@@ -386,10 +397,8 @@ def raw_direction(ds, L: int, direction_layer: str = "own") -> tuple[np.ndarray,
             raise GneError("BAD_RECIPE", f"方向 {ds.name} 中没有层 {L}（0～{max(ds.raw)}）")
     else:
         raise GneError("BAD_RECIPE", f"direction_layer={direction_layer!r} 只能是 own 或 base")
-    r = np.asarray(ds.raw[src], dtype=np.float64).reshape(-1)
-    if not np.any(r):
-        raise GneError("BAD_DIRECTION", f"方向 {ds.name} 的层 {src} 长度为 0")
-    return r, int(src)
+    from .direction import require_length
+    return require_length(ds, src), int(src)
 
 
 def write_vector(weights, ds, L: int, *, direction_layer: str = "own", rms_a: float | None = None,
@@ -408,8 +417,9 @@ def write_vector(weights, ds, L: int, *, direction_layer: str = "own", rms_a: fl
     n_floor = 0
     if gamma is not None:
         if rms_a is None:
-            raise GneError("BAD_KEY", f"层 {L} 是 post-norm，但键中没有 rms_a（触发位置写入的 rms）",
-                           "请重新创建键（post-norm 的 arch 在创建时会保存 rms_a）")
+            raise GneError("BAD_KEY", f"层 {L} 的写入目标（{kind}）输出之后有归一化，因此校正所需的 rms_a（激活位置处"
+                                      "写入的 rms）必须包含在键中，但此键没有",
+                           "请重新构建键（此种结构的层在构建时会保存 rms_a）")
         g, n_floor = floor_gamma(gamma)
         if g.size != n_embd:
             raise GneError("ARCH_UNSUPPORTED", f"层 {L} 的 post-norm 权重长度 {g.size} 与 n_embd={n_embd} 不一致")
@@ -875,7 +885,7 @@ def keyed_plan(weights, units, key_of: KeySource, dir_of: DirSource, *, directio
                            "请确认该键是否由其他模型创建")
         if ks.model_id and getattr(weights.meta, "model_id", None) and ks.model_id != weights.meta.model_id:
             note(f"键 {ks.name} 由其他模型（{ks.model_id}）创建")
-        gamma = post_norm_gamma(weights, u.layer, u.kind)
+        gamma = post_norm_gamma(weights, u.layer, u.kind, attn_correction=getattr(units, "proj_correction", None) != "none")
         gate = ks.gate_a.get(u.layer)
         if gate is None and u.kind in ("expert", "shared"):
             msg = _gate_note(weights, u.layer, u.kind)
@@ -885,7 +895,8 @@ def keyed_plan(weights, units, key_of: KeySource, dir_of: DirSource, *, directio
         d = write_vector(weights, dget(u.direction), u.layer, direction_layer=direction_layer, rms_a=ks.rms_a.get(u.layer),
                          gamma=gamma, kind=u.kind, expert=u.expert, gate=gate, info=info)
         if gamma is not None:
-            note("post-norm 的 arch。keyed 写入是 d = rms̄_A·(r ⊘ γ) 的一阶近似（忽略 rms 的变化）")
+            note(f"层 {u.layer} 的 MLP 输出之后有归一化，因此 keyed 的写入会按归一化部分校正后执行"
+                 "（d = rms̄_A·(r ⊘ γ)。这是忽略写入引起 rms 变化的一阶近似，因此 α 较大时效果不与 α 成比例）")
         if ks.kn.get(u.layer, 1.0) < KN_WARN:
             note(f"L{u.layer}：键 {ks.spec} 的 kn={ks.kn[u.layer]:.3f} 太小（向不希望写入的位置泄漏最多 {ks.gain[u.layer]:.1f} 倍）")
         info.update({"kn": float(ks.kn[u.layer]), "gain": float(ks.gain[u.layer]),
@@ -1112,6 +1123,11 @@ def check_keyed(session, L: int, *, key: str, direction: str, alphas=(1.0, 2.0),
     if not 0 < top_frac <= 1:
         raise GneError("BAD_ARGS", f"top_frac 必须大于 0 且不超过 1（{top_frac}）")
     w, e = session.weights, session.engine
+    if kind in ("ffn", "attn") and getattr(session, "proj_correction", True):   # 出力のあとに正規化がある層: 正規化の後で比べる(v0.9.0)
+        li_ = w.arch.layers[L]
+        if (li_.post_norm_mixer if kind == "attn" else li_.post_norm_ffn) not in ("", "?"):
+            return check_keyed_postnorm(session, L, key=key, direction=direction, alphas=alphas, kind=kind, texts=texts,
+                                        direction_layer=direction_layer, top_frac=top_frac, skip=skip)
     dname, sign = _fold_sign(str(direction), 1.0)
     ks = load_key(session, key)
     tgt = target_of(kind, expert)
@@ -1123,7 +1139,8 @@ def check_keyed(session, L: int, *, key: str, direction: str, alphas=(1.0, 2.0),
         raise GneError("BAD_KEY", f"键 {ks.spec} 的层 {L} 长度 {kappa.size} 与 {tensor} 的输入不一致")
     info: dict = {}
     d_lora = write_vector(w, session.direction_set(dname), L, direction_layer=direction_layer, rms_a=ks.rms_a.get(L),
-                          gamma=post_norm_gamma(w, L, kind), kind=kind, expert=expert, gate=ks.gate_a.get(L), info=info)
+                          gamma=post_norm_gamma(w, L, kind, attn_correction=bool(getattr(session, "proj_correction", True))),
+                          kind=kind, expert=expert, gate=ks.gate_a.get(L), info=info)
     d_eff = d_lora.astype(np.float64) * float(info["out_scale"])          # 書き込み行列の出力(norm の前)に入る向き(α = 1)
     dn = float(np.linalg.norm(d_eff))
     n_used = int(w.arch.layers[L].n_expert_used or 0) if kind == "expert" else 0
@@ -1250,3 +1267,112 @@ def check_keyed(session, L: int, *, key: str, direction: str, alphas=(1.0, 2.0),
     if kind == "expert" and not any(r["n_tokens"] for r in rows):
         out["note"] = (f"专家 {expert} 在 texts 中从未被选中，因此无法测量。请向 texts 传入会选中专家 {expert} 的文本（例如键的写入侧对话）")
     return out
+
+
+def check_keyed_postnorm(session, L: int, *, key: str, direction: str, alphas=(1.0, 2.0), kind: str = "ffn", texts=None,
+                         direction_layer: str = "own", top_frac: float = 0.25, skip: int = 1) -> dict:
+    """V30 の、出力のあとに正規化がある層の版(v0.9.0 B2。ffn・attn): keyed の LoRA を当てて、残差に足された値(正規化の後)の
+    差 Δ を測り、予測 γ ⊙ (y + α(κᵀx) d)/rms(y + α(κᵀx) d) − γ ⊙ y/rms(y) と比べる(y は書き込み行列の出力、x から計算。
+    d = rms̄_A·(r ⊘ γ) は書き込む向き)。合格は |κᵀx| の大きいトークン(上位 top_frac)で相対誤差の中央値 < 5%。
+    first_order は Δ と一次の見込み α(κᵀx)(rms̄_A / rms(y)) r の相対誤差(補正が一次近似であることの目安。判定には使わない)。"""
+    from .attn import capture_attention
+    from .capture import pick_act_name
+    from .postnorm import eps_of, gamma, gated, head_out_parts, layer_names, post_add, require_writer_sums, writer_side
+    from .steer import Recipe, Unit
+    w, e = session.weights, session.engine
+    side = writer_side(kind)
+    li = w.arch.layers[L]
+    require_writer_sums(session, "keyed 的验算（归一化之后）")
+    dname, sign = _fold_sign(str(direction), 1.0)
+    ks = load_key(session, key)
+    if ks.target != kind:
+        raise GneError("BAD_RECIPE", f"键 {ks.spec} 的写入目标是 {ks.target}，不是 {kind}")
+    kappa = ks.kappa_of(L).astype(np.float64)
+    info: dict = {}
+    d_lora = write_vector(w, session.direction_set(dname), L, direction_layer=direction_layer, rms_a=ks.rms_a.get(L),
+                          gamma=post_norm_gamma(w, L, kind, attn_correction=True), kind=kind, gate=ks.gate_a.get(L), info=info)
+    d_eff = d_lora.astype(np.float64) * float(info["out_scale"])
+    r_raw = np.asarray(raw_direction(session.direction_set(dname), L, direction_layer)[0], np.float64)
+    texts = list(texts) if texts else list(CHECK_TEXTS)
+    first = texts[0]
+    ids0 = e.tokenize(first, add_special=True, parse_special=False) if isinstance(first, str) else e.tokenize_prompt(e.render_chat(first))
+    names = set(e.list_names(ids0[:16]))
+    nm = layer_names(w, L)
+    if side == "mixer":
+        added = (nm["mid"], f"l_out-{L - 1}") if nm.get("mid") in names else (nm.get("mixer_post"), None)
+        parts = head_out_parts(w, names, L)
+        if parts is None:
+            raise GneError("ARCH_UNSUPPORTED", f"无法捕获层 {L} 的头输出")
+        xs = [x for x in parts if x]
+        W = w.head_writer_matrix(L).astype(np.float64)
+    else:
+        added = (nm["mid"], f"l_out-{L}") if nm.get("mid") in names else (nm.get("ffn_post"), None)
+        act = pick_act_name(names, L)
+        xs, parts = [act], (act, None)
+        W = w.down_matrix(L).astype(np.float64) * float((w.meta.ffn_down_scale or {}).get(L, 1.0))
+    if not added[0] or added[0] not in names:
+        raise GneError("ARCH_UNSUPPORTED", f"找不到层 {L} 加到残差的值（归一化之后）的捕获名")
+    extra = [x for x in (*added, *xs) if x]
+    g, eps = gamma(w, L, side), eps_of(w)
+    pkind = li.post_norm_kind or "rms"
+    convs = [t if isinstance(t, str) else list(t) for t in texts]
+
+    def cap(lora=None):
+        out = []
+        for ac in capture_attention(session, convs, layers=[], want_pattern=False, want_head_out=False, extra=extra, lora=lora):
+            T = ac.n_tokens
+            a = ac.extra[added[0]].astype(np.float64)
+            if added[1]:
+                b = ac.extra[added[1]].astype(np.float64)
+                a = a - b if side == "mixer" else b - a
+            if side == "mixer":
+                x = gated(ac.extra[parts[0]], ac.extra.get(parts[1]) if parts[1] else None, li.n_head, li.head_dim).reshape(T, -1)
+            else:
+                x = ac.extra[parts[0]].reshape(T, -1)
+            out.append({"x": np.asarray(x, np.float64), "add": a})
+        return out
+    rows = []
+    path = None
+    try:
+        base = cap()
+        for a0 in alphas:
+            a = sign * float(a0)
+            rec = Recipe([Unit(L, None, 0.0, kind, mode="keyed", k=a, direction=dname, key=key)], session.meta.model_id,
+                         name=f"v30pn-L{L}", direction_layer=direction_layer, proj_correction="postnorm")
+            path, ref = session.keyed_lora(rec)
+            got = cap([(str(path), float(ref))])
+            s_all, rel_all, fo_all = [], [], []
+            for b, gt in zip(base, got, strict=True):
+                x, dadd = b["x"][skip:], (gt["add"] - b["add"])[skip:]
+                s = x @ kappa
+                y = x @ W.T
+                pred = post_add(y + a * s[:, None] * d_eff[None, :], g, eps, pkind) - post_add(y, g, eps, pkind)
+                pn = np.linalg.norm(pred, axis=1)
+                rel_all.append(np.linalg.norm(dadd - pred, axis=1) / np.where(pn > 0, pn, np.inf))
+                rms = np.sqrt(np.mean(y * y, axis=1) + eps)
+                fo = a * s[:, None] * (float(ks.rms_a.get(L, 1.0)) / rms)[:, None] * r_raw[None, :]
+                fn = np.linalg.norm(fo, axis=1)
+                fo_all.append(np.linalg.norm(dadd - fo, axis=1) / np.where(fn > 0, fn, np.inf))
+                s_all.append(s)
+            s_cat, rel_cat, fo_cat = np.concatenate(s_all), np.concatenate(rel_all), np.concatenate(fo_all)
+            sa = np.abs(s_cat)
+            thr = float(np.quantile(sa, 1.0 - top_frac)) if sa.size else 0.0
+            big = (sa >= thr) & (sa > 0)
+            rel = rel_cat[big]
+            row = {"alpha": a, "adapter_scale": float(ref), "n_tokens": int(sa.size), "n_big": int(big.sum()),
+                   "kx_threshold": thr, "kx_max": float(sa.max()) if sa.size else None,
+                   "rel_err_median": float(np.median(rel)) if rel.size else None,
+                   "rel_err_p95": float(np.percentile(rel, 95)) if rel.size else None, "cos_median": None,
+                   "leak_b": None, "leak_b_source": None, "leak_b_token_median": None,
+                   "first_order_rel_err_median": float(np.median(fo_cat[big])) if rel.size else None}
+            row["ok"] = bool(rel.size and np.median(rel) < 0.05)
+            rows.append(row)
+    finally:
+        e.free_attn_probe()
+    if path is not None:
+        e.drop_lora(path)
+    ok = all(r["ok"] for r in rows)
+    return {"layer": L, "kind": kind, "expert": None, "tensor": check_layer_ok(w, L, kind, None), "key": ks.spec, "direction": dname,
+            "direction_layer": direction_layer, "in_name": parts[0], "out_name": added[0], "d_norm": float(np.linalg.norm(d_eff)),
+            "direction_norm": info.get("direction_norm"), "post_norm": True, "kn": float(ks.kn.get(L, 1.0)),
+            "leak_b_key_examples": None, "rows": rows, "v30": ok, "judged_leak": False, "compared": "after_norm", "ok": ok}

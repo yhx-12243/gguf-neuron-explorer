@@ -109,7 +109,8 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
                 "connections": data.connections().meta if data.connections() is not None else None,
                 "heads": data.heads_list(), "writers": data.writers_list(),
                 "causal": data.causal_list(), "direction_sets": data.directions_list(),       # CHANGE-06 G
-                "keys": data.keys_list()}                                                     # CHANGE-07 G: 鍵つきの書き込みの鍵
+                "keys": data.keys_list(),                                                     # CHANGE-07 G: 鍵つきの書き込みの鍵
+                "dose_spread": session.dose_spread()}                                         # 残差の大きさの偏り(v0.9.0)
 
     @app.get("/api/vocab")
     def vocab():
@@ -433,13 +434,14 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
     def recipe_save(name: str, units: list[str] = Body(...), ablate: dict | None = Body(None),
                     sampling: dict | None = Body(None), direction_layer: str | None = Body(None),
                     default_direction: str | None = Body(None), default_key: str | None = Body(None),
-                    loop_edits: str | None = Body(None)):
+                    loop_edits: str | None = Body(None), proj_correction: str | None = Body(None)):
         """direction_layer は proj・keyed に当てる方向の層(CHANGE-06・07、own なら書かない)。default_direction・default_key は
         @方向・#鍵を省いた proj・keyed のユニットの既定(CHANGE-07)。loop_edits は同じ層を 2 回実行するモデルの当て方
         (per_visit のときだけ送られる)。"""
         return session.recipe_save(name, units, ablate=ablate, sampling=sampling, default_direction=default_direction or None,
                                    direction_layer=direction_layer if direction_layer and direction_layer != "own" else None,
-                                   default_key=default_key or None, loop_edits=loop_edits or None)
+                                   default_key=default_key or None, loop_edits=loop_edits or None,
+                                   proj_correction=proj_correction or None)
 
     @app.get("/api/evals")
     def evals():
@@ -511,6 +513,28 @@ def create_app(session, *, warm: bool = True, openai: bool = False) -> FastAPI:
     @app.get("/api/writers")
     def writers_list():
         return data.writers_list()
+
+    # --- 層の幾何(gne heads geometry): 保存した配列だけで計算する(GPU を使わない、数秒)ので、ジョブにせずその場で返す ----------
+    @app.get("/api/geometry")
+    def geometry_list():
+        from ..geometry import list_materials
+        return list_materials(session)
+
+    @app.get("/api/geometry/{name}")
+    def geometry_one(name: str):
+        from ..geometry import read_result
+        return read_result(session, name)
+
+    @app.post("/api/geometry/{name}")
+    def geometry_run(name: str, params: dict = Body({})):
+        from ..geometry import UI_PARAMS, analyze, read_result
+        # compare は "" を「比べない」として通す(省くと refine の方向を探す)。ほかの空の欄は既定
+        d = analyze(session, name, **{k: v for k, v in params.items() if k in UI_PARAMS and (v not in (None, "") or k == "compare")})
+        return read_result(session, d["name"])
+
+    @app.post("/api/geometry/{name}/export")
+    def geometry_export(name: str, out: str = Body(...), source: str = Body(...), force: bool = Body(False)):
+        return session.heads_geometry_export(name, out, source, force=force)
 
     @app.get("/api/writers/{name}")
     def writers_one(name: str):

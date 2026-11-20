@@ -69,7 +69,7 @@ def unit_layers(session, up_to: int, kinds, loop_direction: str = "first") -> tu
         if ("attn" in kinds or "linear" in kinds or "layer_attn" in kinds) and li.head_dim and li.head_writer:
             if kind_of_layer(session, L) in kinds or "layer_attn" in kinds:
                 hl.append(rep)
-        if ("neuron" in kinds or "layer_mlp" in kinds) and li.ffn == "dense" and not li.has_post_ffn_norm \
+        if ("neuron" in kinds or "layer_mlp" in kinds) and li.ffn == "dense" and not li.post_norm_ffn \
                 and w.has_tensor(f"blk.{w.stored(L)}.ffn_down.weight"):
             nl.append(rep)
     return sorted(hl), sorted(nl)
@@ -104,12 +104,27 @@ def parse_kinds(spec) -> tuple[str, ...]:
 
 # --- 1. 書き込みの順位づけ ---------------------------------------------------------------------------------
 
+def _zero_direction_layers(builder, ds, layers) -> list[int]:
+    """方向の長さが 0 の層(A と B の残差の差が 0。短い畳み込みの層の最初の数層など)。head_direction が断る層。"""
+    out = []
+    for L in layers:
+        try:
+            builder.r_of(L, ds.name)
+        except GneError as e:
+            if getattr(e, "zero_layer", None) is None:
+                raise
+            out.append(int(L))
+    return out
+
+
 def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last", subset: str = "all",
                    max_examples: int | None = None, kinds=KINDS, direction_layer: str = "own", top_q: int = 256,
                    candidate_layers: list[int] | None = None, loop_direction: str = "first",
-                   progress=None) -> tuple[dict, dict]:
+                   keep_q: bool = False, progress=None) -> tuple[dict, dict]:
     """部品ごとの書き込み(と層ごとの更新のベクトル)を測る。戻り値 (まとめ, 保存する配列)。candidate_layers を渡すと、
-    順位に入れる部品をその層のものに絞る(層ごとの更新のベクトルは全部の層で測る)。loop_direction は unit_layers。"""
+    順位に入れる部品をその層のものに絞る(層ごとの更新のベクトルは全部の層で測る)。loop_direction は unit_layers。
+    keep_q なら、質問ごと・層ごとの更新(注意の出力全体と MLP の出力全体)も q_* の配列で返す(gne heads geometry の材料。
+    float16 で、層ごとに最大の絶対値が 1024 になるよう q_scale_* で割ってある)。"""
     from .attn import _names, _probe, head_out_names, writer_out_name
     from .capture import pick_act_name
     from .direction import Scorer
@@ -130,6 +145,16 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
     builder = ProjBuilder(w, session.direction_set, direction_layer=direction_layer, keep_w=4)
     rS = ds.unit(S).astype(np.float64)
     hl, nl = unit_layers(session, S - 1, kinds, loop_direction)
+    pn = [L for L in hl if w.arch.layers[w.stored(L)].post_norm_mixer not in ("", "?")]
+    if pn:                                           # 出力のあとの正規化: 書き込みの量の点数が残差での寄与を表さない(B3 の補正までは実行しない)
+        raise GneError("ARCH_UNSUPPORTED", f"层 {', '.join(map(str, pn[:6]))}{' …' if len(pn) > 6 else ''} 在注意力（混合层）输出之后有归一化，"
+                       "因此不执行按写入量排序。原因：分数（归一化前的写入）不代表在残差中的贡献"
+                       "（在 LFM3-1.7B 和 Gemma 3 1B 上测得，与归一化后贡献的秩相关中位数 0.85、最小 −0.12）",
+                       "请改用 --rank causal（停用后选择）。在校正归一化的分数进入下一版本前按此处理")
+    pu = [L for L in hl if w.arch.layers[w.stored(L)].post_norm_mixer == "?"]
+    if pu:                                           # 表に無い arch の post_attention_norm(MLP の手前か、出力のあとか、確かめていない)
+        session.warn(f"层 {', '.join(map(str, pu[:6]))} 的 post_attention_norm 是注意力输出之后的归一化还是 MLP 之前的归一化，"
+                     "此 arch 尚未确认。若在输出之后，按写入量的分数不代表在残差中的贡献")
     if candidate_layers is not None:                  # 重みを 2 回使うモデルでは、どちらの回の段で書いても同じ重みを指す
         keep = {int(x) for x in candidate_layers}
         if shared:
@@ -141,6 +166,7 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
     # 捕まえる名前
     items = {s: [(ids, rows) for ids, rows in sc.items[s] if len(ids) <= e.probe_ubatch] for s in "AB"}
     skipped = {s: len(sc.items[s]) - len(items[s]) for s in "AB"}
+    qidx = {s: [sc.index_side[s][j] for j, (ids, _) in enumerate(sc.items[s]) if len(ids) <= e.probe_ubatch] for s in "AB"}
     if not items["A"] or not items["B"]:
         raise GneError("BAD_ARGS", f"所有问题都超过了注意力捕获上限 {e.probe_ubatch} 个 token，无法测量写入")
     probe, ctx = _probe(e, need=max(len(ids) for s in "AB" for ids, _ in items[s]))
@@ -232,6 +258,16 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
            for x in ("a", "b", "diff", "diff_h0", "diff_h1")}
     chk_attn = np.full(NL, np.nan, np.float32)
     chk_mlp = np.full(NL, np.nan, np.float32)
+    qup = {f"{k}_{x.lower()}": np.zeros((nq[x], NL, n_embd), np.float16) for k in ("attn", "mlp") for x in "AB"} if keep_q else None
+    qsc = {k: np.zeros(NL, np.float32) for k in qup} if keep_q else None
+
+    def keep_q_rows(k, L, W, key):
+        """質問ごとの更新(W · 質問ごとの出力の平均)を float16 で持つ。層ごとに最大の絶対値が 1024 になるよう割る(桁あふれを避ける)。"""
+        for x in "AB":
+            Q = stack(x, key, L) @ W.T
+            m = float(np.abs(Q).max()) / 1024.0 or 1.0
+            qup[f"{k}_{x.lower()}"][:, L] = (Q / m).astype(np.float16)
+            qsc[f"{k}_{x.lower()}"][L] = m
     cos_sel = np.full(NL, np.nan, np.float32)
 
     stacks: dict = {}
@@ -259,6 +295,8 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
             va, vb = Wm @ mA, Wm @ mB
             upd[f"{k}_a"][L], upd[f"{k}_b"][L], upd[f"{k}_diff"][L] = va, vb, va - vb
             upd[f"{k}_diff_h0"][L], upd[f"{k}_diff_h1"][L] = Wm @ (mA0 - mB0), Wm @ (mA1 - mB1)
+            if qup is not None:
+                keep_q_rows("attn", L, Wm, "mx")
             if L in mixn and per["A"]["mo"][L]:
                 real = stack("A", "mo", L).mean(axis=0)
                 if mixn[L].startswith("ffn_inp"):           # ffn_inp − 層の入力(前の層の出力)
@@ -276,6 +314,8 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
                 va, vb = Wd @ mA, Wd @ mB
                 upd["mlp_a"][L], upd["mlp_b"][L], upd["mlp_diff"][L] = va, vb, va - vb
                 upd["mlp_diff_h0"][L], upd["mlp_diff_h1"][L] = Wd @ (mA0 - mB0), Wd @ (mA1 - mB1)
+                if qup is not None:
+                    keep_q_rows("mlp", L, Wd, "ma")
                 if L in ffnn and per["A"]["fo"][L]:
                     real = stack("A", "fo", L).mean(axis=0)
                     chk_mlp[L] = float(np.linalg.norm(va - real) / max(np.linalg.norm(real), 1e-12))
@@ -291,6 +331,15 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
     # 層ごとの直接の書き込み(注意全体・MLP 全体を s=1 で射影したときに選ぶ層で縮む A−B の差。層の更新のベクトルから。部品の種類の
     # 指定に関係なく出す。重みを 2 回使うモデルで両方の回に当てるときは、同じ重みの 2 回分を、部品の番号の段の方向で足す)
     lay: dict[int, list[float]] = {}
+    zero = _zero_direction_layers(builder, ds, sorted(set(exec_layers) | set(hl) | set(nl)))   # A と B の差が 0 の層(v0.9.0)
+    zero_note = None
+    if zero:
+        zero_note = (f"方向 {ds.name} 的层 {', '.join(map(str, zero[:8]))}{' …' if len(zero) > 8 else ''} 长度为 0"
+                     "（该层中 A 侧与 B 侧的残差完全相同。短卷积层只能看到几个 token 之前，因此两侧不同的 system "
+                     "提示尚未到达）。该层无法确定沿方向的写入，已从逐层写入表和单元候选中移除")
+        session.warn(zero_note)
+    hl = [L for L in hl if L not in zero]
+    nl = [L for L in nl if L not in zero]
     for L in exec_layers:
         if L >= S or not (arch.layers[L].head_dim or arch.layers[L].ffn == "dense"):
             continue
@@ -298,6 +347,8 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
         if shared and plan.visit(L) != 0:
             st_ = plan.stored(L)
             rep = st_ + plan.shift if loop_direction == "second" else st_
+        if rep in zero:
+            continue
         r_, _ = builder.r_of(rep, ds.name)
         r_ = r_.astype(np.float64)
         c_ = float(r_ @ rS)
@@ -440,6 +491,10 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
         "head_q_a": HQ["A"].astype(np.float32), "head_q_b": HQ["B"].astype(np.float32),
         "top_label": np.array([r_["label"] for r_ in topu]), "top_q_a": tq["A"], "top_q_b": tq["B"],
     })
+    if qup is not None:                                # 質問ごとの更新(keep_q)。対になる = 両側で同じ質問の同じ番号
+        arrays.update({f"q_upd_{k}": v for k, v in qup.items()}, **{f"q_scale_{k}": v for k, v in qsc.items()},
+                      q_index_a=np.array(qidx["A"], np.int32), q_index_b=np.array(qidx["B"], np.int32),
+                      q_paired=np.bool_(not cs.separate_prompts and qidx["A"] == qidx["B"]))
     for L, (ao, bo, as_, bs, _, _) in neu.items():
         arrays[f"neuron_a_own_{L}"] = ao.astype(np.float32)
         arrays[f"neuron_b_own_{L}"] = bo.astype(np.float32)
@@ -454,6 +509,7 @@ def measure_writes(session, ds, cs, *, select_layer: int, positions: str = "last
                "n": nq, "skipped_long": skipped, "gap": gap,
                "base": {"A": float(np.mean(per["A"]["pS"])), "B": float(np.mean(per["B"]["pS"]))},
                "n_units": by_kind_n, "head_layers": hl, "neuron_layers": nl, "layer_scores": layer_scores,
+               "zero_layers": zero, "zero_note": zero_note,
                "loop_edits": ("shared" if shared else "per_visit") if plan is not None else None,
                **({"loop_direction": loop_direction} if shared else {}),
                "totals": {k: v for k, v in totals.items()},
@@ -743,6 +799,8 @@ def allocate_units(session, st, verified: list[dict], *, target: float, n_units=
     rec_n, why, no_rec = _recommend(table, len(a_all), sc)
     for r in table:
         r["recommended"] = r.get("n_heads") == rec_n and rec_n is not None
+    from .causal import most_reduced_summary
+    most_reduced_summary({"s1": s1, "table": table})           # A 側が最も下がった組の印(推す組とは別、v0.9.0)
     out = {"name": name, "direction": ds.name, "contrast_sha": st.cs.sha, "score_layer": S, "score_layers": st.score_layers,
            "max_examples": max_examples, "drift_max": drift_max, "b_move_max": b_move_max, "target": float(target),
            "positions": st.scorer.positions, "subset": st.scorer.subset, "direction_layer": direction_layer,

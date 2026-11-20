@@ -168,6 +168,34 @@ def save_directions(path: Path, cr, cs: ContrastSet, source: str) -> None:
              n_rows_A=cr.n_rows["A"], n_rows_B=cr.n_rows["B"], **extra)
 
 
+def zero_length_layers(ds) -> list[int]:
+    """長さが 0 の層(A 側と B 側の残差がまったく同じだった層)。"""
+    return [int(L) for L in sorted(ds.raw) if not np.any(np.asarray(ds.raw[L]))]
+
+
+def require_length(ds, L: int, what: str | None = None) -> np.ndarray:
+    """方向 ds の層 L のベクトル(float64)。長さが 0 なら、理由と使える層を添えた GneError(v0.9.0)。
+    短い畳み込みの層(LFM2・LFM3 の最初の 2 層)は数トークン前までしか見ないので、生成プロンプトの最後の位置では、両側で違う
+    system プロンプトがまだ届かず、A − B がちょうど 0 になる。0 のまま正規化すると NaN、足すと何も起きない。"""
+    r = np.asarray(ds.raw[L], dtype=np.float64).reshape(-1)
+    if np.any(r):
+        return r
+    raise zero_length_error(ds.name, ds.raw, L, what)
+
+
+def zero_length_error(name: str, raw: dict, L: int, what: str | None = None) -> GneError:
+    first = next((int(x) for x in sorted(raw) if x > L and np.any(np.asarray(raw[x]))), None)
+    head = f"{what}{' ' if what[-1].isascii() else ''}无法执行。原因：" if what else ""
+    e = GneError("BAD_DIRECTION",
+                    f"{head}方向 {name} 的层 {L} 长度为 0。该层中 A 侧与 B 侧的残差完全相同（短卷积层只能"
+                    "看到几个 token 之前，因此在测量方向的位置上，两侧不同的 system 提示尚未到达。"
+                    "如 LFM2 和 LFM3 的前 2 层）",
+                    f"请使用层 {first} 及之后的层（该方向中第一个长度非 0 的层）" if first is not None else
+                    "请重建对照集合，使 A 侧与 B 侧不同的内容能到达测量方向的位置")
+    e.zero_layer = int(L)
+    return e
+
+
 def candidate_layers(n_layer: int, spec: str | list[int] | None = None) -> list[int]:
     """既定 0.3·n_layer 〜 0.8·n_layer。"a-b"、"a-b:step"、"a,b,c" も受け付ける。層 0 と最終層は除く。"""
     if spec is None or spec == "":

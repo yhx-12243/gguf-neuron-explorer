@@ -56,20 +56,24 @@ class Common:
     verbose: bool = False
     json: bool = False
     mmproj: Optional[Path] = None
+    no_proj_correction: bool = False      # v0.9.0: 出力のあとに正規化がある層の射影・ablate を補正しない(v0.8.x と同じ計算)
 
     def merged(self, over: dict) -> Common:
-        kw = {k: v for k, v in over.items() if v is not None and k not in ("verbose", "json")}
+        kw = {k: v for k, v in over.items() if v is not None and k not in ("verbose", "json", "no_proj_correction")}
         return replace(self, **kw, verbose=self.verbose or bool(over.get("verbose")),
-                       json=self.json or bool(over.get("json")))
+                       json=self.json or bool(over.get("json")),
+                       no_proj_correction=self.no_proj_correction or bool(over.get("no_proj_correction")))
 
     def session(self, model: Optional[Path] = None):
         from .api import Session
         path = model or self.model
         if path is None:
             raise GneError("BAD_ARGS", "请指定 GGUF", "--model 或环境变量 GNE_MODEL")
-        return Session(path, root=self.root, n_gpu_layers=self.n_gpu_layers, n_ctx=self.n_ctx,
-                       n_seq_max=self.n_seq_max, seed=self.seed, verbose=self.verbose, progress=self.progress,
-                       mmproj=self.mmproj)
+        s = Session(path, root=self.root, n_gpu_layers=self.n_gpu_layers, n_ctx=self.n_ctx,
+                    n_seq_max=self.n_seq_max, seed=self.seed, verbose=self.verbose, progress=self.progress,
+                    mmproj=self.mmproj)
+        s.proj_correction = not self.no_proj_correction
+        return s
 
     def progress(self, done: int, total: int, stage: str) -> None:
         now = time.monotonic()
@@ -121,6 +125,10 @@ def _common_params() -> list[inspect.Parameter]:
                           default=typer.Option(False, "--verbose", "-v", help="输出 llama.cpp 日志")),
         inspect.Parameter("json", K, annotation=bool,
                           default=typer.Option(False, "--json", help="stdout 只输出 JSON")),
+        inspect.Parameter("no_proj_correction", K, annotation=bool,
+                          default=typer.Option(False, "--no-proj-correction",
+                                               help="对输出之后有归一化的模型，不校正投影（proj）和 ablate"
+                                                    "（与 v0.8.x 相同的计算。需要在与以前相同的作用方式下应用无记录的旧配方时）")),
     ]
 
 
@@ -231,8 +239,10 @@ def main(ctx: typer.Context,
          verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 llama.cpp 日志"),
          json_: bool = typer.Option(False, "--json", help="stdout 只输出 JSON"),
          mmproj: Optional[Path] = typer.Option(None, "--mmproj", envvar="GNE_MMPROJ",
-                                               help="用于音频输入的 mmproj（默认使用模型同目录下的 mmproj*.gguf）")):
-    ctx.obj = Common(model, root, n_gpu_layers, n_ctx, n_seq_max, seed, verbose, json_, mmproj)
+                                               help="用于音频输入的 mmproj（默认使用模型同目录下的 mmproj*.gguf）"),
+         no_proj_correction: bool = typer.Option(False, "--no-proj-correction",
+                                                 help="对输出之后有归一化的模型，不校正投影（proj）和 ablate（与 v0.8.x 相同的计算）")):
+    ctx.obj = Common(model, root, n_gpu_layers, n_ctx, n_seq_max, seed, verbose, json_, mmproj, no_proj_correction)
 
 
 # --- 表示の補助 ------------------------------------------------------------------------------------------
@@ -350,6 +360,11 @@ def info(c: Common, holder: dict,
     if sp:
         rows.append(("GPU / CPU 层数", f"GPU {sp['gpu_layers']} / CPU {sp['cpu_layers']}、预计生成 {sp['decode_tok_s']:.0f} tok/s（单条）"
                      + ("、来自 gne bench 实测" if sp["source"] == "bench" else "、来自默认系数")))
+    ds = (d.get("stats") or {}).get("dose_spread")
+    if ds:
+        rows.append(("残差偏斜", "统计来自 v0.9.0 之前，因此没有此项（用 gne stats resid 重新生成即可输出）" if ds.get("old")
+                     else f"rel 强度 1 = 去掉最大的 {ds['top']} 个成分后大小的约 {ds['median']:.1f} 倍（层 3 及以后的中位数。最大 "
+                          f"{ds['max']:.1f} 倍，层 {ds['max_layer']}）"))
     text = _table(rows)
     text += "".join(f"\n警告：{w}" for w in d["arch_warnings"]) or "\n无警告：dense FFN，神经元操控与 control vector 等价"
     if d.get("workflow"):
@@ -444,6 +459,9 @@ def verify(c: Common, holder: dict,
     steps = [(vid, (lambda vid=vid, fn=fn: VResult(vid, "省略", "skip", why[vid]) if vid in why else fn())) for vid, fn in steps]
     if s.engine.hc_streams:
         steps.append(("V26", v.v26_hc_streams))
+    from .postnorm import entry, writer_layers, writer_sums_vresult
+    if writer_layers(s.weights) or (entry(s.meta.arch) or {}).get("mixer_out"):   # 捕捉の表を使うモデル: 名前と式の検算(v0.9.0)
+        steps.append(("V27", lambda: writer_sums_vresult(s)))
 
     def show(r):
         results.append(r)
@@ -515,10 +533,19 @@ def stats_resid(c: Common, holder: dict, corpus: Optional[Path] = _CORPUS, token
     d = s.stats_resid(corpus=corpus, tokens=tokens, layers=parse_layers(layers),
                       include_last_layer=include_last_layer, chunk_tokens=chunk_tokens)
     st = d["stats"]
-    rows = [f"  L{L:<3} p10 {a:8.2f}  p50 {b:8.2f}  p90 {q:8.2f}"
-            for L, a, b, q in zip(st["layers"], st["p10"], st["p50"], st["p90"], strict=True)]
+    rest = st.get("p50_rest") or [None] * len(st["layers"])
+    rows = [f"  L{L:<3} p10 {a:8.2f}  p50 {b:8.2f}  p90 {q:8.2f}" + (f"  偏斜 {b / r:5.2f} 倍" if r else "")
+            for L, a, b, q, r in zip(st["layers"], st["p10"], st["p50"], st["p90"], rest, strict=True)]
     text = (f"{d['path']}（{st['n_tokens']} token/层、语料 {d['corpus']['sha']}、{d['seconds']:.1f} 秒）\n"
-            + "\n".join(rows))
+            + "\n".join(rows)
+            + "\n偏斜 = p50 ÷ 去掉最大的 8 个成分后大小的中位数（rel 强度 1 相当于去掉偏斜后大小的多少倍）")
+    for w in s.warnings:
+        if "集中" in w:
+            text += f"\n警告：{w}"
+    ds = s.dose_spread()
+    if ds and ds.get("warn"):
+        text += (f"\n警告：此模型中强度（rel）1 相当于去掉偏斜后大小的约 {ds['median']:.1f} 倍（偏斜较少的模型约"
+                 "为 1.3 倍）。请从较弱的强度开始尝试")
     return d, text, 0
 
 
@@ -2333,6 +2360,11 @@ def direction_key_verify(c: Common, holder: dict,
                         if "other_max" in r else "") + f"  {'○' if r['ok'] else '×'}")
     if d.get("note"):
         lines.append(f"注: {d['note']}")
+    if d.get("compared") == "after_norm":
+        lines.append("由于该层在输出之后有归一化，已将加到残差的值（" + d["out_name"] + "）之差与经过归一化的预测进行比较"
+                     "（合格标准为相对误差 < 5%）。与一阶预估的差："
+                     + "、".join(f"α {r['alpha']:+g} {_f(r.get('first_order_rel_err_median'), '.2f')}" for r in d["rows"]))
+        return d, "\n".join(lines + [f"V30 {'合格' if d['v30'] else '不合格'}（归一化之后）"]), 0 if d["v30"] else 1
     lines.append(f"V30 {'合格' if d['v30'] else '不合格'}(相对误差 < 3%"
                  + ("、对不希望写入侧的泄漏 < 0.1" if d["judged_leak"] else "、对不希望写入侧的泄漏无判定")
                  + ("、其他专家的槽位差 < 1e-3、选择方式变化 0" if kind == "expert" else "") + ")")
@@ -2715,6 +2747,10 @@ def heads_writers(c: Common, holder: dict,
             lines.append(f"{r['layer']:>4} {r['kind']:<8} {r['attention']:>+10.2f} {r['moe']:>+8.2f} {r['shared']:>+8.2f}")
     for L, rows in d["experts"].items():
         lines.append(f"L{L} 的专家(按差值从大到小): " + " ".join(f"E{x['expert']}({x['diff']:+.2f}、A {x['rate_a']:.0%}/B {x['rate_b']:.0%})" for x in rows))
+    if d.get("post_norm_layers"):
+        lines.append(f"对于输出之后有归一化的 {len(d['post_norm_layers'])} 个层，已按加到残差的值（归一化之后）分为 attention 和 MLP"
+                     + (f"。其中 MoE 层 {', '.join(map(str, d['post_norm_moe_unsplit'][:8]))} 未拆分为专家和共享专家，而是放入了「专家」栏"
+                        if d.get("post_norm_moe_unsplit") else ""))
     return d, "\n".join(lines), 0
 
 
@@ -2758,7 +2794,7 @@ def heads_allocate(c: Common, holder: dict,
             continue
         lines.append(f"  {r['n_heads']:>3} {r['s_max']:>6.2f} {r['remain']:>5} {r['a_max']:>7.2f} {r['b_drift_orth']:>7.4f} "
                      f"{r['b_side_delta']:>+7.2f} {r['seconds']:>5.0f}  " + " ".join(r["units"])
-                     + ("" if r["reached"] else "  （目标未达到）") + ("  ← 推荐" if r["recommended"] else ""))
+                     + ("" if r["reached"] else "  （目标未达到）") + ("  ← 推荐" if r["recommended"] else "") + _mr_mark(r))
         lines += _allocate_note(r, d)
     lines += _initial_lines(d)
     if d["recommended"] is not None:
@@ -2831,6 +2867,9 @@ def recipe_scale(recipe: Path = typer.Argument(..., exists=True, help="要乘以
     except GneError as e:
         raise typer.BadParameter(e.message, param_hint="--out") from e
     print(f"{out}（{len(sr.units)} 个单元，已乘入倍率 ×{tag}）" + ("由于倍率为负，各单元的方向与原始方向相反" if scale < 0 else ""))
+    if r.proj_correction is None and (r.proj_units or r.ablate):                    # v0.9.0: 記録の無い古いレシピ
+        print("原始配方中没有投影校正的记录，因此已按带校正（proj_correction: postnorm）写出。对于输出之后有归一化的"
+              "模型，作用方式与之前的版本不同。若要使用与以前相同的作用方式，请将写出的配方的 proj_correction 设为 none")
 
 
 @gne_command(headproj_app, "ablate", "headproj export")
@@ -2852,7 +2891,7 @@ def headproj_ablate(c: Common, holder: dict,
     if not units:
         raise GneError("BAD_ARGS", "指定的层没有注意力头")
     rec = Recipe(units, s.meta.model_id, name=f"{direction}-heads-ablate", default_direction=direction,
-                 direction_layer="own" if per_layer else "base")
+                 direction_layer="own" if per_layer else "base", proj_correction=s.proj_correction_label(None))
     out = out or s.store.export_dir() / (f"{direction}-heads-ablate.gguf" if bake else f"{direction}-heads-ablate.lora.gguf")
     d = s.headproj_export(rec, out, bake=bake, requant="keep" if bake else "q8_0")
     lines = [f"{d['path']}({d['bytes'] / 1e6:.2f} MB、{'烧录' if bake else 'LoRA'}、{len(units)} 个注意力头、{len({u.layer for u in units})} 层、{'按层的 r_L' if per_layer else '基准层的 r'}、比例 {scale:g})"]
@@ -2950,6 +2989,8 @@ def headproj_check(c: Common, holder: dict, layer: int = typer.Option(..., "--la
     sl = [float(x) for x in ss.split(",")]
     if whole is not None:
         d = s.check_whole_proj(layer, whole.lower(), direction, ss=sl)
+        if d.get("compared") == "after_norm":
+            return d, _postnorm_check_text(d, f"L{layer} {d['kind']}", direction), 0 if d["ok"] else 1
         lines = [f"L{layer} {d['kind']}（{d['out_tensor']}、方向 {direction} 的 L{d['direction_from']}、写入与方向的 |cos| 中位数 "
                  f"{_f(d['dir_cos'], '.3f')}）"]
         for r in d["rows"]:
@@ -2959,11 +3000,15 @@ def headproj_check(c: Common, holder: dict, layer: int = typer.Option(..., "--la
         return d, "\n".join(lines), 0 if d["ok"] else 1
     if neuron is not None:
         d = s.check_neuron_proj(layer, neuron, direction, ss=sl)
+        if d.get("compared") == "after_norm":
+            return d, _postnorm_check_text(d, f"L{layer} N{neuron}", direction), 0 if d["ok"] else 1
         who = f"L{layer} N{neuron}"
         lines = [f"{who}（{d['out_tensor']}、激活 {d['act_tensor']}、方向 {direction} 的 L{d['direction_from']}、"
                  f"写入方向与该方向的 |cos| {_f(d['dir_cos_neuron'], '.3f')}、有激活的位置 {d['n_active']}/{d['n_tokens']}）"]
     else:
         d = s.check_head_proj(layer, head, direction, ss=sl)
+        if d.get("compared") == "after_norm":
+            return d, _postnorm_check_text(d, f"L{layer} H{head}", direction), 0 if d["ok"] else 1
         lines = [f"L{layer} H{head}（{d['out_tensor']}、方向 {direction} 的 L{d['direction_from']}、注意力头写入与方向的 |cos| 中位数 "
                  f"{_f(d['dir_cos_head'], '.3f')}）"]
     for r in d["rows"]:
@@ -2972,6 +3017,19 @@ def headproj_check(c: Common, holder: dict, layer: int = typer.Option(..., "--la
     lines.append(f"  对比 gain ×{d['gain']['k']:g}：正交分量变化 {_f(d['gain']['orth_change_rel_median'], '.3f')}")
     lines.append(f"V24 {'通过' if d['v24'] else '未通过'}、V25 {'通过' if d['v25'] else '未通过'}")
     return d, "\n".join(lines), 0 if d["ok"] else 1
+
+
+def _postnorm_check_text(d: dict, who: str, direction: str) -> str:
+    """出力のあとに正規化がある層の射影の検算(補正つき、v0.9.0)の表示。"""
+    lines = [f"{who}（输出之后有归一化的层。用加到残差的值 {d['added_tensor']} 比较，方向 {direction} 的 L{d['direction_from']}，"
+             f"校正后的方向与 r̂ 的 cos {d['cos_r_v']:.3f}，向其他方向移动的预测 {_f(d['side_ratio_pred'], '.2f')} 倍）"]
+    for r in d["rows"]:
+        lines.append(f"  s {r['s']:g}：r̂ 成分变化的相对误差（与预测）中位数 {_f(r['comp_change_rel_err_median'], '.2e')}、"
+                     f"成分 {r['comp_after_over_before_median']:+.3f} 倍（预测 {r['comp_after_over_before_pred']:+.3f}）、"
+                     f"与成比例时相比的效果 {r['vs_proportional_median']:.2f}、向其他方向的移动 {_f(r['side_change_median'], '.2f')} 倍"
+                     f"  {'○' if r['ok'] else '×'}")
+    lines.append(f"验算（归一化之后）{'合格' if d['ok'] else '不合格'}")
+    return "\n".join(lines)
 
 
 @gne_command(heads_app, "pipeline", "heads pipeline")
@@ -3000,6 +3058,7 @@ def heads_pipeline(c: Common, holder: dict,
                    holdout: bool = typer.Option(False, "--holdout", help="--rank writes：将问题分成两半，用偶数序号选择，用奇数序号（未用于选择的问题）测量表中的数值和回复校验（每侧至少 16 个问题）"),
                    loop_direction: Optional[str] = typer.Option(None, "--loop-direction", help="--rank writes、同一层运行两次的模型：按第一次运行的层（first）或第二次运行的层（second）的方向，测量并投影循环内的部件"),
                    strength: Optional[str] = typer.Option(None, "--strength", help="--rank writes：s=1 的组未达到目标时的强度决定方式。per_unit（默认：按单元分别调整，根据在投影值容易残留的问题上的效率提高）/ uniform（全部使用同一倍率，v0.8.2 及之前）"),
+                   from_direction: Optional[str] = typer.Option(None, "--from-direction", help="使用已生成的方向向量（跳过方向构建。例如 heads geometry 保存的方向。作为批量的名称方向复制）"),
                    yes: bool = _YES):
     """対照集合から、方向づくり → 基準層 → 候補づくり → 強さの配分 を 1 回で回す。候補づくりと配分は 2 通り:
     --rank writes(既定): 全部の部品(注意ヘッド・線形注意のヘッド、--unit-kinds all で MLP のニューロンも)を方向への書き込みの量で
@@ -3013,20 +3072,24 @@ def heads_pipeline(c: Common, holder: dict,
             "select_layer": select_layer, "candidate_layers": candidate_layers, "always_layers": always_layers,
             "rank": rank, "unit_kinds": unit_kinds, "verify_top": verify_top, "verify_sample": verify_sample, "verify_mode": verify_mode,
             "n_units": _ints(n_units), "check_replies": check_replies, "check_tokens": check_tokens,
-            "holdout": True if holdout else None, "loop_direction": loop_direction, "strength": strength}
+            "holdout": True if holdout else None, "loop_direction": loop_direction, "strength": strength,
+            "from_direction": from_direction}
     _gate(s, "head_pipeline", {"spec": str(spec), **{k: v for k, v in over.items() if v is not None}}, yes, None)
     d = s.heads_pipeline(spec, **over)
+    pn = d.get("postnorm")
+    pn_line = ([f"注意：组中头部和整个层的投影里，层 {', '.join(map(str, (pn['layers'] + pn['unsure_layers'])[:8]))} "
+                + pn["note"]] if pn else [])
     if d.get("writes"):
-        return d, "\n".join(_pipeline_writes_lines(d)), 0
+        return d, "\n".join(_pipeline_writes_lines(d) + pn_line), 0
     rank_line = ("选择方式：v0.7.0 之前的选择方式（--rank causal。逐层停用 → 逐个停用前几名层的注意力头 → 按效率重新分配）"
-                 + (f"。{d['rank_note']}" if d.get("rank_note") else ""))
+                 + (f"\n注意（已切换选择方式）：{d['rank_note']}" if d.get("rank_note") else ""))
     sc, ca, al = d["score"], d["causal"], d["allocate"]
     ck = "causal" if (d.get("settings") or {}).get("select_layer") not in (None, "") else "causal_max"
     lines = [f"{d['path']}（{d['n_prompts']} 个问题，{d['seconds']:.0f} 秒"
              + (f"，复用已生成的{'、'.join({'direction': '方向', 'causal': '因果'}[x] for x in d['reused'])}" if d.get("reused") else "")
              + "）",
-             rank_line,
-             f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒）",
+             rank_line, *pn_line,
+             f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒）" + _from_dir_text(d),
              f"2. 基准层 L{sc['base_layer']}（cohen_d 最大，停止测量阶段使用 {sc['n'].get('A')} 个问题）",
              f"3. 因果：测量层 L{','.join(map(str, ca['score_layers']))}、{ca['n_rows']} 个注意力头、前列 " +
              " ".join(f"L{r['layer']}H{r['head']}({r[ck]:+.2f}{'，仅破坏所以排除' if r.get('excluded') else ''})" for r in ca["top"][:6])
@@ -3040,8 +3103,13 @@ def heads_pipeline(c: Common, holder: dict,
         if r.get("skipped"):
             lines.append(f"   {r['n_heads']} 个：{r['skipped']}")
             continue
-        lines.append(f"   {r['n_heads']} 个：最大 s {r['s_max']:.2f}，剩余 {r['remain']}/{al['n_a']}，B 正交 {r['b_drift_orth']:.4f}  "
-                     + " ".join(r["units"]) + ("  ← 推荐" if r["recommended"] else "") + ("" if r["reached"] else "（目标未达到）"))
+        lines.append(f"   {r['n_heads']} 个：最大 s {r['s_max']:.2f}，剩余 {r['remain']}/{al['n_a']}，"
+                     + (f"A 平均 {r['a_mean']:.2f}、" if r.get("a_mean") is not None else "") + f"B 正交 {r['b_drift_orth']:.4f}  "
+                     + " ".join(r["units"]) + ("  ← 推荐" if r["recommended"] else "") + _mr_mark(r) + ("" if r["reached"] else "（目标未达到）"))
+    if not d.get("recommended"):
+        lines.append("   无推荐组：按工具的基准无法确定为一组（所有组都未达到目标）。" + _mr_line(d.get("most_reduced"))
+                     + "其他方法：--rank writes（按写入量从所有单元中选择，默认）、heads refine（从剩余问题中添加单元）")
+    lines.append("   " + REC_GUIDE)
     lines += _initial_lines(al)
     if d.get("arch_defaults"):                               # この arch だけの既定(sensenova_loop)
         ad = d["arch_defaults"]
@@ -3067,6 +3135,43 @@ WRITES_STOP = {"target": "全部为 s=1", "raised": "提高后达到目标", "s_
                "b_move": "因 B 侧朝 A 侧移动而停止", "no_gain": "提高后也没有改善，因此停止"}
 
 
+def _from_dir_text(d: dict) -> str:
+    """一括の 1. の行: 作り済みの方向から流したとき(--from-direction)の出どころと知らせ。"""
+    dr = d.get("direction") or {}
+    if not dr.get("from"):
+        return ""
+    return (f"。已复制并使用生成好的方向 {dr['from']}（跳过了方向构建）"
+            + (f"\n   注意：{dr['from_note']}" if dr.get("from_note") else ""))
+
+
+def _mr_mark(r: dict | None) -> str:
+    """組の比較表の行の印: A 側が最も下がった組(元の方向・元の目標で測った A 平均が最小、v0.9.0)。応答が壊れた組は添える。"""
+    if not r or not r.get("most_reduced"):
+        return ""
+    broke = r.get("replies_break") or r.get("verdict") == "replies_break" or bool((r.get("check") or {}).get("break_warning"))
+    return "  ← A 侧下降最多" + ("（回复校验中发现回复损坏。请降低强度后使用）" if broke else "")
+
+
+MR_NEXT = ("改变强度并验证回复（gne chat、gne steer。界面中可用聊天里的「将此强度应用到配方」保存，"
+           "CLI 中可用 gne recipe-scale 将强度乘入配方）")
+REC_GUIDE = ("推荐组只是参考（不是合格判定）。推荐规则依据投影值（剩余数、B 侧偏移）决定，并未查看回复"
+             "（回复校验只检查是否损坏）")
+
+
+def _mr_line(mr: dict | None, refine: bool = False) -> str:
+    """推す組・推す行が無いときの次の手: A 側が最も下がった組と、強さを調整する案内。"""
+    if not mr:
+        return MR_NEXT + "。"
+    if refine:
+        which = "s=1 行的合并配方" if mr.get("key") == "s1" else f"上限 {mr.get('key') or mr.get('n_added')} 的行的合并配方"
+        a = mr.get("a_mean_after")
+    else:
+        which = "提高倍率前的组（s=1）" if mr.get("s1") else f"{mr.get('n_heads')} 个单元的组"
+        a = mr.get("a_mean")
+    return (f"A 侧下降最多的是 {which}（A 平均 {_f(a, '.2f')}）。{MR_NEXT}。"
+            + ("但这个组在回复校验中出现了回复损坏（重复、空回复增加）。请降低强度后再使用。" if mr.get("replies_break") else ""))
+
+
 def _same_total(k: str, n_units: dict) -> bool:
     """層全体の部品の和は、同じ種類の個別の部品(ヘッド・ニューロン)の和と同じなので、個別の部品もあれば並べない。"""
     return (k == "layer_attn" and (n_units.get("attn") or n_units.get("linear"))) or (k == "layer_mlp" and n_units.get("neuron"))
@@ -3085,7 +3190,7 @@ def _pipeline_writes_lines(d: dict) -> list[str]:
              "选择方式：按写入量排列全部部件（--rank writes，默认。部件 "
              + "、".join(KIND_JA.get(k, k) for k in wr["kinds"])
              + "。v0.7.0 之前的选择方式是 --rank causal）",
-             f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒）",
+             f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒）" + _from_dir_text(d),
              f"2. 基准层 L{d['score']['base_layer']}（cohen_d 最大）",
              f"3. 写入排序：选择层 L{wr['select_layer']}，A {wr['n']['A']} 个问题、B {wr['n']['B']} 个问题，A−B 差距 {wr['gap']:.2f}，"
              f"部件 " + "、".join(f"{KIND_JA[k]} {n}" for k, n in wr["n_units"].items() if n) + f"（{wr['seconds']:.0f} 秒）",
@@ -3115,7 +3220,7 @@ def _pipeline_writes_lines(d: dict) -> list[str]:
             f"   上限 {r['n_heads']} 个：{r['n_used']} 个（{kk}），{strg}（{WRITES_STOP.get(r['stop'], r['stop'])}）"
         lines.append(head + f"、A 平均 {r['a_mean']:.2f}、B Δ {r['b_side_delta']:+.2f}、B 正交 {r['b_drift_orth']:.4f}、"
                      f"剩余 {r['remain']}/{al['n_a']}" + ("" if r.get("effect") is None else f"、效果 {r['effect']:.2f}")
-                     + ("  ← 推荐" if r.get("recommended") else "") + ("" if r["reached"] else "（未达到目标）"))
+                     + ("  ← 推荐" if r.get("recommended") else "") + _mr_mark(r) + ("" if r["reached"] else "（未达到目标）"))
         ho = r.get("holdout")
         if ho:                                       # 選ぶのに使っていない質問での数
             lines.append(f"      未用于选择的问题：A 平均 {ho['a_mean']:.2f}、B Δ {ho['b_side_delta']:+.2f}、B 正交 {ho['b_drift_orth']:.4f}、"
@@ -3144,10 +3249,11 @@ def _pipeline_writes_lines(d: dict) -> list[str]:
     if d.get("recommended") and not d["recommended"].get("reached", True):
         lines.append("   所有组都未达到目标，因此在限制范围内推荐效果（A 侧下降幅度 − B 侧移动幅度）最大的组")
     if d.get("no_recommend"):
-        lines.append(f"   无推荐组：{d['no_recommend']['reason']}。下一步：--rank causal（v0.7.0 之前的选择方式）、"
-                     "通过 --unit-kinds 更改部件种类、heads refine（从剩余问题中追加部件）")
+        lines.append(f"   无推荐组：按工具的基准无法确定为一组（{d['no_recommend']['reason']}）。" + _mr_line(d.get("most_reduced"))
+                     + "其他方法：--rank causal（v0.7.0 之前的选择方式）、通过 --unit-kinds 更改单元种类、heads refine（从剩余问题中添加单元）")
+    lines.append("   " + REC_GUIDE)
     for nt in al.get("notes") or []:
-        lines.append("   注意: " + nt["text"])
+        lines.append("   注意：" + nt["text"])
     ck = d.get("check")
     if ck:
         def cell(x):
@@ -3191,6 +3297,7 @@ def heads_writes(c: Common, holder: dict,
                  score_layers: Optional[str] = typer.Option(None, "--score-layers", help="校验时排列投影值的层（默认是基准层及后续层）"),
                  out_name: Optional[str] = typer.Option(None, "--out-name", help="保存名称（默认是方向名称）"),
                  loop_direction: str = typer.Option("first", "--loop-direction", help="同一层运行两次的模型：按第一次运行的层（first）或第二次运行的层（second）的方向测量循环内的部件"),
+                 save_q: bool = typer.Option(False, "--save-q", help="将逐问题、逐层的更新保存到 <名称>.writes_q.npz（用于 gne heads geometry 的按问题分解和标签置换基准。Qwen3.5-4B 每侧 16 问约 10 MB）"),
                  show: int = typer.Option(30, "--show")):
     """全部の部品(注意ヘッド・線形注意のヘッド・MLP のニューロン)を、方向への書き込みの量で順位づけする。質問 1 問につき 1 回流すだけで、
     部品ごとに「その層の方向 r̂ にどれだけ書いたか」(ヘッドは出力·r̂、ニューロンは活性 ×(ffn_down の列·r̂))を読み、点数 =
@@ -3201,7 +3308,7 @@ def heads_writes(c: Common, holder: dict,
     d = s.heads_writes(name, contrast=contrast, select_layer=select_layer, kinds=unit_kinds, positions=positions, subset=subset,
                        max_examples=max_examples, verify_top=verify_top, verify_sample=verify_sample, verify_mode=verify_mode,
                        verify_examples=verify_examples, score_layers=s.score_layers_of(score_layers), name=out_name,
-                       loop_direction=loop_direction)
+                       loop_direction=loop_direction, save_q=save_q)
     ts = d.get("totals_share") or {}
     lines = [f"{d['path']}（选择层 L{d['select_layer']}，A {d['n']['A']} 个问题、B {d['n']['B']} 个问题，A−B 差距 {d['gap']:.2f}，{d['seconds']:.0f} 秒）",
              "部件：" + "、".join(f"{KIND_JA[k]} {n}" for k, n in d["n_units"].items() if n)
@@ -3223,7 +3330,9 @@ def heads_writes(c: Common, holder: dict,
     if d.get("verify"):
         lines.append("分数与测得效果的排名相关性（Spearman，A−B 差距的缩小量）：" + _verify_corr_line(d["verify"]["spearman"]))
     lines.append(f"数组：{d['npz']}（各层更新的向量、各部件的写入）")
-    lines.append("弱点：只看直接写入。只是驱动后续层写入者的部件不会体现在分数中")
+    if d.get("q_npz"):
+        lines.append(f"逐问题更新：{d['q_npz']}（{d['q_bytes'] / 1e6:.1f} MB。供 gne heads geometry --name {d['name']} 使用）")
+    lines.append("弱点：只看直接写入。仅驱动后续层写入者的单元不会体现在分数中")
     return d, "\n".join(lines), 0
 
 
@@ -3383,7 +3492,10 @@ def _refine_text(d: dict) -> str:
     rnd = d.get("round") or 1
     rname = lambda k: "原组" if int(k) == 0 else f"第 {k} 轮"            # noqa: E731
     byr = " + ".join(f"{rname(k)} {n} 个" for k, n in (d.get("units_by_round") or {}).items())
-    lines = [f"{d['path']}({d['seconds']:.0f} 秒)",
+    lines = [f"{d['path']}（{d['seconds']:.0f} 秒）",
+             *([f"注意（已切换选择方式）：{d['rank_note']}"] if d.get("rank_note") else []),
+             *([f"注意：添加组的头部和整个层投影中，层 {', '.join(map(str, (d['postnorm']['layers'] + d['postnorm']['unsure_layers'])[:8]))} "
+                + d["postnorm"]["note"]] if d.get("postnorm") else []),
              f"从剩余中添加 第 {rnd} 轮（原始批量 {d.get('root') or d['base']}）。基础 = {d['base']} 的 {d['n_heads']} 个单元所在行"
              + (f"的合并配方（原组 + {'第 1 轮' if rnd == 2 else f'第 1～{rnd - 1} 轮'}添加，{len(d['base_units'])} 个单元）" if rnd > 1 else f"的组（{len(d['base_units'])} 个单元）"),
              f"1. 应用基础后，原方向 {d.get('direction')} 的 L{d['score_layer']} 投影值高于目标 {d['threshold']:.2f} 的"
@@ -3402,7 +3514,7 @@ def _refine_text(d: dict) -> str:
                          f"A 平均 {c['a_mean_before']:.2f} → {c['a_mean_after']:.2f}、B Δ {c.get('b_delta', float('nan')):+.2f}、"
                          f"B ⊥ {c['b_drift_orth_base']:.3f} → {c['b_drift_orth']:.3f}"
                          + (f"、段 {c['exit_after']['layer']} 的 A {c['exit_before']['a_mean']:.2f} → {c['exit_after']['a_mean']:.2f}" if c.get("exit_after") else "")
-                         + ("  ← 推荐" if cb and c["recipe"] == cb["recipe"] else "")
+                         + ("  ← 推荐" if cb and c["recipe"] == cb["recipe"] else "") + _mr_mark(c)
                          + {"worse": f"  [会变差：{'、'.join(why_ja.get(k, k) for k in c.get('why') or [])}]", "no_gain": "  [不会改善]",
                             "replies_break": "  [回复损坏]"}.get(c.get("verdict"), ""))
             lines.append(f"      {c['recipe']}")
@@ -3425,7 +3537,9 @@ def _refine_text(d: dict) -> str:
         else:
             lines.append("无推荐行：" + ("所有可作为推荐的合并配方都会导致回复损坏。" if d.get("no_recommend") == "replies_break"
                                           else "沿原方向、原目标合并后，没有任何一行改善或会变差。")
-                         + "建议不要添加（保留基础）")
+                         + "按工具的基准无法确定要添加的行。保持基础较为稳妥，但候选行仍保留在上表中可供选择。"
+                         + _mr_line(d.get("most_reduced"), refine=True))
+        lines.append(REC_GUIDE + "。A 侧下降最多的行也按合并配方的值（原方向、原目标）决定")
         ck = d.get("check")
         if ck:
             r0, r1 = ck["rows"]["none"], ck["rows"]["recipe"]
@@ -4053,6 +4167,48 @@ def nw_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: O
         lines.append(f"  L{x['layer']} N{','.join(map(str, x['neurons']))}: {x['form']}、s {x['s']:g}、α {x['alpha']:+g}、方向 {x['direction']}、键 {x['key']}"
                      + (f" & {x['key2']}" if x["key2"] else "") + f"、在键有反应的位置 |α|‖d‖ = {x['norm']:.2f}")
     lines.append("在 llama.cpp 中用 --lora <此文件> 应用(倍率 1)。")
+    return d, "\n".join(lines), 0
+
+
+@gne_command(heads_app, "geometry", "heads geometry")
+def heads_geometry(c: Common, holder: dict,
+                   name: str = typer.Option(..., "--name", help="heads writes 的保存名（<root>/heads/<model_id>/<名称>.writes.npz）"),
+                   parts: str = typer.Option("layer", "--parts", help="行单位：layer（逐层）/ attn,mlp（注意力整体输出与 MLP 整体输出。注意力整体输出在线性注意力层中为线性注意力输出）/ layer,attn,mlp"),
+                   normalize: str = typer.Option("both", "--normalize", help="奇异值分解前是否统一行（层）大小：rows / none / both（两种都输出）"),
+                   top_k: Optional[int] = typer.Option(None, "--top-k", help="贡献率、逐层解释率、保存方向最多输出到第几个（默认 6）"),
+                   layers: Optional[str] = typer.Option(None, "--layers", help="使用的层（例如 10-30，默认为材料的全部层）"),
+                   min_half_cos: Optional[float] = typer.Option(None, "--min-half-cos", help="不可靠标记的基准（两个半边 cos 低于此值的行。默认 0.5）"),
+                   compare: Optional[str] = typer.Option(None, "--compare", help="用于比较的方向向量（逗号分隔。默认使用 heads refine 的方向 <名称>_r1 等，若存在）"),
+                   exclude_dims: Optional[str] = typer.Option(None, "--exclude-dims", help="从计算中排除的残差维度（例如 1234,567。根据每行的高位维度决定）"),
+                   out_name: Optional[str] = typer.Option(None, "--out-name", help="结果的保存名（默认与 --name 相同）"),
+                   permutations: Optional[int] = typer.Option(None, "--permutations", help="交换 A 与 B 标签生成基准的次数（仅在存在逐问题更新 <名称>.writes_q.npz 时。默认 200，0 表示关闭）"),
+                   perm_seed: int = typer.Option(0, "--perm-seed", help="标签置换的随机种子"),
+                   export_direction: Optional[str] = typer.Option(None, "--export-direction", help="将结果方向保存为此名称的方向向量（与 --export-from 一起使用）"),
+                   export_from: Optional[str] = typer.Option(None, "--export-from", help="保存的方向：svd-rows:K / svd-none:K（奇异值分解第 K 个，所有层使用同一方向）/ within:K（各层按问题分解的残余第 K 个）/ update、update-attn、update-mlp（该层新加部分的方向 = 逐层更新差的方向。整层、注意力整体输出、MLP 整体输出）"),
+                   force_export: bool = typer.Option(False, "--force-export", help="即使存在同名方向向量也替换")):
+    """heads writes の材料の、層ごとの更新ベクトル(A 側の平均の更新 − B 側の平均の更新。その層が残差に足した量)を比べる。
+    層どうしのコサイン類似度の行列、特異値分解(行の大きさをそろえる・そろえない。基準は、行が直交していたときの値と、半分どうしの
+    差から作る雑音の目安)、質問を半分ずつに分けた差どうしの一致、方向ベクトルとの cos、同じ重みを 2 回使うモデルでは 1 回目と 2 回目、
+    heads refine の方向との cos。heads writes --save-q で質問ごとの更新を保存してあれば、ラベル入れ替えの基準と、同じ層の中で
+    質問ごとの差を分解した結果(1 本の方向で説明できる割合・取り残しの向きとその安定度)も出す。モデルは流さない(GPU を使わない)。
+    かたまりや上位の向きは、更新の差が似ていることしか示さない(A と B の質問の話題・長さの違いも映る)。"""
+    from .geometry import HALF_COS_MIN, PERMUTATIONS, TOP_K, human_lines
+    s = holder["session"] = c.session()
+    d = s.heads_geometry(name, parts=parts, normalize=normalize, top_k=TOP_K if top_k is None else top_k, layers=layers,
+                         min_half_cos=HALF_COS_MIN if min_half_cos is None else min_half_cos, compare=compare,
+                         exclude_dims=exclude_dims, out_name=out_name,
+                         permutations=PERMUTATIONS if permutations is None else permutations, seed=perm_seed)
+    lines = human_lines(d)
+    if export_direction or export_from:
+        if not (export_direction and export_from):
+            raise GneError("BAD_ARGS", "--export-direction（名称）与 --export-from（如 svd-rows:K）必须一起传递")
+        e = s.heads_geometry_export(d["name"], export_direction, export_from, force=force_export)
+        d["export"] = e
+        lines.append(f"已保存方向向量 {e['name']}：{e['path']}（{e['source']}、层 {e['layers']}、"
+                     f"与选择层残差平均差的 cos {_f(e.get('cos_select'), '+.3f')}）")
+        lines += ["  " + n["text"] for n in e["notes"]]
+        lines.append(f"  用法：gne direction score --name {e['name']} / gne heads writes --name {e['name']} / "
+                     f"gne headproj ablate --direction {e['name']} --per-layer")
     return d, "\n".join(lines), 0
 
 
