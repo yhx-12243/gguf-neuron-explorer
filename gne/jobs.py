@@ -173,11 +173,15 @@ def _headproj_export(s, recipe: str | None = None, out: str | None = None, *, un
         path = s.store.export_dir() / (f"{file_stem}.gguf" if bake else f"{file_stem}.lora.gguf")
     else:
         path = s.default_export_path(r, bake=bake, kind="headproj", name=nm)
-    if not overwrite and path.exists():
+    dry = bool(p.get("dry_run"))                     # 書かずに計算だけ(Inkling 2 の焼き込みの予定)
+    if not overwrite and not dry and path.exists():
         raise GneError("FILE_EXISTS", f"{path.name} 已存在", "请覆盖或使用其他名称")
     if adapter_name is not None and str(adapter_name).strip():
         p["name"] = str(adapter_name).strip()
-    d = s.headproj_export(r, path, **p)
+    d = s.headproj_export(r, None if dry else path, **p)
+    if dry:
+        d["name"] = nm
+        return d
     d["file"] = Path(d["path"]).name
     if not bake and Path(d["path"]).parent.resolve() == s.store.export_dir().resolve():
         d["url"] = f"/api/export/file/{d['file']}"
@@ -545,6 +549,9 @@ def standard_kinds() -> dict[str, Callable[..., dict]]:
     }
 
 
+INKLING_JOBS = frozenset({"head_pipeline", "heads_refine", "behave", "headproj_export", "eval"})   # Inkling 2 で受けるジョブ(CHiPS の流れ)
+
+
 class JobRunner:
     """ジョブを 1 本ずつ順に回すスレッド。kinds: 種類 → fn(session, **params) -> dict。"""
 
@@ -559,6 +566,10 @@ class JobRunner:
     def start(self, kind: str, params: dict | None = None) -> Job:
         if kind not in self.kinds:
             raise GneError("BAD_ARGS", f"没有任务类型 {kind!r}（{', '.join(self.kinds)}）")
+        plan = getattr(getattr(self.session, "weights", None), "inkling", None)
+        if plan is not None and kind not in INKLING_JOBS:      # Inkling 2: CHiPS の流れと behave だけ(inkling.py)
+            from .inkling import refuse
+            raise refuse(plan, f"任务 {kind}")
         from .estimate import NeedsConfirm, gate
         try:
             params, est = gate(self.session, kind, dict(params or {}))     # CHANGE-03 C: 予算と 30 分の確認

@@ -50,6 +50,11 @@ def behave(session, prompts: list, *, lora=None, vectors=None, match: str | None
     labs = [x.strip() for x in labels.split(",") if x.strip()]
     if judge and ("{q}" not in judge or "{a}" not in judge):
         raise GneError("BAD_ARGS", "判定模板中需要 {q}（问题）和 {a}（回复）")
+    # Inkling 2(inkling.py)はいつも答えの前に思考を書く。思考の欄を除いた回答だけを数える(--thinking と同じ扱い。思考の途中で切れたら空)
+    ink = getattr(getattr(session, "weights", None), "inkling", None) is not None
+    if ink and judge:
+        raise GneError("ARCH_UNSUPPORTED", "Inkling 2 总是在回答前写思考，因此该模型尚不能使用 judge（--judge。用简短回复读取判定字符）判读"
+                       "（已停止）", "请用正则匹配（--match）计数（docs/inkling2.md）")
     seeds = seeds or [0]
     # 進み具合: 種ごとに質問の数だけ(判定があればその分も)進む。ジョブの取り消しは progress が例外を投げて止める
     total = len(seeds) * len(prompts) * (2 if judge else 1)
@@ -69,11 +74,22 @@ def behave(session, prompts: list, *, lora=None, vectors=None, match: str | None
         stage = f"behave: 种子 {seed}" if len(seeds) > 1 else "behave"
         outs = _generate(session, [(q, max_tokens) for q in prompts], vectors, lora, "all", lambda k, st=stage: tick(k, st),
                          sampling=sp, thinking=thinking)
-        replies = [{"i": i, "text": answer_of(o["text"], thinking), "full": o["text"] if thinking else None,
-                    "finish": o["finish"], "n_tokens": len(o["token_ids"]), "loop": loop_like(o["token_ids"])} for i, o in enumerate(outs)]
+        if ink:
+            from .inkling import ReplyMarks, answer_part, reasoning_tokens
+            marks = ReplyMarks(session.engine)
+            for o in outs:
+                o["shown"] = marks.render(session.engine, o["token_ids"])
+                o["reasoning_tokens"] = reasoning_tokens(marks, o["token_ids"])
+        replies = [{"i": i, "text": answer_part(o["shown"]) if ink else answer_of(o["text"], thinking),
+                    "full": o["shown"] if ink else o["text"] if thinking else None,
+                    "finish": o["finish"], "n_tokens": len(o["token_ids"]), "loop": loop_like(o["token_ids"]),
+                    **({"reasoning_tokens": o["reasoning_tokens"]} if ink else {})} for i, o in enumerate(outs)]
         counts = {"n": len(replies), "empty": sum(not r["text"].strip() for r in replies), "loop": sum(r["loop"] for r in replies),
                   "at_limit": sum(r["finish"] not in ("eog", "stop", "eos") for r in replies),
                   "tokens": round(sum(r["n_tokens"] for r in replies) / max(len(replies), 1), 1)}
+        if ink:                                     # 一致・空は回答だけで数える。tokens は思考を含む返事全体の長さ、思考の長さは別に出す
+            rts = [r["reasoning_tokens"] or 0 for r in replies]
+            counts["reasoning_tokens"] = round(sum(rts) / max(len(rts), 1), 1)
         if rx:
             counts["match"] = sum(bool(rx.search(r["text"])) for r in replies)
         if judge:

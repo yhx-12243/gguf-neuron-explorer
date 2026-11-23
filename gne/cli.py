@@ -43,6 +43,8 @@ from .modal_cli import modal_app  # noqa: E402
 app.add_typer(modal_app, name="modal")
 headproj_app = typer.Typer(no_args_is_help=True, help="导出注意力头的方向分量投影（mode: proj，CHANGE-06 E）")
 app.add_typer(headproj_app, name="headproj")
+inkling_app = typer.Typer(no_args_is_help=True, help="Inkling 2（inkling2_loop）专用：只读取内部的工具（docs/inkling2.md）")
+app.add_typer(inkling_app, name="inkling")
 
 
 @dataclass
@@ -73,6 +75,13 @@ class Common:
                     n_seq_max=self.n_seq_max, seed=self.seed, verbose=self.verbose, progress=self.progress,
                     mmproj=self.mmproj)
         s.proj_correction = not self.no_proj_correction
+        if s.weights.inkling is not None:            # Inkling 2: 使えるコマンドだけ通す(ほかは読み込む前に止める。inkling.py)
+            from .inkling import check_command
+            try:
+                check_command(s.weights.inkling, getattr(self, "command", None))
+            except GneError:
+                s.close()
+                raise
         return s
 
     def progress(self, done: int, total: int, stage: str) -> None:
@@ -194,6 +203,7 @@ def _envelope(command: str, c: Common, session=None) -> dict:
 def _run(c: Common, command: str, f: Callable, kwargs: dict) -> None:
     holder: dict = {}
     code = 0
+    c.command = command                              # c.session() が、Inkling 2 で使えるコマンドかを確かめる
     try:
         payload, human, code = f(c, holder, **kwargs)
         s = holder.get("session")
@@ -315,6 +325,43 @@ def _units_text(units: list[dict]) -> str:
 
 # --- info / probe / verify / bench ---------------------------------------------------------------------
 
+def _span(a: int, b: int) -> str:
+    return f"{a}" if a == b else f"{a}〜{b}"
+
+
+def _inkling_rows(ink: dict) -> list[tuple[str, str]]:
+    """gne info の Inkling 2 の行(層の並び・段の表・attention・専門家・gne の対応)。"""
+    rows = []
+    if ink["n_passes"] > 1:
+        a, b = ink["core_start"], ink["core_end"] - 1
+        rows.append(("重复", f"第 {a}～{b} 层连续执行 {ink['n_passes']} 次（执行顺序的段 {ink['n_steps']}。从第 2 次起从第 {a - 1} 层的"
+                     f"输出重新开始，上一轮的流通过秩 {ink['gate_rank']} 的门控混合"
+                     + ("）" if not ink.get("varying") else "。这是用不同次数训练的模型）")))
+    starts = "、".join(str(L) for L in range(0, ink["n_stored"], ink["block"]))
+    rows.append(("残差流", f"第 {starts} 层开始新的流（各子层将此前所有流与当前流经 RMS 归一化，"
+                 "并用学习到的查询加权后相加再读取。深度方向注意力）"))
+    nh, nkv = ink.get("n_head"), ink.get("n_head_kv")
+    nh = nh[0] if isinstance(nh, list) and len(set(nh)) == 1 else nh
+    nkv = nkv[0] if isinstance(nkv, list) and len(set(nkv)) == 1 else nkv
+    full = ink["full_layers"]
+    rows.append(("attention", f"头 {nh}（KV {nkv}）、宽度 {ink.get('head_dim')}、无 RoPE（相对位置偏置）。滑动窗口（sliding window、"
+                 f"{ink['window']} token）{len(ink['swa']) - len(full)} 层，全局层 {', '.join(map(str, full))}"))
+    ex = ink.get("experts") or {}
+    types = "、".join(f"{k}：" + "、".join(f"{q} {len(Ls)} 层" for q, Ls in v.items()) for k, v in (ex.get("types") or {}).items())
+    sc = ex.get("scaled_layers") or {}
+    scaled = sorted({L for Ls in sc.values() for L in Ls})
+    rows.append(("专家", f"每个 token 使用 {ink.get('expert_used')} 个，宽度 {ink.get('expert_width')}（门控与 up 为单个张量），"
+                 f"用 sigmoid 选择，并将选中的权重归一化后乘以 {ink.get('expert_weights_scale')}"))
+    rows.append(("专家权重类型", types + (f"。具有逐专家倍率（.scale）的层 {len(scaled)}：{', '.join(map(str, scaled))}" if scaled else "")))
+    for g in ink["step_groups"]:
+        p = g["pass"]
+        what = f"第 {_span(*g['layers'])} 层的第 {p} 次" if p else f"第 {_span(*g['layers'])} 层"
+        full = f"，全局层 {', '.join(map(str, g['full']))}" if g["full"] else ""
+        rows.append((f"段 {_span(*g['steps'])}", f"{what}（llama.cpp 编号 {_span(*g['slots'])}，流 {', '.join(map(str, g['streams']))}{full}）"))
+    rows.append(("gne 支持", "仅支持加载、信息、映射和对话。测量或改写内部的功能会写明理由并停止"))
+    return rows
+
+
 @gne_command(app, "info")
 def info(c: Common, holder: dict,
          load: bool = typer.Option(True, "--load/--no-load", help="确认能否由 llama.cpp 加载（R6）")):
@@ -342,9 +389,13 @@ def info(c: Common, holder: dict,
     if rw:
         rows.append(("残差写入器", ", ".join(f"{k} {n}" for k, n in rw["counts"].items())
                      + ("（已通过计算图确认）" if rw["verified"] else "（由张量名推测）")))
+    ink = m.get("inkling")
+    if ink:                                          # Inkling 2(docs/inkling2.md)
+        rows += _inkling_rows(ink)
     lc = d["llama_cpp"]
     if lc is not None:
-        rows.append(("llama.cpp", f"可加载（n_layer {lc['n_layer']}, n_embd {lc['n_embd']}, n_vocab {lc['n_vocab']}）"
+        rows.append(("llama.cpp", f"可加载（n_layer {lc['n_layer']}{'（执行顺序的段数）' if ink else ''}, n_embd {lc['n_embd']}, "
+                     f"n_vocab {lc['n_vocab']}）"
                      if lc["ok"] else f"无法加载：{lc['error']}（可能需要用新版 llama.cpp 重新构建，R6）"))
         lp = lc.get("loop") if lc["ok"] else None
         if lp:                                       # 同じ層を 2 回実行するモデル(docs/sensenova_loop.md)
@@ -387,6 +438,7 @@ def probe(c: Common, holder: dict,
         raise GneError("BAD_ARGS", "请加上 --list-names")
     s = holder["session"] = c.session()
     e = s.engine
+    e.allow_names = True                             # 名前だけを見る(Inkling 2 でも使える。値は読まない)
     names = e.list_names(e.tokenize_prompt(e.render_chat([{"role": "user", "content": prompt}])))
     groups: dict[str, set[int]] = {}
     other = []
@@ -456,6 +508,9 @@ def verify(c: Common, holder: dict,
             why["V3"] = f"层 {v.L}～{v.L + 2} 中有残差位于两条流中的层，此 llama.cpp 中 control vector 无法到达下一层{hint}"
     if s.meta.n_expert:
         why |= dict.fromkeys(("V2", "V11", "V13", "V14"), "这是全层 MoE。此检查假设使用 dense 的 ffn_down（MoE 通过 V24 和 gne experts 检查）")
+    ink = s.weights.inkling is not None
+    if ink:                                          # Inkling 2: 中を読む・書き換える検査は省く(トークン化の V8 だけ流す。docs/inkling2.md)
+        why |= dict.fromkeys([vid for vid, _ in steps], "Inkling 2 尚不支持测量或改写内部的功能，因此跳过此检查")
     steps = [(vid, (lambda vid=vid, fn=fn: VResult(vid, "省略", "skip", why[vid]) if vid in why else fn())) for vid, fn in steps]
     if s.engine.hc_streams:
         steps.append(("V26", v.v26_hc_streams))
@@ -472,7 +527,9 @@ def verify(c: Common, holder: dict,
             show(fn())
         except Exception as ex:  # noqa: BLE001
             show(VResult(vid, "异常", "fail", repr(ex)))
-    if bench and not s.engine.cvec_supported:
+    if bench and ink:
+        show(VResult("V7", "基准测试", "skip", "Inkling 2 不支持 control vector，因此跳过"))
+    elif bench and not s.engine.cvec_supported:
         show(VResult("V7", "基准测试", "skip", "不读取 control vector 的 arch"))
     elif bench:
         bench_result = run_bench(s.engine, layer=v.L, reps=5)
@@ -843,8 +900,13 @@ def _doses(text: str) -> list[float]:
 @gne_command(app, "eval")
 def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Optional[list[str]] = _UNIT,
              dose_unit: Optional[str] = _DOSE_UNIT,
-             doses: str = typer.Option("0,0.25,0.5,0.75,1", "--doses", help="作用于整个配方的倍率（必定包含 0 = 无干预）"),
+             doses: Optional[str] = typer.Option(None, "--doses", help="作用于整个配方的倍率（必定包含 0 = 无干预）。默认 0,0.25,0.5,0.75,1，"
+                                                                     "Inkling 2 为 0,1）"),
              suite: Optional[Path] = typer.Option(None, "--suite", help="任务集 YAML（默认 configs/eval/default.yaml）"),
+             items: Optional[str] = typer.Option(None, "--items", help="Inkling 2：问题数量 exact,format,mix,persona（默认 8,4,4,4。all 表示全部。"
+                                                                    "等间隔抽取）"),
+             reasoning_tokens: Optional[int] = typer.Option(None, "--reasoning-tokens",
+                                                            help="Inkling 2：思考上限（token，默认 512）。让思考和回答合计写到上限 + 回答长度"),
              when: Optional[str] = _WHEN, lora_when: str = _LORA_WHEN,
              judge_model: Optional[Path] = typer.Option(None, "--judge-model", help="用于人格评分的另一个 GGUF（可选）"),
              judge_target: Optional[str] = typer.Option(None, "--judge-target", help="要评分的目的人格（例 'a yandere anime girl'）"),
@@ -922,15 +984,18 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
                          f"{_f(r_['rate'], '6.2f')}" + ("  可发布" if r_["shippable"] else ""))
         lines.append("在同一 A 侧投影值水平下比较的副作用。报告应主要采用判定一致率（外部可见指标）")
         return d, "\n".join(lines), 0
-    _gate(s, "eval", {"doses": _doses(doses), "suite": suite, "when": when, "random_controls": random_controls,
+    dz = _doses(doses) if doses else None
+    _gate(s, "eval", {"doses": dz, "suite": suite, "when": when, "random_controls": random_controls, "items": items,
+                      "reasoning_tokens": reasoning_tokens,
                       "recipe": r, "keyed_metrics": keyed, "keyed_contrast": keyed_contrast,      # keyed の選択性の分も見積もる
                       "keyed_examples": keyed_examples or None, "keyed_pseudo": keyed_pseudo, "keyed_match": keyed_match,
                       "keyed_subset": keyed_subset}, yes, None)
-    d = s.eval(r, doses=_doses(doses), suite=suite, when=when, lora_when=lora_when, judge_model=judge_model, judge_target=judge_target,
+    d = s.eval(r, doses=dz, suite=suite, when=when, lora_when=lora_when, judge_model=judge_model, judge_target=judge_target,
                name=name, random_controls=random_controls, reactivity=reactivity, head_controls=head_controls,
                control_pool=control_pool, direction_metrics=direction_metrics, dir_max_examples=dir_max_examples or None,
                keyed_contrast=keyed_contrast, keyed_metrics=keyed, keyed_examples=keyed_examples or None,
-               keyed_match=keyed_match, keyed_pseudo=keyed_pseudo, keyed_subset=keyed_subset)
+               keyed_match=keyed_match, keyed_pseudo=keyed_pseudo, keyed_subset=keyed_subset,
+               **({"items": items, "reasoning_tokens": reasoning_tokens} if items is not None or reasoning_tokens is not None else {}))
     th = d["suite"]["thresholds"]
     nc = d.get("random_controls") or 0
     head = f"{'倍率':>5} {'能力':>6} {'下降pt':>6} {'ppl':>8} {'恶化%':>7} {'混入':>6} {'新词':>5} {'d4':>5} {'截断':>4}"
@@ -945,6 +1010,9 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
     if dmx:                                              # CHANGE-06 F.1: 方向への射影の値と直交成分のずれ
         head += f" │ {'下降':>7} {'A正交':>7} {'B正交':>7}" + (f" {'一致率':>6}" if dmx.get("behavior") else "") \
             + (f" {'null':>5}" if nc else "")
+    inkd = d.get("inkling")
+    if inkd:                                             # Inkling 2: 壊れた返事(空・思考の途中で切れた・ループ・回答が切れた)と回答の読み込み
+        head += f" │ {'空':>3} {'思考截断':>5} {'循环':>5} {'回答截断':>5} {'思考':>5} {'回复lp下降':>9}"
     kd = d.get("keyed")                                  # CHANGE-07 E: 結果の keyed(方式の比較・比較用の鍵、または skipped)
     ksel = any((row.get("keyed") or {}).get("selectivity") is not None for row in d["rows"])
     knull = ksel and any((row.get("keyed") or {}).get("null_pct") is not None for row in d["rows"])
@@ -978,6 +1046,10 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
             if nc:
                 npct = row.get("rate_null_pct") if row.get("rate_null_pct") is not None else row.get("dir_null_pct")
                 line += f" {_f(None if npct is None else npct * 100, '4.0f')}%"
+        if inkd:
+            bk = row.get("broken") or {}
+            line += (f" │ {bk.get('empty', 0):>3} {bk.get('no_answer', 0):>5} {bk.get('loop', 0):>5} {bk.get('cut_answer', 0):>5} "
+                     f"{bk.get('reasoning_median', 0):>5.0f} {_f(row.get('reply_logprob_drop'), '+9.4f')}")
         if ksel:
             kr = row.get("keyed") or {}
             line += f" │ {_f(kr.get('selectivity'), '+.3g'):>7}"
@@ -1001,6 +1073,19 @@ def eval_cmd(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Op
                  + ("" if rcd["head_controls"] or not head_controls else "配方不含注意力头，因此无法创建注意力头对照"))
     if dmx:
         text += (f"\n方向 {dmx['direction']}（L{dmx['layers'][-1]}）：下降 = A 侧投影值下降幅度，A正交 / B正交 = 残差差的正交分量 ÷ 残差" + ("，一致率 = A 侧判定（validate.match）" if dmx.get("behavior") else ""))
+        if inkd:
+            text += "（Inkling 2：不读取残差，而是读取第 6～17 层最后一段的 MLP 输入和最后混合的输出。点 48 = 最后混合的输出）"
+    if inkd:
+        it = inkd["items"]
+        text += (f"\nInkling 2：读取回复的指标（能力、混入、新词、judge、反应性、一致率）是在思考之后的回答上测量的（思考上限 "
+                 f"{inkd['reasoning_tokens']} token，问题 exact {it['exact']}、format {it['format']}、mix {it['mix']}、persona {it['persona']}。"
+                 "各倍率都会写自己的思考）。ppl 是直接读取参考文本的值。空 = 回答为空，思考截断 = 思考途中达到上限，"
+                 "循环 = 重复，回答截断 = 回答达到上限被截断，思考 = 思考长度的中位数，回复lp下降 = 让模型读取无干预回复（思考和回答）时"
+                 "平均对数概率的下降幅度（越大表示回复越容易改变。回答几乎由之前的思考决定，因此效果会体现在思考上）。"
+                 "未测量下一 token 的 KL")
+        ex = inkd.get("expected") or {}
+        if ex:
+            text += f"（预计约 {ex['seconds'] / 60:.0f} 分钟" + ("，无干预回复使用了之前的结果" if ex.get("base_cached") else "") + "）"
     if kd and "skipped" in kd:
         text += f"\n未测量 keyed 的 eval 选择性: {kd['skipped']}" + (f"\n提示: {kd['hint']}" if kd.get("hint") else "")
     elif kd:
@@ -1334,17 +1419,31 @@ def chat(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
          when: Optional[str] = _WHEN, ablate: Optional[str] = _ABLATE,
          temperature: Optional[float] = _TEMP, top_k: Optional[int] = _TOP_K, top_p: Optional[float] = _TOP_P,
          min_p: Optional[float] = _MIN_P, presence_penalty: Optional[float] = _PRES,
-         sample_seed: Optional[int] = _SSEED, greedy: bool = _GREEDY, lora_when: str = _LORA_WHEN):
+         sample_seed: Optional[int] = _SSEED, greedy: bool = _GREEDY, lora_when: str = _LORA_WHEN,
+         reasoning_effort: Optional[str] = typer.Option(None, "--reasoning-effort",
+                                                        help="传给聊天模板的思考量（reasoning_effort。Inkling 2 为 none / minimal / "
+                                                             "low / medium / high / xhigh / max 或 0～0.99。省略则使用模板默认值）"),
+         hide_reasoning: bool = typer.Option(False, "--hide-reasoning",
+                                             help="对于在回答前写思考的模型（Inkling 2），不输出思考，只输出长度和回答"
+                                                  "（默认用 <think> … </think> 包围并输出思考）")):
     """−/0/+ 三列对比聊天（共享用户输入，逐列回复）。采样时三列使用相同 seed。"""
-    from .chat import ChatState, chat_turn, make_columns
+    from .chat import ChatState, chat_turn, effort_value, make_columns
     s = holder["session"] = c.session()
+    eff = effort_value(s.engine.chat_template, reasoning_effort)
+    if eff is not None:
+        s.engine.template_vars = {**s.engine.template_vars, "reasoning_effort": eff}
     if when:
         from .when import parse_when
         parse_when(when)
     base = s.recipe(units=unit, path=recipe, dose_unit=dose_unit, ablate=ablate) if (unit or recipe or ablate) else None
     sp = _sampling(base, greedy, temperature, top_k, top_p, min_p, presence_penalty, sample_seed)
     load = lambda p: s.recipe(path=p) if p else None  # noqa: E731
-    cols = make_columns(base, dose=dose, left=load(left), right=load(right), center=load(center))
+    if s.weights.inkling is not None and base is None and not (left or right or center):
+        # Inkling 2(docs/inkling2.md): レシピを指定しないときは、無介入の 1 列だけで話す
+        from .chat import Column
+        cols = [Column("0（无干预）", None)]
+    else:
+        cols = make_columns(base, dose=dose, left=load(left), right=load(right), center=load(center))
     live = stream and not c.json
 
     def on_column(i, col):
@@ -1362,7 +1461,8 @@ def chat(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
             turns.append({"user": user, "replies": chat_turn(s, state, user, max_tokens=max_tokens,
                                                              on_text=on_text if live else None,
                                                              on_column=on_column if live else None,
-                                                             when_override=when, sampling=sp, lora_when=lora_when)})
+                                                             when_override=when, sampling=sp, lora_when=lora_when,
+                                                             hide_reasoning=hide_reasoning)})
         d = {"columns": [{"label": col.label, "recipe": col.recipe.to_dict() if col.recipe else None} for col in cols],
              "system": system, "turns": turns, "sampling": None if sp is None else sp.to_dict()}
         if live:
@@ -1372,7 +1472,8 @@ def chat(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
         for t in d["turns"]:
             lines.append(f"> {t['user']}")
             for col, rep in zip(d["columns"], t["replies"], strict=True):
-                lines.append(f"── {col['label']} ──({rep['finish']}, {rep['n_gen']} tok)\n{rep['text']}")
+                rtx = f"、思考 {rep['reasoning_tokens']} tok" if hide_reasoning and rep.get("reasoning_tokens") is not None else ""
+                lines.append(f"── {col['label']} ──({rep['finish']}, {rep['n_gen']} tok{rtx})\n{rep['text']}")
         return d, "\n".join(lines), 0
     if c.json:
         raise GneError("BAD_ARGS", "使用 --json 时请通过 --prompt 传入输入（不能使用交互模式）")
@@ -1394,10 +1495,11 @@ def chat(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, unit: Option
             continue
         replies = chat_turn(s, state, user, max_tokens=max_tokens, on_text=on_text if stream else None,
                             on_column=on_column if stream else None, when_override=when, sampling=sp,
-                             lora_when=lora_when)
+                            lora_when=lora_when, hide_reasoning=hide_reasoning)
         if not stream:
             for col, rep in zip(cols, replies, strict=True):
-                print(f"── {col.label} ──\n{rep['text']}")
+                rtx = f"（思考 {rep['reasoning_tokens']} 个 token）\n" if hide_reasoning and rep.get("reasoning_tokens") is not None else ""
+                print(f"── {col.label} ──\n{rtx}{rep['text']}")
         else:
             print()
         turns.append({"user": user, "replies": replies})
@@ -2912,7 +3014,8 @@ def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, u
         "LoRA 版产生偏差)，其余(K-quant、IQ、F16 等)为 f16。仅对保持 Q8_0 时 rank 1 的小编辑有 1 成以上被舍入抹掉的张量(结果 "
         "edit_kept < 0.9)用 f16。专家张量也遵循相同规则(改为 f16 会使整体变为 F16 而变大) ")),
                     key: Optional[str] = typer.Option(None, "--key", help="省略 #KEY 的 keyed 单元的键(由 gne direction key 创建)"),
-                    into: Optional[Path] = typer.Option(None, "--into", help="--bake：烧录到另一个 GGUF（同一结构、未量化的 F16 / BF16 等）。方向使用此模型（--model）的。不使用 GPU"),
+                    into: Optional[Path] = typer.Option(None, "--into", help="--bake：烘焙到另一个 GGUF（同一结构、未量化的 F16 / BF16 等，Inkling 2 为同一模型的其他量化）。方向使用此模型（--model）的。不使用 GPU"),
+                    dry_run: bool = typer.Option(False, "--dry-run", help="Inkling 2 的 --bake：不写入，只输出要改写的张量、类型、大小、编辑保留情况（以及指定 --into 时删除量的差异）"),
                     via_f16: bool = typer.Option(False, "--via-f16", help="--bake：以 F16 写入，再用 llama-quantize 恢复到原类型"),
                     imatrix: Optional[Path] = typer.Option(None, "--imatrix"), llama_quantize: Optional[str] = typer.Option(None, "--llama-quantize"),
                     verify: bool = typer.Option(False, "--verify", help=("--bake: 比较烧录版与 LoRA 版(V26、V33: 方向上的投影值、KL、最可能 token、ppl。最后一层投影值的合格线为，加上写入几乎为 0 "
@@ -2931,10 +3034,14 @@ def headproj_export(c: Common, holder: dict, recipe: Optional[Path] = _RECIPE, u
         raise GneError("BAD_ARGS", "--in 与 --model 指向不同文件")
     s = holder["session"] = c.session(in_path)
     r = s.recipe(units=unit, path=recipe, default_direction=direction, direction_layer=direction_layer, default_key=key)
-    out = out or s.default_export_path(r, bake=bake, kind="headproj")
+    if dry_run and s.weights.inkling is None:
+        raise GneError("BAD_ARGS", "--dry-run 仅用于 Inkling 2 的烘焙")
+    out = None if dry_run else (out or s.default_export_path(r, bake=bake, kind="headproj"))
     d = s.headproj_export(r, out, bake=bake, requant=requant, via_f16=via_f16, imatrix=str(imatrix) if imatrix else None,
                           llama_quantize=llama_quantize, verify=verify, contrast=contrast, strip_meta=strip_meta, into=into,
-                          lora_f16=lora_f16, name=name)
+                          lora_f16=lora_f16, name=name, **({"dry_run": True} if dry_run else {}))
+    if s.weights.inkling is not None:                 # Inkling 2: テンソルごとの書き方と、ファイル・VRAM の増え方
+        return d, "\n".join(_inkling_export_lines(d, bake)), 0
     lines = [f"{d['path']}（{d['bytes'] / 1e6:.2f} MB，{'烧录' if bake else 'LoRA'}"
              + (f"，名称字段 {d['general_name']!r}" if d.get("general_name") else "")
              + ("，不包含 gne 记录、原始模型名或标识符" if d.get("strip_meta") else "") + "）"]
@@ -3038,7 +3145,10 @@ def heads_pipeline(c: Common, holder: dict,
                    target: Optional[str] = typer.Option(None, "--target", help="难生效示例投影值目标：数值、B（消到 B 侧平均值）、mid（默认，A 与 B 中点）"),
                    n_heads: Optional[str] = typer.Option(None, "--n-heads", help="--rank causal：要比较的组的注意力头数量（默认 6,5,4）。--rank writes 使用 --n-units"),
                    max_examples: Optional[int] = typer.Option(None, "--max-examples", help="停止测量阶段使用的问题数量（默认 64，等间距抽稀）"),
-                   positions: Optional[str] = typer.Option(None, "--positions", help="创建方向的位置：last（默认）/ response 等"),
+                   positions: Optional[str] = typer.Option(None, "--positions", help="创建方向的位置：last（默认）/ response 等。"
+                                                           "Inkling 2 为 last / answer（思考之后、回答开头）/ response（全部回答 token）/ "
+                                                            "reasoning / after:<正则表达式> / all / assistant（模型必定在回答前写思考，"
+                                                           "因此若想针对回答写法，也请尝试 answer 或 response）"),
                    top_layers: Optional[int] = typer.Option(None, "--top-layers", help="--rank causal：逐个测量注意力头的层数（默认 4）"),
                    hard: Optional[int] = typer.Option(None, "--hard", help="--rank causal：测量效率时，投影值容易保留的问题数量（默认 16）"),
                    include_score_layers: bool = typer.Option(False, "--include-score-layers", help="将测量投影值的层及其之后的注意力头也作为候选(默认排除。只是直接改变测量量，行为不易变化)"),
@@ -3059,6 +3169,7 @@ def heads_pipeline(c: Common, holder: dict,
                    loop_direction: Optional[str] = typer.Option(None, "--loop-direction", help="--rank writes、同一层运行两次的模型：按第一次运行的层（first）或第二次运行的层（second）的方向，测量并投影循环内的部件"),
                    strength: Optional[str] = typer.Option(None, "--strength", help="--rank writes：s=1 的组未达到目标时的强度决定方式。per_unit（默认：按单元分别调整，根据在投影值容易残留的问题上的效率提高）/ uniform（全部使用同一倍率，v0.8.2 及之前）"),
                    from_direction: Optional[str] = typer.Option(None, "--from-direction", help="使用已生成的方向向量（跳过方向构建。例如 heads geometry 保存的方向。作为批量的名称方向复制）"),
+                   include_before: bool = typer.Option(False, "--include-before", help="仅 Inkling 2：将第 0～5 层（重复之前）的部件也纳入候选（默认不纳入）"),
                    yes: bool = _YES):
     """対照集合から、方向づくり → 基準層 → 候補づくり → 強さの配分 を 1 回で回す。候補づくりと配分は 2 通り:
     --rank writes(既定): 全部の部品(注意ヘッド・線形注意のヘッド、--unit-kinds all で MLP のニューロンも)を方向への書き込みの量で
@@ -3074,8 +3185,14 @@ def heads_pipeline(c: Common, holder: dict,
             "n_units": _ints(n_units), "check_replies": check_replies, "check_tokens": check_tokens,
             "holdout": True if holdout else None, "loop_direction": loop_direction, "strength": strength,
             "from_direction": from_direction}
+    if include_before:
+        if s.weights.inkling is None:
+            raise GneError("BAD_ARGS", "--include-before 仅适用于 Inkling 2")
+        over["include_before"] = True
     _gate(s, "head_pipeline", {"spec": str(spec), **{k: v for k, v in over.items() if v is not None}}, yes, None)
     d = s.heads_pipeline(spec, **over)
+    if d.get("inkling"):
+        return d, "\n".join(_inkling_pipeline_lines(d)), 0
     pn = d.get("postnorm")
     pn_line = ([f"注意：组中头部和整个层的投影里，层 {', '.join(map(str, (pn['layers'] + pn['unsure_layers'])[:8]))} "
                 + pn["note"]] if pn else [])
@@ -3180,6 +3297,120 @@ def _same_total(k: str, n_units: dict) -> bool:
 def _verify_corr_line(sp: dict) -> str:
     return "、".join(f"{'全部' if k == 'all' else KIND_JA.get(k, k)} {_f(v['score_vs_gap_drop'], '+.2f')}"
                      f"（仅 A 侧 {_f(v['score_vs_a_drop'], '+.2f')}，{v['n']} 个）" for k, v in sp.items())
+
+
+def _inkling_bake_line(m: dict) -> str:
+    ex = f"、编辑专家 {len(m['experts'])} 个" if "experts" in m else ""
+    kept = f"、保留编辑 {m['edit_kept']:.3f}" if m.get("edit_kept") is not None else ""
+    if len(m.get("edit_kept_by_direction") or []) > 1:
+        kept = f"、保留编辑（按方向）{'、'.join(f'{x:.3f}' for x in m['edit_kept_by_direction'])}"
+    how = {"projection-aware rounding": "保持原类型，仅移动待编辑列的编码", "requant": "以原类型重新量化",
+           "convert": "更改类型"}.get(m.get("method"), m.get("method") or "")
+    par = (f"、移动的编码 {m['codes_changed']}（列 {m['columns']}）、不沿方向的变化 ÷ 已删除分量 "
+           f"{m.get('off_over_removed', m['off_over_removed_median']):.2f}" if m.get("method") == "projection-aware rounding" else "")
+    fb = (f"、原类型下保留编辑仅 {m['fallback']['edit_kept']:.2f}，因此改为 Q8_0"
+          if (m.get("fallback") or {}).get("edit_kept") is not None else "")
+    if (m.get("fallback") or {}).get("why") == "off_direction":
+        fb = (f"、原类型下不沿方向的变化 ÷ 已删除分量为 {m['fallback']['off_over_removed']:.2f}（上限 {m['fallback']['off_max']}）"
+              "，因此改为 Q8_0（整个 MLP 部件、auto 的判定方式）")
+    if (m.get("fallback") or {}).get("why") == "imatrix":
+        fb = f"、{m['fallback']['from']} 需要 imatrix，无法写回原类型，因此使用 Q8_0"
+    if m.get("unedited_rel_change") is not None:
+        fb += f"、重新量化后未编辑列的值变化了 {m['unedited_rel_change']:.1%}"
+    return (f"  {m['tensor']}: {m.get('type') or m.get('from')} → {m['to']}({m['bytes_from'] / 2**20:.1f} → {m['bytes_to'] / 2**20:.1f} MiB、"
+            f"{how}{ex}{kept}{par}{fb})")
+
+
+def _inkling_export_lines(d: dict, bake: bool) -> list[str]:
+    """gne headproj export の表示(Inkling 2)。"""
+    if not bake:
+        return [f"{d['path']}({d['bytes'] / 1e6:.2f} MB、LoRA)"]
+    g = d.get("growth") or {}
+    head = (f"仅计算不写入（--dry-run）：若写入 {d['bytes'] / 2**30:.2f} GiB（原 {d['bytes_src'] / 2**30:.2f} GiB），类型 {d['requant']}"
+            if d.get("dry_run") else f"{d['path']}（{d['bytes'] / 2**30:.2f} GiB、原 {d['bytes_src'] / 2**30:.2f} GiB、烘焙、类型 {d['requant']}）")
+    lines = [head,
+             *([f"烘焙目标：{d['into']}（同一模型的其他量化。方向与部件来自此模型，删除量来自烘焙目标的权重）"] if d.get("into") else []),
+             *([d["plan"]] if d.get("plan") else []),
+             *([f"注意：{d['vram_note']}"] if d.get("vram_note") else []),
+             *([f"注意：{d['kept_note']}"] if d.get("kept_note") else []),
+             f"文件与 VRAM 的增长：{g.get('bytes', 0) / 2**20:+.0f} MiB"
+             + (f"（加载时的 VRAM 空闲 {d['vram_free_mb']:.0f} MiB）" if d.get("vram_free_mb") is not None else "")]
+    lines += [_inkling_bake_line(m) for m in d["modified"]]
+    co = d.get("carry_over")
+    if co:
+        lines.append("删除量（r̂ᵀW）在此模型与烘焙目标之间的差异（按部件。比值偏离 1 时，此模型决定的强度作用方式会改变）：")
+        lines += [f"  {x['unit']}：大小比 {x['norm_ratio']:.3f}、相对差 {x['rel_diff']:.3f}、cos {x['cos']:.4f}" for x in co]
+    if not d.get("dry_run"):
+        lines.append(f"记录：GGUF 的 gne.patches 与 {d['sidecar']}。第 6～17 层的权重在 3 次重复中共享，因此烘焙也会作用于全部 3 次")
+    return lines
+
+
+def _inkling_pipeline_lines(d: dict) -> list[str]:
+    """heads pipeline の表示(Inkling 2)。ほかのモデルの rank writes の表示と同じ並びで、段の名前と区分を出す。"""
+    ink, wr, ve, al = d["inkling"], d["writes"], d["verify"], d["allocate"]
+    lab = {str(p["key"]): p["label"] for p in ink["points"]}
+    lines = [f"{d['path']}（{d['n_prompts']} 问，{d['seconds']:.0f} 秒）",
+             f"Inkling 2：方向与测量位置 {ink['positions']}。基准为 {ink['reference']}。{ink['unit_note']}",
+             *(["  " + ink["position_note"]] if ink.get("position_kind") == "last" else []),
+             *([f"  该模型的默认值：" + "、".join(f"{k} {v}" for k, v in d["arch_defaults"].items())] if d.get("arch_defaults") else []),
+             *([("   使用的提问：方向 A {0}、B {1}，测量段 A {2}、B {3}（从对照集 A {4}、B {5} 中，每侧最多等间隔取 {6} 问）"
+                 .format((ink.get("n_questions") or {}).get("direction", {}).get("A"), (ink.get("n_questions") or {}).get("direction", {}).get("B"),
+                         ink["n_questions"]["measure"]["A"], ink["n_questions"]["measure"]["B"], ink["n_questions"]["total"]["A"],
+                         ink["n_questions"]["total"]["B"], ink["n_questions"].get("max_examples")))] if ink.get("n_questions") else []),
+             f"1. 方向 {d['name']}（{d['direction']['positions']}，{d['direction']['seconds']:.0f} 秒"
+             + (f"，因找不到回答开头而无法读取的对话 A {d['direction']['skipped']['A']}、B {d['direction']['skipped']['B']}"
+                if any((d["direction"].get("skipped") or {}).values()) else "") + ")" + _from_dir_text(d),
+             "2. 测量点（A 侧 / B 侧平均）：" + " | ".join(f"{x['label']} {x['A']:+.2f} / {x['B']:+.2f}" for x in d["score"]["layers"]),
+             f"3. 写入排序：构建组的目标为{wr['select_label']}，A {wr['n']['A']} 问、B {wr['n']['B']} 问，A−B 差 {wr['gap']:.2f}，部件 "
+             + "、".join(f"{KIND_JA.get(k, k)} {n}" for k, n in wr["n_units"].items() if n) + f"（{wr['seconds']:.0f} 秒）",
+             "   排除候选的层：" + "、".join(x for x in (
+                 f"流起始层的 attention {wr['excluded']['stream_start']}" if wr["excluded"].get("stream_start") else "",
+                 f"第 {wr['excluded']['before'][0]}～{wr['excluded']['before'][-1]} 层（通过 --include-before 纳入）" if wr["excluded"].get("before") else "") if x),
+             "   前列：" + " ".join(f"{r['label']}({r['score']:+.2f})" for r in wr["top"][:8]),
+             f"4. 将前 {ve['n']} 个逐一以 s=1 投影验证（" + "、".join(f"{KIND_JA[k]} {n}" for k, n in ve["kinds"].items() if n)
+             + f"、{ve['seconds']:.0f} 秒）。分数与实测 A−B 差缩小幅度的秩相关：" + _verify_corr_line(ve["spearman"]),
+             f"5. 从 s=1 构建组（目标 {d['target']:.2f} = {d['target_from']}，候选 {al['pool']} 个。A 侧平均值在无干预下为 {al['base_a_mean']:.2f}）："]
+    for r in ([dict(al["s1"], s1=True)] if al.get("s1") else []) + al["table"]:
+        if r.get("skipped"):
+            lines.append(f"   上限 {r['n_heads']} 个：{r['skipped']}")
+            continue
+        kk = "、".join(f"{KIND_JA[k]} {n}" for k, n in r["kinds"].items() if n)
+        strg = (f"强度 {r['s_max']:.2f}" if r.get("alpha") is not None or abs(r["s_max"] - r.get("s_min", r["s_max"])) < 1e-9 else
+                f"强度 最大 {r['s_max']:.2f}、中位数 {r['s_median']:.2f}、最小 {r['s_min']:.2f}")
+        head = f"   s=1（提升前）：{r['n_used']} 个（{kk}）" if r.get("s1") else \
+            f"   上限 {r['n_heads']} 个：{r['n_used']} 个（{kk}）、{strg}（{WRITES_STOP.get(r['stop'], r['stop'])}）"
+        lines.append(head + f"，A 平均 {r['a_mean']:.2f}，B Δ {r['b_side_delta']:+.2f}，B 正交 {r['b_drift_orth']:.4f}，"
+                     f"剩余 {r['remain']}/{al['n_a']}" + ("" if r.get("effect") is None else f"，效果 {r['effect']:.2f}")
+                     + ("  ← 推荐" if r.get("recommended") else "") + _mr_mark(r) + ("" if r["reached"] else "（未达到目标）"))
+        lines.append("      " + " ".join(r["units"]))
+        bl = r.get("by_layer") or {}
+        if bl:
+            lines.append("      测量点的 A / B：" + " | ".join(f"{lab.get(k, k)} {v['A']:+.2f} / {v['B']:+.2f}" for k, v in bl.items()))
+    if d.get("no_recommend"):
+        lines.append(f"   无推荐组：按工具标准无法唯一确定（{d['no_recommend']['reason']}）。" + _mr_line(d.get("most_reduced")))
+    lines.append("   " + REC_GUIDE)
+    for nt in al.get("notes") or []:
+        lines.append("   注意: " + nt["text"])
+    ck = d.get("check")
+    if ck:
+        def cell(x):
+            return f"{x['match_finished']}/{x['finished']}" if x.get("match_finished") is not None else f"{x['finished']}/{x['n']} 已写完"
+        for key, lab_ in (("none", "无干预"), ("recipe", "推荐组" if ck.get("recommended") else f"上限 {ck.get('n_heads')} 个的组（无推荐组）")):
+            x = ck["rows"][key]
+            lines.append(f"6. 回复校验 {lab_}（按去掉思考后的回答计数）：A {cell(x['A'])}、B {cell(x['B'])}（空 A {x['A']['empty']}/B {x['B']['empty']}，"
+                         f"重复 A {x['A']['loop']}/B {x['B']['loop']}，因上限截断 A {x['A']['at_limit']}/B {x['B']['at_limit']}）")
+        if ck.get("match_warning"):
+            lines.append("   注意: " + ck["match_warning"])
+        for side, x in (ck.get("break_warning") or {}).items():
+            lines.append(f"   注意：应用该组后 {side} 侧回复出现损坏（重复 {x['loop']}、空 {x['empty']} / {x['n']} 问，无干预下为 "
+                         f"{x['loop_none']}、{x['empty_none']}）。请降低强度，或尝试其他组、其他部件类型")
+        if ck.get("note"):
+            lines.append("   注意: " + ck["note"] + (f"。{ink['position_note']}" if ink.get("position_kind") == "last" else ""))
+    if d.get("recommended"):
+        r_ = d["recommended"]["recipe"]
+        lines.append(f"配方：{r_}。试运行：gne chat --recipe {r_}（强度用 gne recipe-scale 修改）、gne behave --recipe {r_}、"
+                     f"烘焙：gne headproj export --recipe {r_} --bake --out <GGUF>")
+    return lines
 
 
 def _pipeline_writes_lines(d: dict) -> list[str]:
@@ -3498,7 +3729,9 @@ def _refine_text(d: dict) -> str:
                 + d["postnorm"]["note"]] if d.get("postnorm") else []),
              f"从剩余中添加 第 {rnd} 轮（原始批量 {d.get('root') or d['base']}）。基础 = {d['base']} 的 {d['n_heads']} 个单元所在行"
              + (f"的合并配方（原组 + {'第 1 轮' if rnd == 2 else f'第 1～{rnd - 1} 轮'}添加，{len(d['base_units'])} 个单元）" if rnd > 1 else f"的组（{len(d['base_units'])} 个单元）"),
-             f"1. 应用基础后，原方向 {d.get('direction')} 的 L{d['score_layer']} 投影值高于目标 {d['threshold']:.2f} 的"
+             *([f"Inkling 2: {d['inkling']['replies_note']}"] if (d.get("inkling") or {}).get("replies_note") else []),
+             f"1. 应用基础后，原方向 {d.get('direction')} 的 "
+             + ((d.get("inkling") or {}).get("score_label") or f"L{d['score_layer']}") + f"  投影值高于目标 {d['threshold']:.2f} 的"
              f" A 侧问题：{rm['n']}/{rm['n_a']} 个" + (f"（数量较少，因此按投影值从高到低用 {rm['used']} 个问题创建方向）" if rm["padded"] else ""),
              f"2. 用剩余问题运行批量 → 新方向 {pp['direction']}" + (f"（复用已创建的{'、'.join({'direction': '方向', 'causal': '因果'}[x] for x in pp['reused'])}）" if pp["reused"] else "")]
     rows = d.get("combined_rows") or []
@@ -3523,7 +3756,8 @@ def _refine_text(d: dict) -> str:
                 lines.append(f"      未用于选择的问题：剩余 {h['remain_before']} → {h['remain_after']} / {h['n_a']}、A 平均 {h['a_mean_before']:.2f} → "
                              f"{h['a_mean_after']:.2f}、B Δ {h['b_delta']:+.2f}、B ⊥ {h['b_drift_orth']:.3f}" + ("" if h["reached"] else "（未达到目标）"))
             for x in c.get("dups") or []:
-                who = {"layer_attn": "attn", "layer_mlp": "ffn", "neuron": f"N{x['head']}"}.get(x["kind"], f"H{x['head']}")
+                who = {"layer_attn": "attn", "layer_mlp": "ffn",
+                       "neuron": (f"E{x['expert']} " if x.get("expert") is not None else "") + f"N{x['head']}"}.get(x["kind"], f"H{x['head']}")
                 lines.append(f"      同一单元包含在两个方向中：L{x['layer']} {who}"
                              f"（{'、'.join(f'{rname(k)} s{sv:.2f} @{dn}' for k, sv, dn in zip(x['rounds'], x['s'], x['directions']))}）。两个投影都会应用")
             for x in c.get("cross_visit") or []:
@@ -3552,7 +3786,9 @@ def _refine_text(d: dict) -> str:
                                                               for sd, x in (ck.get("break_warning") or {}).items()]:
                 if w:
                     lines.append(f"   注意: {w}")
-        if cb:
+        if cb and d.get("inkling"):
+            lines.append(f"验证：gne eval --recipe {cb['recipe']} --random-controls 16")
+        elif cb:
             lines.append(f"检查：gne eval --recipe {cb['recipe']} --random-controls 16")
         lines.append("仅添加组的表（新方向，仅供参考。不要单独使用）：")
         for r in pp["table"]:
@@ -4209,6 +4445,521 @@ def heads_geometry(c: Common, holder: dict,
         lines += ["  " + n["text"] for n in e["notes"]]
         lines.append(f"  用法：gne direction score --name {e['name']} / gne heads writes --name {e['name']} / "
                      f"gne headproj ablate --direction {e['name']} --per-layer")
+    return d, "\n".join(lines), 0
+
+
+# --- Inkling 2: 中を読むだけの道具(gne/inkling_read.py、docs/inkling2.md) -------------------------------------------------------
+
+_INK_SPEC = typer.Option(..., "--spec", exists=True, help="对照集（公开模板：prompts_a / prompts_b，或 user_prompts 与 system_a）")
+_INK_MAX = typer.Option(None, "--max-prompts", help="每侧问题数量的上限")
+_INK_NAME = typer.Option(None, "--name", help="结果写入 <root>/inkling/<model_id>/<名称>.<类型>.json（省略则使用模板名称）")
+
+
+def _ink_reader(c: Common, holder: dict):
+    from .inkling_read import Reader
+    s = holder["session"] = c.session()
+    return s, Reader(s, progress=c.progress)
+
+
+def _ink_save(s, name: str, kind: str, d: dict, arrays: dict | None = None) -> str:
+    import re as _re
+
+    import numpy as np
+    if not _re.fullmatch(r"[\w.\-]+", name):
+        raise GneError("BAD_ARGS", f"名称 {name!r} 只能包含英数字、_、-、.")
+    out = s.store.root / "inkling" / s.meta.model_id
+    out.mkdir(parents=True, exist_ok=True)
+    p = out / f"{name}.{kind}.json"
+    p.write_text(json.dumps(d, ensure_ascii=False, indent=1, default=_json_default), encoding="utf-8")
+    if arrays:
+        np.savez(out / f"{name}.{kind}.npz", **arrays)
+    return str(p)
+
+
+def _ink_convs(spec: Path, max_prompts: Optional[int]):
+    from .inkling_read import load_contrast
+    A, B, nm = load_contrast(spec)
+    if max_prompts:
+        A, B = A[:max_prompts], B[:max_prompts]
+    return A, B, nm
+
+
+def _ink_step(st: dict) -> str:
+    p = f"，第 {st['pass']} 次" if st["pass"] else ""
+    return f"段 {st['step']:>2}（层 {st['layer']}{p}，流 {st['stream']}）"
+
+
+@gne_command(inkling_app, "read", "inkling read")
+def inkling_read_cmd(c: Common, holder: dict,
+                     text: str = typer.Option(..., "--text", "-t", help="用户话语（放入聊天模板后运行）"),
+                     names: str = typer.Option("l_out,ffn_mix,attn_out,ffn_out", "--names",
+                                               help="要捕获的名称（逗号分隔。可通过 gne probe --list-names 查看。段按执行顺序）"),
+                     steps: Optional[str] = typer.Option(None, "--steps", help="段（例 18-29。省略则为全部）"),
+                     out: Path = typer.Option(..., "--out", help="输出的 .npz（名称-段 →（token、值））")):
+    """段ごとの値を捕まえて .npz に書く(読むだけ。値の意味は docs/inkling2.md の「中を読む」)。"""
+    import numpy as np
+
+    from .inkling_read import want
+    s, r = _ink_reader(c, holder)
+    bases = [x.strip() for x in names.split(",") if x.strip()]
+    ids = r.ids(text)
+    r.fit([ids])
+    cap = r.run(ids, want(bases, parse_layers(steps)))
+    if not cap:
+        raise GneError("NOT_FOUND", f"{', '.join(bases)} 不在图中", "请用 gne probe --list-names 确认名称")
+    np.savez(out, **cap)
+    lines = [f"{out}（{len(ids)} 个 token、{len(cap)} 个）"] + [f"  {k}: {tuple(v.shape)}" for k, v in sorted(cap.items())[:40]]
+    return {"path": str(out), "n_tokens": len(ids), "names": {k: list(v.shape) for k, v in cap.items()}}, "\n".join(lines), 0
+
+
+@gne_command(inkling_app, "check", "inkling check")
+def inkling_check_cmd(c: Common, holder: dict,
+                      spec: Path = typer.Option(Path(__file__).resolve().parent.parent / "configs" / "pipeline" / "question_kinds.json",
+                                                "--spec", exists=True, help="用于取问题的对照集（使用 A 侧第一个问题）"),
+                      steps: Optional[str] = typer.Option(None, "--steps", help="段（省略则为全部）")):
+    """捕まえた値を、別の計算(流れの和・混ぜ方・繰り返しのゲート・W_o・短い畳み込み・専門家の和・SiTU)と突き合わせる。"""
+    import numpy as np
+
+    from .inkling_read import check
+    s, r = _ink_reader(c, holder)
+    A, _, _ = _ink_convs(spec, 1)
+    d = check(r, A[0], steps=parse_layers(steps))
+    lines = [f"核对（{d['n_tokens']} 个 token、{len(d['steps'])} 段）。值为相对误差 ‖捕获 − 计算‖ / ‖捕获‖ 的中位数 / 最大值"]
+    lines += [f"  {k}: {v['median']:.2e} / {v['max']:.2e}（{v['n']} 项）" for k, v in d["errors"].items()]
+    return d, "\n".join(lines), 0
+
+
+@gne_command(inkling_app, "mix", "inkling mix")
+def inkling_mix_cmd(c: Common, holder: dict, spec: Path = _INK_SPEC, max_prompts: Optional[int] = _INK_MAX,
+                    positions: str = typer.Option("all", "--positions", help="平均的 token：all / last"),
+                    name: Optional[str] = _INK_NAME):
+    """各段の深さ方向の注意の重み: attention と MLP の入力が、それまでのどの流れをどれだけ読むか、繰り返しのメッセージが前の回の
+    どの流れを読むか、最後の出力の混ぜ方(対照集合の両側の質問で平均)。"""
+    import numpy as np
+
+    from .inkling_read import mix_summary
+    if positions not in ("all", "last"):
+        raise GneError("BAD_ARGS", "--positions 必须为 all 或 last")
+    s, r = _ink_reader(c, holder)
+    A, B, nm = _ink_convs(spec, max_prompts)
+    d = mix_summary(r, A + B, positions=positions)
+    d["path"] = _ink_save(s, name or nm, "mix", d)
+    fmt = lambda labels, ws: " · ".join(f"{lab} {w:.2f}" for lab, w in zip(labels, ws, strict=True))  # noqa: E731
+    lines = [f"深度方向注意力权重（{d['n_convs']} 个对话，{'全部 token' if positions == 'all' else '最后 token'}的平均）。"
+             "顺序为保存的流从新到旧，最后是当前状态"]
+    for st in d["steps"]:
+        parts = []
+        if "attn" in st:
+            a = st["attn"]
+            parts.append("attn " + (fmt(a["labels"], a["weights"][0]) if not a["queries"] else
+                                    " / ".join(f"{q}: {fmt(a['labels'], w)}" for q, w in zip(a["queries"], a["weights"], strict=True))))
+        f = st["ffn"]
+        parts.append("ffn " + fmt(f["labels"], f["weights"][0]))
+        if "msg" in st:
+            m = st["msg"]
+            parts.append("msg " + " / ".join(f"{q}: {fmt(m['labels'], w)}" for q, w in zip(m["queries"], m["weights"], strict=True)))
+        lines.append(f"{_ink_step(st)}  " + " | ".join(parts))
+    if d["out"]:
+        lines.append("最后输出：" + fmt(d["out"]["labels"], d["out"]["weights"]))
+    # 区分ごとのまとめ: MLP の入力が今の状態をどれだけ読むか
+    for title, rows in _ink_groups(r.plan, d["steps"]):
+        ws = [st["ffn"]["weights"][0][-1] for st in rows]
+        lines.append(f"MLP 输入读取当前状态的权重（{title}）：平均 {np.mean(ws):.2f}、最小 {np.min(ws):.2f}、最大 {np.max(ws):.2f}")
+    lines.append(f"保存：{d['path']}")
+    return d, "\n".join(lines), 0
+
+
+_INK_REGION = {"before": "重复之前", "loop": "重复之中", "after": "重复之后"}
+
+
+def _ink_region_title(plan, reg: str, p: int = 0) -> str:
+    if reg == "before":
+        return f"{_INK_REGION[reg]}（第 0～{plan.core_start - 1} 层）"
+    if reg == "after":
+        return f"{_INK_REGION[reg]}（第 {plan.core_end}～{plan.n_stored - 1} 层）"
+    return f"{_INK_REGION[reg]}（第 {plan.core_start}～{plan.core_end - 1} 层、第 {p} 次）"
+
+
+def _ink_groups(plan, rows: list[dict]):
+    """表を 繰り返しの前 / 繰り返しの中(回ごと)/ 繰り返しの後 に分ける。"""
+    from .inkling_read import region
+    keys = []
+    for r in rows:
+        k = (region(plan, r["step"]), plan.step(r["step"])["pass"])
+        if k not in keys:
+            keys.append(k)
+    return [(_ink_region_title(plan, reg, p), [r for r in rows if (region(plan, r["step"]), plan.step(r["step"])["pass"]) == (reg, p)])
+            for reg, p in keys]
+
+
+@gne_command(inkling_app, "residuals", "inkling residuals")
+def inkling_residuals_cmd(c: Common, holder: dict, spec: Path = _INK_SPEC, max_prompts: Optional[int] = _INK_MAX,
+                          name: Optional[str] = _INK_NAME):
+    """残差の定義の比べ(読むだけ)。(a) 流れの部分和 l_out と、副層が実際に読む混ぜた入力(MLP の ffn_mix、attention の attn_mix。
+    全体を見る層は Q・K・V 別、2 回目以降は繰り返しのゲートの後も)で、最後のトークンの A − B の方向を段ごとに作り、向きの近さ(cos)と
+    分かれ方(半分で作った方向で残りの半分を測った差 ÷ 標準偏差)を並べる。同じ層の回どうしの向き、3 回目の方向に沿った各回の
+    ヘッド・副層の書き込み、深さ方向の注意の重みの A 側と B 側の違い、繰り返しのメッセージの強さも出す。方向は保存するが、
+    方向で押す・射影する機能は、どの定義にするか決まるまで止めたまま。"""
+    import numpy as np
+
+    from .inkling_read import study
+    s, r = _ink_reader(c, holder)
+    plan = r.plan
+    A, B, nm = _ink_convs(spec, max_prompts)
+    d = study(r, A, B)
+    D = d.pop("directions")
+    d["path"] = _ink_save(s, name or nm, "residuals", d, {f"d_{k}": v for k, v in D.items()})
+    f = lambda x, fm="+.2f": "—" if x is None or x != x else format(x, fm)  # noqa: E731
+    med = lambda xs: float(np.median(xs)) if xs else float("nan")  # noqa: E731
+    lines = [f"残差定义比较（A {d['n_a']} 问、B {d['n_b']} 问，最后 token）。a = 流的部分和，ffn = MLP 读取的混合输入，"
+             "Q/K/V = attention 读取的混合输入（SWA 层为 1 个），ffn'、Q' = 重复门控之后。分离度 = 用一半数据构建的方向测量另一半的"
+             " A − B ÷ 标准差"]
+    cols = [("l_out|ffn_mix", "a-ffn"), ("l_out|attn_mix_q", "a-Q"), ("ffn_mix|attn_mix_q", "ffn-Q"), ("attn_mix_q|attn_mix_k", "Q-K"),
+            ("attn_mix_q|attn_mix_v", "Q-V"), ("ffn_mix|ffn_in", "ffn-ffn'"), ("attn_mix_q|attn_in_q", "Q-Q'")]
+    lines.append("\n1. 方向接近度（cos）与分离度")
+    for title, rows in _ink_groups(plan, d["steps"]):
+        lines.append(f"[{title}]")
+        for x in rows:
+            cs = "  ".join(f"{lab} {f(x['cos'][k])}" for k, lab in cols if k in x["cos"])
+            sp = " ".join(f"{lab} {f(x['sep'].get(v), '.1f')}" for v, lab in (("l_out", "a"), ("ffn_mix", "ffn"), ("attn_mix_q", "Q"))
+                          if v in x["sep"])
+            lines.append(f"  段 {x['step']:>2} 层 {x['layer']:>2}  {cs}  | 分离度 {sp}")
+        lines.append(f"  中位数：cos a-ffn {f(med([x['cos']['l_out|ffn_mix'] for x in rows]))}、cos ffn-Q "
+                     f"{f(med([x['cos'].get('ffn_mix|attn_mix_q') for x in rows if 'ffn_mix|attn_mix_q' in x['cos']]))}、分离度 a "
+                     f"{f(med([x['sep']['l_out'] for x in rows]), '.1f')} / ffn {f(med([x['sep']['ffn_mix'] for x in rows]), '.1f')}")
+    lines.append("\n2. 同一层各次重复之间的方向接近度（1-2 / 2-3 / 1-3）")
+    for x in d["passes"]:
+        lines.append(f"  层 {x['layer']:>2}  " + "  ".join(f"{lab} {'/'.join(f(v) for v in x[k])}"
+                                                    for k, lab in (("l_out", "a"), ("ffn_mix", "ffn"), ("attn_mix_q", "Q"))))
+    lines.append("\n3. 沿第 3 次重复方向（该层段）时各次写入的 A − B（注意力整体、整个 MLP；头仅列方向与第 3 次相反、"
+                 "大小达到第 3 次最大值 1 成以上的）。方向 a = 流的部分和，b = MLP 读取的混合输入")
+    for dn in ("a", "b"):
+        n_opp = 0
+        for x in [h for h in d["heads"] if h["direction"] == dn]:
+            n_opp += len(x["opposite"])
+            pp = "  ".join(f"第 {q['pass']} 次 attn {q['attn']:+.2f} ffn {q['ffn']:+.2f}" for q in x["passes"])
+            op = ", ".join(f"第 {o['pass']} 次 H{o['head']} {o['value']:+.2f}（第 3 次 {o['pass3']:+.2f}）" for o in x["opposite"][:6])
+            lines.append(f"  [{dn}] 层 {x['layer']:>2}  {pp}" + (f"  反向：{op}" + (" …" if len(x["opposite"]) > 6 else "") if op else ""))
+        lines.append(f"  [{dn}] 反向头（第 1、2 次累计）：{n_opp}（层 {plan.width} × 头 {len(d['heads'][0]['passes'][0]['heads'])} × 2 次）")
+    lines.append(f"  各头写入之和与 attn_out 的差（相对、最大值）：{f(d['head_sum_rel_max'], '.1e')}")
+    lines.append("\n4. 深度方向注意力权重 A 侧与 B 侧的差异（权重差绝对值之和 ÷ 2。0 = 相同，1 = 完全不同）")
+    for title, rows in _ink_groups(plan, d["mix"]):
+        lines.append(f"[{title}]")
+        for x in rows:
+            parts = [f"{side} 最后 {x[f'{side}_last']['tv']:.3f} 整体 {x[f'{side}_all']['tv']:.3f}" for side in ("attn", "ffn", "msg")
+                     if f"{side}_last" in x]
+            lines.append(f"  段 {x['step']:>2}  " + "  ".join(parts))
+        lines.append(f"  最大值：ffn 最后 {max(x['ffn_last']['tv'] for x in rows):.3f}、attn 最后 "
+                     f"{max([x['attn_last']['tv'] for x in rows if 'attn_last' in x] or [0]):.3f}")
+    lines.append("\n5. 重复消息的强度（第 2 次起，全部 token 平均）：‖gain ⊙ 消息‖ ÷ ‖混合输入‖ / ‖forget ⊙ 混合输入‖ ÷ ‖混合输入‖")
+    for p in (2, 3):
+        rows = [x for x in d["loop"] if x["pass"] == p]
+        for step in sorted({x["step"] for x in rows}):
+            xs = [x for x in rows if x["step"] == step]
+            lines.append(f"  段 {step:>2}（层 {xs[0]['layer']}、第 {p} 次）  " + "  ".join(
+                f"{x['ctrl']} {x['gain_msg_rel']:.3f} / {x['forget_rel']:.3f}" for x in xs))
+        if rows:
+            lines.append(f"  第 {p} 次平均：gain·消息 {np.mean([x['gain_msg_rel'] for x in rows]):.3f}、forget "
+                         f"{np.mean([x['forget_rel'] for x in rows]):.3f}")
+    lines.append(f"\n保存：{d['path']}（方向为 .npz）")
+    return d, "\n".join(lines), 0
+
+
+@gne_command(inkling_app, "conv", "inkling conv")
+def inkling_conv_cmd(c: Common, holder: dict, spec: Path = _INK_SPEC, max_prompts: Optional[int] = _INK_MAX,
+                     steps: Optional[str] = typer.Option(None, "--steps", help="段（省略则为全部）"),
+                     source: Optional[str] = typer.Option(None, "--from", help="用于取方向的 gne inkling residuals 结果名称（省略则为模板名称。没有则创建）"),
+                     name: Optional[str] = _INK_NAME):
+    """attention と MLP の書き込みから方向を除いたとき、短い畳み込みの後に方向の成分がどれだけ残るか(実際の活性で)。方向は段ごとの
+    A − B で、a = 流れの部分和、b = MLP が読む混ぜた入力(gne inkling residuals の結果)。素直な射影と、今のトークンの倍率で直した
+    射影を比べる。"""
+    import numpy as np
+
+    from .inkling_read import conv_leak, study
+    s, r = _ink_reader(c, holder)
+    plan = r.plan
+    A, B, nm = _ink_convs(spec, max_prompts)
+    src = s.store.root / "inkling" / s.meta.model_id / f"{source or nm}.residuals.npz"
+    if src.exists():
+        z = np.load(src)
+        dirs = {"a": z["d_l_out"], "b": z["d_ffn_mix"]}
+    else:
+        D = study(r, A, B)["directions"]
+        dirs = {"a": D["l_out"], "b": D["ffn_mix"]}
+    d = conv_leak(r, A + B, dirs, steps=parse_layers(steps))
+    d["directions_from"] = str(src) if src.exists() else "computed"
+    d["path"] = _ink_save(s, name or nm, "conv", d)
+    f = lambda x: "—" if x is None else f"{x:.3f}"  # noqa: E731
+    lines = ["短卷积后残留的方向分量（残留比例 = 投影后的分量 ÷ 原分量，均方）。直接 = 去除 r（当前 token 的倍率部分 + "
+             "前序 token 的泄漏），校正 = 去除 normalize(g⊙r)。副作用 = 方向其他部分的变化 ÷ 写入大小。"
+             f"方向：{d['directions_from']}"]
+    for title, rows in _ink_groups(plan, d["rows"]):
+        lines.append(f"[{title}]")
+        for x in rows:
+            lines.append(f"  段 {x['step']:>2} {x['kind']:4} [{x['direction']}]  直接 {f(x['left_naive'])}（当前 {f(x['left_naive_now'])} "
+                         f"前序 {f(x['left_naive_past'])}）  校正 {f(x['left_corrected'])}  副作用 直接 {f(x['side_naive'])} "
+                         f"校正 {f(x['side_corrected'])}  重算差 {x['recompute_rel']:.1e}")
+    for kind in ("attn", "ffn"):
+        for dn in ("a", "b"):
+            xs = [x for x in d["rows"] if x["kind"] == kind and x["direction"] == dn]
+            if xs:
+                lines.append(f"{kind} [{dn}]：直接投影的残留比例 中位数 {np.median([x['left_naive'] for x in xs]):.3f}（最大 "
+                             f"{np.max([x['left_naive'] for x in xs]):.3f}）、校正投影 {np.median([x['left_corrected'] for x in xs]):.3f}"
+                             f"（最大 {np.max([x['left_corrected'] for x in xs]):.3f}）、副作用 直接 "
+                             f"{np.median([x['side_naive'] for x in xs]):.3f} 校正 {np.median([x['side_corrected'] for x in xs]):.3f}")
+    lines.append(f"保存：{d['path']}")
+    return d, "\n".join(lines), 0
+
+
+@gne_command(inkling_app, "chips-trial", "inkling chips-trial")
+def inkling_chips_trial_cmd(c: Common, holder: dict,
+                            spec: Path = typer.Option(Path(__file__).resolve().parent.parent / "configs" / "pipeline" / "pirate_tone.json",
+                                                      "--spec", exists=True, help="含 user_prompts、system_a/b、validate 的模板"),
+                            name: str = typer.Option("trial", "--name", help="结果写入 <root>/inkling/<model_id>/<名称>.chips/（重跑时跳过已完成的组）"),
+                            ks: str = typer.Option("4,8,16,32", "--ks", help="注意力头组的大小"),
+                            strengths: str = typer.Option("1,2,4,8", "--strengths", help="强度 s（所有部件相同）"),
+                            whole_ks: str = typer.Option("2,4", "--whole-ks", help="注意力整体组的层数"),
+                            whole_strengths: str = typer.Option("1,2,4", "--whole-strengths"),
+                            gate: str = typer.Option("after", "--gate", help="第 2、3 次 MLP 输入：after（重复门控之后）/ before"),
+                            keep_stream_start: bool = typer.Option(False, "--keep-stream-start", help="将流起始层（0、6、12、18）的 attention 也纳入候选"),
+                            n_build: Optional[int] = typer.Option(None, "--n-build", help="用于方向和排序的提问数（省略则为全部）"),
+                            n_val_a: int = typer.Option(30, "--n-val-a", help="A 侧回复数"),
+                            n_val_b: int = typer.Option(15, "--n-val-b", help="B 侧回复数"),
+                            n_kl: int = typer.Option(30, "--n-kl", help="测量中间值和最后 token KL 的提问数（各侧）"),
+                            max_tokens: int = typer.Option(1024, "--max-tokens"),
+                            all_kinds: bool = typer.Option(False, "--all-kinds", help="在仅注意力头的组之后，用同一网格追加包含整个 MLP、专家神经元的组"
+                                                           "（hw = 头 + 注意力整体 + 整个 MLP，all = 再加神经元）"),
+                            all_ks: str = typer.Option("8,16,32", "--all-ks", help="--all-kinds 组的大小"),
+                            answer_check: bool = typer.Option(False, "--answer-check", help="最后，在思考之后的回答开头做一次校验"
+                                                              "（第二个方向、投影延续方式、强组的思考）")):
+    """[試し] Inkling 2 で、CHiPS の形の取り除き(ヘッド・attention 全体の書き込みから方向の成分を引く LoRA)が応答で効くかを、
+    決まった格子(組の大きさ × 強さ)で確かめる。ふつうの機能ではない。方向は MLP が読む混ぜた入力(層 6〜17 は 3 回目)、射影は
+    短い畳み込みの今のトークンの倍率で直した形。docs/inkling2.md の「CHiPS の試し」。"""
+    import numpy as np
+
+    from .inkling_chips import broken, candidates_all, region_of, trial, trial_all
+    if gate not in ("after", "before"):
+        raise GneError("BAD_ARGS", "--gate 必须为 after 或 before")
+    s = holder["session"] = c.session()
+    fl = lambda x: tuple(float(v) for v in x.split(",") if v.strip())  # noqa: E731
+    il = lambda x: tuple(int(v) for v in x.split(",") if v.strip())  # noqa: E731
+    out = s.store.root / "inkling" / s.meta.model_id / f"{name}.chips"
+    res = trial(s, spec, out, ks=il(ks), strengths=fl(strengths), whole_ks=il(whole_ks), whole_strengths=fl(whole_strengths),
+                gate=gate, skip_stream_start=not keep_stream_start, n_build=n_build, n_val_a=n_val_a, n_val_b=n_val_b, n_kl=n_kl,
+                max_tokens=max_tokens, progress=c.progress)
+    if all_kinds:
+        res = trial_all(s, spec, out, ks=il(all_ks), strengths=fl(strengths), gate=gate, skip_stream_start=not keep_stream_start,
+                        n_build=n_build, n_val_a=n_val_a, n_val_b=n_val_b, n_kl=n_kl, max_tokens=max_tokens, progress=c.progress)
+    if answer_check:
+        from .inkling_chips import answer_check as _answer_check
+        res = _answer_check(s, spec, out, gate=gate, n_val_a=n_val_a, n_val_b=n_val_b, max_tokens=max_tokens, progress=c.progress)
+    f = lambda x, fm=".2f": "—" if x is None or x != x else format(x, fm)  # noqa: E731
+    cnt = lambda r, sd: (f"一致 {r[sd]['counts'].get('match', 0)}/{r[sd]['counts']['n']} 空 {r[sd]['counts']['empty']} "  # noqa: E731
+                         f"重复 {r[sd]['counts']['loop']} 截断 {r[sd]['counts']['at_limit']}")
+    lines = [f"[试运行] CHiPS 形式的移除（{res['config']['spec']}，方向为 MLP 输入、第 2/3 次为 {res['config']['gate']}，"
+             f"流起始层的 attention {'排除' if res['config']['skip_stream_start'] else '也纳入'}）"]
+    lines.append("排序（基准段中的 A − B 写入，前 16 个。括号内为第 1、2、3 次）：")
+    pos = sorted([r for r in res["rank"] if r["head"] is not None and r["value"] > 0], key=lambda r: -r["value"])
+    for r in pos[:16]:
+        bp = " / ".join(f(r["by_pass"][k]) for k in sorted(r["by_pass"]) if k != "0")
+        lines.append(f"  层 {r['layer']:>2} H{r['head']:<2} {r['value']:+.3f}" + (f"（{bp}）" if bp else ""))
+    ra = res.get("rank_all")
+    if ra:
+        plan = s.weights.inkling
+        lines.append(f"全部类型的排序：专家权重预处理 {ra['expert_q']['seconds']:.0f} 秒（q {ra['expert_q']['q_mb']:.0f} MB）、"
+                     f"排序 {ra['seconds']:.0f} 秒、最大内存（RSS）{ra['max_rss_mb_after_rank']:.0f} MB。神经元之和与 MLP 写入的差 "
+                     f"{ra['neuron_sum_vs_ffn_out_rel']['median']:.1e} / {ra['neuron_sum_vs_ffn_out_rel']['max']:.1e}")
+        allc = candidates_all(plan, ra, ("head", "attn", "ffn", "neuron"), skip_stream_start=res["config"]["skip_stream_start"])
+        for k in (8, 16, 32, 100):
+            sub = allc[:k]
+            kinds = {kk: sum(1 for r in sub if r["kind"] == kk) for kk in ("head", "attn", "ffn", "neuron")}
+            regs = {rg: sum(1 for r in sub if region_of(plan, r["layer"]) == rg) for rg in ("loop", "after")}
+            lines.append(f"  前 {k}：{kinds}、区域 {regs}")
+        lines.append("  神经元集中度：" + "; ".join(f"{k} 专家 {v['experts']}、层 {v['layers']}、前 5 专家比例 {f(v['share_top5_experts'])}"
+                                                for k, v in ra["concentration"].items()))
+    for ck in res.get("ffn_lora_checks", []):
+        lines.append(f"MLP 的 LoRA 校验：层 {ck['layer']}（{ck['type']}、倍率 {'有' if ck['has_scale'] else '无'}、"
+                     f"{'整体' if ck['units'][0][1] == 'ffn' else '神经元'}、选中的 token {ck['n_tokens_selected']}/{ck['n_tokens']}）、"
+                     f"卷积前 {ck['rel_pre']:.1e}、后 {ck['rel_post']:.1e}、r 分量变化 实测 {ck['r_change_measured']:+.3f} / "
+                     f"公式 {ck['r_change_formula']:+.3f}、LoRA {ck['lora_bytes'] / 2**20:.2f} MB")
+    lines.append(f"无干预：A {cnt(res['base'], 'A')}，B {cnt(res['base'], 'B')}")
+    lines.append("组：残留差 = 改写后的 A − B ÷ 原始 A − B（最后混合输出、按区域的中位数），KL = 最后 token 的分布差")
+    for k, r in res["sets"].items():
+        if r.get("same_as"):
+            lines.append(f"  {k:<22} 与 {r['same_as']} 相同的部件（不重跑）")
+            continue
+        kr = r["keep_by_region"]
+        reg = " ".join(f"{x} {f(kr.get(x))}" for x in ("before", "pass1", "pass2", "pass3", "after"))
+        rep = f"  A {cnt(r, 'A')}  B {cnt(r, 'B')}  损坏 {broken(r)}" if "A" in r else ""
+        lines.append(f"  {k:<22} 输出 {f(r['keep_out'])}  [{reg}]  KL A {f(r['kl_a'], '.3f')} B {f(r['kl_b'], '.3f')}{rep}")
+    lines.append(f"第 0～5 层与 18～23 层比较：目标缩减方式 {f(res.get('region_target_reduction'))}、选择的强度 {res.get('region_pick')}")
+    lines.append(f"最佳组：{res.get('best')}，最差组：{res.get('worst')}")
+    le = res.get("loop_effect")
+    if le:
+        for kind in ("attn", "msg"):
+            b0, b1 = np.array(le["base"][kind]), np.array(le["best"][kind])
+            lines.append(f"最佳组中的 {kind}（A − B，段 6～41）：第 1 次 {b0[6:18].sum():+.2f}→{b1[6:18].sum():+.2f}、"
+                         f"第 2 次 {b0[18:30].sum():+.2f}→{b1[18:30].sum():+.2f}、第 3 次 {b0[30:42].sum():+.2f}→{b1[30:42].sum():+.2f}")
+    ac = res.get("answer_check")
+    if ac:
+        lines.append("回答开头的校验：")
+        if "dir_build" in ac:
+            lines.append("  构建第二个方向的回复：" + "、".join(f"{sd} {v['with_answer']}/{v['n']}（回答开头中位数第 {v['answer_pos_median']:.0f} 个 token）"
+                                                         for sd, v in ac["dir_build"].items()))
+        if "cos_by_region" in ac:
+            lines.append("  与最后提问 token 方向的 cos（按区域的中位数）：" + "、".join(f"{rg} {v['median']:+.2f}" for rg, v in ac["cos_by_region"].items())
+                         + f"、最后输出 {ac['cos_out']:+.2f}")
+        tr = ac.get("trajectory")
+        if tr:
+            lines.append(f"  最后提问 token 在方向上的投影 A − B（改写前的回复 A {tr['n']['A']}、B {tr['n']['B']}，按位置分隔）：")
+            lines.append("    " + " | ".join(tr["buckets"]))
+            for rg, v in tr["gap"].items():
+                lines.append(f"    {rg}: " + " | ".join(f(v[b]) for b in tr["buckets"]))
+        for key, row in (ac.get("reruns") or {}).items():
+            for dname, d in row.items():
+                parts = [f"{m}: 出力 {f(x['keep_out'])} 3 回目 {f(x['keep_by_region'].get('pass3'))}" for m, x in d.items() if m not in ("A", "B")]
+                rep = f"  A {cnt(d, 'A')}  B {cnt(d, 'B')}" if "A" in d else ""
+                lines.append(f"  {key} 在 {dname} 下：" + "; ".join(parts) + rep)
+    lines.append(f"保存：{out}")
+    return {k: v for k, v in res.items() if k != "rank"} | {"rank_top": pos[:32], "path": str(out)}, "\n".join(lines), 0
+
+
+def _ink_trial_units(c: Common, s, trial: Optional[Path], name: str, set_key: Optional[str], units: Optional[str]):
+    from .inkling_chips import units_of
+    d = trial or (s.store.root / "inkling" / s.meta.model_id / f"{name}.chips")
+    if not (d / "directions.npz").exists():
+        raise GneError("BAD_ARGS", f"没有试运行结果：{d}", "请用 --name 或 --trial 指定 chips-trial 的输出")
+    if units:
+        us = json.loads(units)
+    elif set_key:
+        res = json.loads((d / "result.json").read_text(encoding="utf-8"))
+        if set_key not in res["sets"]:
+            raise GneError("BAD_ARGS", f"组 {set_key!r} 不存在", "请指定 chips-trial 表中的组名")
+        us = units_of(res["sets"][set_key])
+    else:
+        raise GneError("BAD_ARGS", "--set 或 --units 必须指定一项")
+    return d, [[int(u[0]), str(u[1]), u[2], float(u[3])] for u in us]
+
+
+_INK_TRIAL = typer.Option(None, "--trial", help="chips-trial 的输出文件夹（省略则从 --name 推导。用烘焙后的 GGUF 校验时需要）")
+_INK_SET = typer.Option(None, "--set", help="chips-trial 的组名（例 all_k16_s2）")
+_INK_UNITS = typer.Option(None, "--units", help='部件 JSON（[[层, "head"|"attn"|"ffn"|"neuron", 编号, 强度], ...]）')
+
+
+@gne_command(inkling_app, "chips-bake", "inkling chips-bake")
+def inkling_chips_bake_cmd(c: Common, holder: dict, out: Path = typer.Option(..., "--out", help="输出的 GGUF"),
+                           name: str = typer.Option("trial", "--name"), trial: Optional[Path] = _INK_TRIAL,
+                           set_key: Optional[str] = _INK_SET, units: Optional[str] = _INK_UNITS,
+                           requant: str = typer.Option("auto", "--requant", help="要改写的张量类型：auto（默认。按原类型、原大小写入，"
+                                                       "仅对编辑保留不足 1 成的张量使用 Q8_0）、keep（始终使用原类型）、q8_0、f16")):
+    """[試し] chips-trial の組を GGUF に焼き込む(LoRA と同じ変化量。GPU は使わない)。層 6〜17 の重みは 3 回で共有なので、
+    焼き込みも LoRA と同じく 3 回すべてに効く。専門家ごとの倍率(ffn_down_exps.scale)はそのままにし、変化量を倍率で割って入れる。"""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from .inkling_chips import bake, layer_refs
+    s = holder["session"] = c.session()
+    d, us = _ink_trial_units(c, s, trial, name, set_key, units)
+    if Path(out).resolve() == Path(s.weights.path).resolve():
+        raise GneError("BAD_ARGS", "输出与原始文件相同")
+    z = np.load(d / "directions.npz")
+    refs = layer_refs(s.weights.inkling, {k: z[k] for k in ("ffn_mix", "ffn_in", "out")}, "after")
+    r = bake(SimpleNamespace(w=s.weights, plan=s.weights.inkling), us, refs, Path(out), requant=requant)
+    lines = [f"[试运行] 烘焙：{r['path']}（{r['bytes'] / 2**30:.2f} GiB、原 {r['bytes_src'] / 2**30:.2f} GiB）"]
+    for m in r["modified"]:
+        lines.append(_inkling_bake_line(m))
+    if any((m.get("edit_kept") or 1.0) < 0.9 for m in r["modified"]):
+        lines.append("  注意：重新量化后存在编辑丢失 1 成以上的张量（可用 --requant q8_0 或 f16 重写）")
+    lines.append(f"记录：{r['sidecar']}")
+    return r, "\n".join(lines), 0
+
+
+@gne_command(inkling_app, "chips-bake-check", "inkling chips-bake-check")
+def inkling_chips_bake_check_cmd(c: Common, holder: dict,
+                                 mode: str = typer.Option(..., "--mode", help="lora（原模型 + LoRA）、baked（烘焙后的 GGUF）、replies（仅回复）"),
+                                 save: Path = typer.Option(..., "--save", help="写入测量值的 JSON"),
+                                 against: Optional[Path] = typer.Option(None, "--against", help="要比较的 lora 侧 JSON"),
+                                 name: str = typer.Option("trial", "--name"), trial: Optional[Path] = _INK_TRIAL,
+                                 set_key: Optional[str] = _INK_SET, units: Optional[str] = _INK_UNITS,
+                                 spec: Path = typer.Option(Path(__file__).resolve().parent.parent / "configs" / "pipeline" / "pirate_tone.json",
+                                                           "--spec", exists=True),
+                                 n_a: int = typer.Option(4, "--n-a"), n_b: int = typer.Option(2, "--n-b"),
+                                 reply_tokens: int = typer.Option(256, "--reply-tokens"),
+                                 recipe: Optional[Path] = typer.Option(None, "--recipe", help="gne heads pipeline 的配方（--mode lora。方向为配方方向）"),
+                                 direction: Optional[Path] = typer.Option(None, "--direction", help="方向 .npz（gne heads pipeline 的方向。用烘焙后的 GGUF 测量时）")):
+    """[試し] 焼き込みの確かめ。同じ組で、元のモデル + LoRA(--mode lora)と焼き込んだ GGUF(-m に焼き込んだもの、--mode baked)の
+    中の値(各段の MLP の入力と最後に混ぜた出力の、方向への射影)と貪欲の応答を比べる。--mode replies は中の値を読めない
+    llama.cpp(名前の patch なし)で読み込んで応答だけ。"""
+    from .inkling_chips import bake_check, bake_compare
+    if mode not in ("lora", "baked", "replies"):
+        raise GneError("BAD_ARGS", "--mode 必须为 lora、baked 或 replies")
+    s = holder["session"] = c.session()
+    ds = None
+    if recipe is not None:                                     # gne heads pipeline のレシピ: 方向はレシピの方向
+        from .headproj import proj_heads
+        from .inkling_pipeline import chips_unit
+        rr = s.recipe(path=recipe)
+        hs = [p for p in proj_heads(rr) if p.s]
+        # 測る向きはレシピの既定の方向(残りから追加の合わせたレシピなら元の一括の方向)。LoRA はレシピのもの(いくつかの方向もまとめる)
+        ds = s.direction_set(rr.default_direction or hs[0].direction)
+        units = json.dumps([chips_unit(p) + [p.direction] for p in hs])
+        lora_path = (s.lora_for(rr) or [[None]])[0][0] if mode == "lora" else None
+    elif direction is not None:
+        from .direction import DirectionSet
+        ds = DirectionSet.load(direction)
+    if mode != "lora" and not units and not set_key:          # 焼き込んだ GGUF の記録(<GGUF>.chips.json)の組
+        side = Path(str(s.weights.path) + ".chips.json")
+        if side.exists():
+            units = json.dumps(json.loads(side.read_text(encoding="utf-8"))["units"])
+    if ds is not None:
+        d, us = None, [[int(u[0]), str(u[1]), u[2], float(u[3]), *(u[4:5])] for u in json.loads(units)]
+    else:
+        d, us = _ink_trial_units(c, s, trial, name, set_key, units)
+    r = bake_check(s, d, us, spec, mode=mode, n_a=n_a, n_b=n_b, reply_tokens=reply_tokens, ds=ds,
+                   lora_path=locals().get("lora_path"))
+    r["model"] = Path(s.weights.path).name
+    Path(save).write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
+    g = r["greedy"]
+    lines = [f"[试运行] 烘焙校验（{mode}，{Path(s.weights.path).name}）：回复 {len(g['tokens'])} 个、{g['n_tokens']} token、"
+             f"{g['n_tokens'] / max(g['seconds'], 1e-9):.1f} token/秒"]
+    if against:
+        lo = json.loads(Path(against).read_text(encoding="utf-8"))
+        if lo["units"] != r["units"]:
+            raise GneError("BAD_ARGS", "要比较的 JSON 与组不同")
+        cmp = bake_compare(s.weights.inkling, lo, r)
+        r["compare"] = cmp
+        Path(save).write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
+        for rg, v in (cmp.get("proj_by_region") or {}).items():
+            lines.append(f"  {rg}：差 ÷ LoRA 的移动（中位数）{v['diff_over_edit_median']:.3f}、差 ÷ 原值（最大）{v['diff_over_base_max']:.2e}、"
+                         f"LoRA 的移动 ÷ 原值（中位数）{v['edit_over_base_median']:.3f}")
+        if "out" in cmp:
+            lines.append("  最后混合输出：差 ÷ LoRA 的移动 " + ", ".join(f"{x:.3f}" for x in cmp["out"]["diff_over_edit"]))
+        gg = cmp["greedy"]
+        lines.append(f"  贪心回复：相同 {gg['same']}/{gg['n']}、首个不同 token {gg['first_diff']}、长度 {gg['lens']}、"
+                     f"速度 LoRA {gg['tok_per_s'][0]:.1f} / 本实现 {gg['tok_per_s'][1]:.1f} token/秒")
+    lines.append(f"保存：{save}")
+    return r, "\n".join(lines), 0
+
+
+@gne_command(inkling_app, "experts", "inkling experts")
+def inkling_experts_cmd(c: Common, holder: dict, spec: Path = _INK_SPEC, max_prompts: Optional[int] = _INK_MAX,
+                        name: Optional[str] = _INK_NAME):
+    """段ごとの専門家の選ばれ方(全トークン)と、繰り返しの層で同じトークンに回どうしが選んだ 8 個の重なり。"""
+    import numpy as np
+
+    from .inkling_read import experts
+    s, r = _ink_reader(c, holder)
+    A, B, nm = _ink_convs(spec, max_prompts)
+    d = experts(r, A + B)
+    d["path"] = _ink_save(s, name or nm, "experts", d)
+    lines = [f"专家选择方式（{d['n_tokens']} 个 token）。5 成、9 成 = 占被选次数该比例的专家数量"]
+    for st in d["steps"]:
+        lines.append(f"{_ink_step(st)}  5 成 {st['n50']:>3}  9 成 {st['n90']:>3}  被选中 {st['n_used']:>3}  "
+                     f"最大权重的平均 {st['w_max_mean']:.2f}")
+    lines.append("同一 token 各次重复选择的专家重叠（共同数 ÷ 8）：" + "; ".join(
+        f"层 {x['layer']} {x['passes'][0]}-{x['passes'][1]} {x['mean']:.2f}" for x in d["overlap"]))
+    lines.append(f"保存：{d['path']}")
     return d, "\n".join(lines), 0
 
 

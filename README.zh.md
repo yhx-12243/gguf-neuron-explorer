@@ -58,6 +58,7 @@
 - 尚未测试 Metal。
 - MoE 模型：granite-3.1-1b-a400m 和 LFM2-8B-A1B。参见[混合专家](#混合专家)。
 - SenseNova-Loop-9B（arch `sensenova_loop`，第 4–27 层运行两次）。官方 llama.cpp 目前还无法加载它：需要一个专用环境，使用两种 llama.cpp fork 之一（各自使用自己的 GGUF 文件），并对 llama-cpp-python 0.3.36 做修正。模型团队的 fork（OpenSenseNova/llama.cpp，基于 llama.cpp 1.0）读取 sensenova/SenseNova-Loop-9B-GGUF 的官方 GGUF 文件，包括 BF16；GuideboardLabs fork（基于 llama.cpp 0.8）读取 guideboardlabs/SenseNova-Loop-9B-GGUF，生成速度约快 5 倍。该选哪个见 [docs/sensenova_loop.md](docs/sensenova_loop.md)，补丁见 [third_party/sensenova-loop/](third_party/sensenova-loop/README.md)。
+- Inkling-2-Mini（arch `inkling2_loop`，第 6–17 层运行三次，并在回答前写思考的 MoE）。gne 可以读取其内部（`gne inkling …`），运行 CHiPS 流程（方向、对每个注意力头 / 注意力整体 / 整个 MLP / 专家神经元排序、组、配方）与“从剩余中添加”，导出 LoRA，按原大小烘焙配方（也可烘焙到同一模型的另一量化），在思考后的回答上评估，并进行折叠思考的对话。FiSH、键、lens 等其他基于方向的功能会给出原因后停止。需要合并了 PR #32704 的提交（`690b87d8`，2026-11-21）或之后版本的 llama.cpp、用于读取内部的名称补丁 [third_party/inkling2/](third_party/inkling2/README.md)，以及修正 llama-cpp-python 0.3.36 的专用环境。主要在 UD-IQ2_XXS 和公开模板上验证。参见 [docs/inkling2.md](docs/inkling2.md)。
 - 对于尚未使用过的模型，请先运行 `gne verify`。
 
 ## 安装
@@ -567,6 +568,8 @@ r = client.chat.completions.create(
 
 在命令行中，`gne steer --audio speech.wav --system "Respond in text." --recipe ...` 效果相同。
 
+请求中的 `reasoning_effort` 在聊天模板使用它时（Inkling 2，以及 gpt-oss 等会读取它的其他模板；命令行中为 `gne chat --reasoning-effort`）会传给模板，否则会被忽略。对于 Inkling 2，回复会把思考放在 `reasoning_content`、回答放在 `content` 中返回，流式时也是如此（[docs/inkling2.md](docs/inkling2.md)）。
+
 `"recipe"` 不用 `units`，而是接收 `~/.gne/recipes` 下保存的配方名称；`"scale"` 会乘以配方的剂量。除非请求将 `temperature` 设为大于 0，或设置 `top_p`、`top_k`、`min_p`、`presence_penalty`、`seed` 中的任意一项，或者配方带有 `sampling`，否则生成使用 greedy；之后会按 llama.cpp 的顺序采样。未提供的值来自配方的 `sampling` 或 llama-server 的默认值。不支持 tools 和 logprobs。请求会与 UI 聊天共享 GPU。
 
 服务器不保存状态，因此强度可以在对话中的任何时候变化：随消息发送 `"gne": {"recipe": "yandere_qwen38_27b", "scale": 0.7, "when": "ramp:0.5-1.5"}`，并可随时修改 `scale` 和 `when`。[`examples/strength/strength_chat.py`](examples/strength/strength_chat.py) 维护一个 0 到 100 的强度，可在聊天中输入 `/s 70` 修改，或由另一个程序通过文件修改（例如游戏事件、直播中的计量条）。它在每条消息前使用 [docs/verification.md](docs/verification.md)（F94、F96）中的测量结果将强度映射到 `when` 和 `scale`。每次请求都会重新读取整段对话，因此新的强度也会改变之前回合的读取方式（使用 `all` 和 `assistant` 时），而长历史会使每条回复开始得更晚。
@@ -611,6 +614,7 @@ python -m pytest -q
 - [FiSH：改写少数闲置神经元，让模型只在特定场景改变语气](https://balaena01.github.io/fish-steering/)：文章，包含测量结果与数据。
 - [docs/qwen4exp.md](docs/qwen4exp.md)：Qwen3.8-Flash-Next（`qwen4exp`）：分割 GGUF 文件、四条残差流，以及在不使用 control vector 时哪些功能可用。
 - [docs/sensenova_loop.md](docs/sensenova_loop.md)：SenseNova-Loop-9B（`sensenova_loop`）：如何构建环境、层运行两次时的层编号、改写作用于两次运行还是单次运行，以及按运行分别运行 CHiPS。
+- [docs/inkling2.md](docs/inkling2.md)：Inkling-2-Mini（`inkling2_loop`）：如何构建环境、结构（三次运行、多条残差流）、段编号、对话中的思考、读取内部、CHiPS 流程、导出与烘焙（原大小、`--into`）、评估，以及哪些功能会停止。
 - [docs/head-component-steering.md](docs/head-component-steering.md)：CHiPS，只改变少数由因果选出的注意力头中沿方向的分量（`mode: proj`、`gne direction score`、`gne heads causal`、`gne heads allocate`、`gne eval --compare-methods`），以及它与全层消融的关系。
 - [docs/keyed-write.md](docs/keyed-write.md)：键控写入。只有当从对照集构建的键对写入残差流的权重矩阵输入产生反应时，才进行秩 1 写入（`mode: keyed`、`gne direction key`、`gne direction key-check`），包含句子结尾的完整示例、它与 CHiPS 的关系，以及如何寻找键有效的位置（`gne direction key-causal`）。
 - [docs/persona_workflow.md](docs/persona_workflow.md)：从神经元逐步构建人格（使用 `examples/persona_neurons/` 中的脚本，并以病娇案例作为完整示例），并从示例对话中提取注意力头与神经元。

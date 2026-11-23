@@ -85,9 +85,15 @@ class Live:
             seed = vals.pop("seed", None)
             sampling = Sampling(**vals, seed=seed if seed is not None else int.from_bytes(uuid.uuid4().bytes[:4], "little"))
         system = body.get("system")
+        from ..chat import effort_value                  # チャットテンプレートに渡す思考の量(reasoning_effort。無ければ既定)
+        effort = effort_value(self.s.engine.chat_template, body.get("reasoning_effort"))
         from ..media import http_content                 # 音声の部品(base64)。ローカルのファイルは読ませない
         hist = [[{**m, "content": http_content(m.get("content")) if m.get("role") == "user" else m.get("content")}
                  for m in (c.get("messages") or [])] for c in cols]
+        if getattr(getattr(self.s, "weights", None), "inkling", None) is not None:
+            from ..inkling import answer_part              # Inkling 2: 前の返事の思考の欄は履歴に入れない(回答だけ)
+            hist = [[{**m, "content": answer_part(m["content"])} if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+                     else m for m in h] for h in hist]
         sid = uuid.uuid4().hex[:8]
         stop = threading.Event()
         self._streams[sid] = stop
@@ -103,7 +109,7 @@ class Live:
                         if stop.is_set():
                             break
                         # CHANGE-05: 専門家全体の gain・route は作業用コピーで読み直して生成する(抜けると元に戻す)
-                        with self.s.patched(self.s.patches_for(r)) as e:
+                        with self.s.patched(self.s.patches_for(r)) as e, e.with_template_vars(reasoning_effort=effort):
                             ctx = e.steer_ctx()
                             msgs = ([{"role": "system", "content": system}] if system else []) + hist[i]
                             ids = e.chat_ids(msgs)
@@ -113,18 +119,28 @@ class Live:
                             vecs = self.s.vectors(r)[0] if r is not None else None
                             q.put({"type": "column", "col": i, "n_prompt": len(ids)})
                             dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                            marks = None
+                            if getattr(getattr(self.s, "weights", None), "inkling", None) is not None:
+                                from ..inkling import ReplyMarks       # Inkling 2: 思考の欄を <think> … </think> で見せる
+                                marks = ReplyMarks(e)
 
-                            def cb(_si, tok, _i=i, _dec=dec):
+                            def cb(_si, tok, _i=i, _dec=dec, _marks=marks):
                                 if stop.is_set():
                                     raise _Stopped()
-                                piece = _dec.decode(e.token_bytes(tok))
+                                mark = _marks.piece(tok) if _marks is not None else None
+                                piece = _dec.decode(b"", final=True) + mark if mark is not None else _dec.decode(e.token_bytes(tok))
                                 if piece:
                                     q.put({"type": "text", "col": _i, "text": piece})
                             try:
                                 out, winfo = generate_when(e, ctx, msgs, vecs, w, max_tokens=max_tokens, on_token=cb,
                                                            lora=self.s.lora_for(r), sampling=sampling)
-                                q.put({"type": "end", "col": i, "text": out.text, "finish": out.finish, "n_gen": out.n_gen,
-                                       "when": winfo})
+                                text = marks.render(e, out.token_ids) if marks is not None else out.text
+                                rt = None
+                                if marks is not None:                  # 思考の長さ(画面の思考の欄の見出し)
+                                    from ..inkling import reasoning_tokens
+                                    rt = reasoning_tokens(marks, out.token_ids)
+                                q.put({"type": "end", "col": i, "text": text, "finish": out.finish, "n_gen": out.n_gen,
+                                       "when": winfo, **({"reasoning_tokens": rt} if rt is not None else {})})
                             except _Stopped:
                                 q.put({"type": "end", "col": i, "text": None, "finish": "stopped", "n_gen": None})
                                 break

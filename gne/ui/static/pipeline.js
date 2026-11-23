@@ -110,8 +110,19 @@ export function checkSpec(text) {
 
 // "16:H8:s15.65@evil" → { layer, head, s, direction }
 const parseUnit = (u) => { const m = String(u).match(/^(\d+):H(\d+):s([^@]+)(?:@(.+))?$/i); return m ? { layer: +m[1], head: +m[2], s: +m[3], direction: m[4] || null } : null; };
+// Inkling 2 の段の表(/api/model の inkling。PipelinePanel が作られたときに入れる)。部品の名前に回を出し、パネルへのリンクは付けない
+let INK = null;
+const inkMark = (L) => (INK && L >= INK.core_start && L < INK.core_end ? ` ×${INK.n_passes}` : "");
+const inkTip = (L) => (INK && L >= INK.core_start && L < INK.core_end
+  ? t("層 {a}〜{b} の重みは {n} 回の繰り返しで共有なので、この部品の書き換えは {n} 回すべてに効きます", { a: INK.core_start, b: INK.core_end - 1, n: INK.n_passes })
+  : t("繰り返しの外の層(1 回だけ実行)"));
+const inkWho = (u) => (u.kind === "neuron" ? (u.expert !== undefined && u.expert !== null ? `E${u.expert} N${u.head ?? u.index}` : `N${u.head ?? u.index}`)
+  : u.kind === "layer_attn" ? "attn" : u.kind === "layer_mlp" ? "ffn" : `H${u.head ?? u.index}`);
+// 測る点の名前(段の番号から。サーバーの label は日本語なので、英語の画面ではここで作る)
+const inkPoint = (x) => (x.layer === 48 ? t("最後に混ぜた出力") : t("段 {s}", { s: x.layer }));
 // 部品の印: ヘッドは HEAD パネルへのリンク、ニューロン(L:Nn)は文字だけ
-const unitChip = (u, extra = "") => (u.kind === "neuron" ? `<a href="#" class="pp-head mono" data-neuron="${u.layer}:${u.head ?? u.index}" title="${t("NEURON パネルで開く")}">L${u.layer} N${u.head ?? u.index}${extra}</a>`
+const unitChip = (u, extra = "") => (INK ? `<span class="mono" title="${esc(inkTip(u.layer))}">L${u.layer} ${inkWho(u)}${inkMark(u.layer)}${extra}</span>`
+  : u.kind === "neuron" ? `<a href="#" class="pp-head mono" data-neuron="${u.layer}:${u.head ?? u.index}" title="${t("NEURON パネルで開く")}">L${u.layer} N${u.head ?? u.index}${extra}</a>`
   : u.kind === "layer_attn" ? `<span class="mono" title="${t("層の注意の出力全体(attn_output、線形注意の層は ssm_out)")}">L${u.layer} attn${extra}</span>`
   : u.kind === "layer_mlp" ? `<span class="mono" title="${t("層の MLP の出力全体(ffn_down)")}">L${u.layer} ffn${extra}</span>`
   : headChip(u.layer, u.head ?? u.index, extra));
@@ -152,7 +163,7 @@ const mrNext = (mr, refine) => {
   return t("A 側が最も下がったのは、{w}です(A 平均 {a})。チャットで強さを調整して、応答を確かめてください(「この強さをレシピに反映」で保存できます)。", { w: which, a: fmt(a, 2) })
     + (mr.replies_break ? ` <span class="ng">${t("ただし、この組は応答での確かめで応答が壊れました(繰り返し・空が増えた)。強さを下げてから使ってください。")}</span>` : "");
 };
-const partName = (q) => (q.kind === "neuron" ? `L${q.layer} N${q.head}` : q.kind === "layer_attn" ? `L${q.layer} attn` : q.kind === "layer_mlp" ? `L${q.layer} ffn` : `L${q.layer} H${q.head}`);
+const partName = (q) => (q.kind === "neuron" ? `L${q.layer} ${q.expert !== undefined && q.expert !== null ? `E${q.expert} ` : ""}N${q.head}${inkMark(q.layer)}` : q.kind === "layer_attn" ? `L${q.layer} attn` : q.kind === "layer_mlp" ? `L${q.layer} ffn` : `L${q.layer} H${q.head}`);
 
 // 層ごとの cohen_d の小さな棒グラフ(SVG)。基準層は白、cohen_d 最大の層は緑。棒にマウスを当てると値
 function dChart(layers, base, best) {
@@ -170,8 +181,11 @@ function dChart(layers, base, best) {
 }
 
 export class PipelinePanel {
-  constructor(root, { onRun, onShowDirection, onOpenHead, onOpenNeuron, onLoadProj, onEval, onOverlay, onOpenCandidates, isLoop, writesBlocked } = {}) {
+  constructor(root, { onRun, onShowDirection, onOpenHead, onOpenNeuron, onLoadProj, onEval, onOverlay, onOpenCandidates, isLoop, writesBlocked,
+                      inkling, onChatProj } = {}) {
+    this.onChatProj = onChatProj || ((name, specs, dir) => this.onLoadProj(name, specs, dir));   // (名前, 部品, 方向) → レシピを置き換えて 3 列チャット
     this.isLoop = isLoop || (() => false);       // 同じ層を 2 回実行するモデル(ループの中の部品の方向の欄を出す)
+    this.inkling = inkling || (() => null);      // Inkling 2 の段の表(答えの前に思考を書くモデル。位置の選択と、使えない欄を変える)
     // このモデルで書き込みの量での順位づけ(rank writes)を実行しない理由の文(実行できれば null)。サーバーの既定の切り替えと同じ条件:
     // 残差が複数本の流れ(hyper-connections)、注意の出力のあとに正規化がある層(v0.9.0)
     this.writesBlocked = writesBlocked || (() => null);
@@ -242,6 +256,7 @@ export class PipelinePanel {
       <p class="muted note" id="pp-nores">${t("まだ結果がありません。「1. 対照の文」で「方向とヘッドを作る」を押すか、「これまでの実行」から開いてください。")}</p>
       <div id="pp-result"></div>`;
     this.$ = (s) => root.querySelector(s);
+    this.inklingForm();
     const ta = this.$("#pp-text");
     try { ta.value = localStorage.getItem(DRAFT) || ""; } catch { /* 下書きが無くても使える */ }
     ta.addEventListener("input", () => this.check());
@@ -276,7 +291,7 @@ export class PipelinePanel {
     this.steps = new Steps(root, {
       shared: this.$("#pp-shared"), store: "gne.chips.step", label: t("CHiPS の手順"), extra: () => [this.$("#pp-nores")],
       steps: [{ key: "input", label: t("1. 対照の文"), els: () => [this.$("#pp-input"), this.$("#pp-run")], shared: true },
-              { key: "dir", label: t("2. 方向と基準層"), els: res("section.pp-stage:nth-of-type(1)") },
+              { key: "dir", label: this.inkling() ? t("2. 方向と測る点") : t("2. 方向と基準層"), els: res("section.pp-stage:nth-of-type(1)") },
               { key: "causal", label: t("3. 効くヘッドを探す"), els: res("section.pp-stage:nth-of-type(2)") },
               { key: "alloc", label: t("4. 配り方を決める"), els: res("section.pp-stage:nth-of-type(3), section.pp-stage:nth-of-type(4), section.pp-stage:nth-of-type(5)") },
               { key: "cand", label: t("5. 強さの候補を作る"), els: res(".pp-cand") },
@@ -288,6 +303,38 @@ export class PipelinePanel {
   }
 
   $$(s) { return [...this.root.querySelectorAll(s)]; }
+
+  // Inkling 2: 位置の選択(答えの始まりなど)、使えない欄(止めて選ぶ・質問を分ける・ループの方向・作り済みの方向)を止め、このモデル用の既定を入れる
+  inklingForm() {
+    const ink = this.inkling();
+    INK = ink || null;
+    if (!ink) return;
+    const pos = this.$("#pp-pos");
+    pos.innerHTML = [["last", t("質問の最後(既定)")], ["answer", t("答えの始まり(思考の後)")], ["response", t("答えのトークン全部")],
+                     ["reasoning", t("思考のトークン全部")], ["after", t("答えの中の一致の直後(正規表現)")], ["all", t("質問のトークン全部")]]
+      .map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+    pos.closest("label").title = t("方向を作り、射影の値を測る位置。このモデルは答えの前に必ず思考を書くので、質問の最後で作った方向は、思考と答えを書く位置では差が小さくなることがあります。答えの口調や書き方を狙うときは「答えの始まり」か「答えのトークン全部」も試してください(どちらも、書き換える前のモデルに返事を書かせてから読むので遅い)");
+    pos.closest("label").insertAdjacentHTML("afterend", `<label class="muted" id="pp-pos-re-l" hidden>${t("正規表現")} <input id="pp-pos-re" size="10" spellcheck="false" placeholder="[.!?]"></label>`
+      + `<p class="muted note" id="pp-ink-note">${esc(t("Inkling 2: 方向は MLP が読む入力(層 6〜17 は 3 回目)で作り、部品はヘッド・注意全体・MLP 全体・専門家のニューロンから選びます。層 6〜17 の重みは 3 回の繰り返しで共有なので、その層の部品は 3 回すべてに効きます。名前の patch を当てた llama.cpp が要ります(docs/inkling2.md)"))}</p>`);
+    pos.addEventListener("change", () => { this.$("#pp-pos-re-l").hidden = pos.value !== "after"; });
+    const rank = this.$("#pp-rank");
+    rank.value = "writes";
+    rank.querySelector("option[value=causal]").disabled = true;
+    const rb = this.$("#pp-rank-blocked");
+    rb.hidden = false;
+    rb.textContent = t("Inkling 2 では「止めて選ぶ」はまだ使えません");
+    const kinds = this.$("#pp-kinds");                // このモデルの部品(線形注意は無い)と既定(ヘッド・ニューロン・層全体)
+    kinds.innerHTML = [["heads", t("ヘッドだけ")], ["all", t("ヘッドと専門家のニューロン")], ["heads,layers", t("ヘッドと層全体")],
+                       ["all,layers", t("ヘッド・専門家のニューロン・層全体(既定)")]].map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+    kinds.value = "all,layers";
+    this.$("#pp-mx").value = 32;
+    this.$("#pp-mx").closest("label").title = t("このモデルでは、方向づくりと射影の値を測る段(順位づけ・確かめ・配分)の両方で、側ごとにこの数の質問を使う(等間隔に間引く。既定 32)。答えの始まりなどの位置では、質問 1 つごとに返事を書かせるので、全部の質問を使うと時間がかかるため");
+    this.$("#pp-ckt").value = 1024;
+    this.$("#pp-ckt").closest("label").title = t("応答での確かめで書かせる長さの上限(トークン、このモデルの既定 1024。答えの前に思考を書くので長め)");
+    for (const id of ["#pp-holdout", "#pp-loopdir", "#pp-fromdir"]) { const l = this.$(id).closest("label"); if (l) l.hidden = true; }
+    this.$("#pp-kinds").closest("label").insertAdjacentHTML("afterend",
+      `<label class="muted" title="${t("層 0〜5(繰り返しの前)の部品も候補に入れる。既定は入れない")}"><input type="checkbox" id="pp-before"> ${t("層 0〜5 も候補に入れる")}</label>`);
+  }
 
   // 手順の印(済・実行中・まだ)
   marks() {
@@ -399,6 +446,14 @@ export class PipelinePanel {
   // 候補の探し方に合わせて、使わない設定のまとまりを無効にする(値は残すが、ジョブには渡さない)。ループの中の部品の方向は、
   // 同じ層を 2 回実行するモデルのときだけ選べる
   rankFields() {
+    if (this.inkling()) {                          // Inkling 2: 書き込みの量で選ぶ流れだけ
+      this.$("#pp-rank").value = "writes";
+      this.$("#pp-fs-writes").disabled = false;
+      this.$("#pp-fs-causal").disabled = true;
+      this.$("#pp-fs-writes-off").hidden = true;
+      this.$("#pp-fs-causal-off").hidden = false;
+      return;
+    }
     const why = this.writesBlocked(), opt = this.$("#pp-rank option[value=writes]"), note = this.$("#pp-rank-blocked");
     opt.disabled = !!why;
     note.hidden = !why;
@@ -427,6 +482,11 @@ export class PipelinePanel {
     const hard = num("#pp-hard", 1);
     if (hard === null) { this.status(t("残りやすい質問の数は 1 以上の整数で"), true); return null; }
     const p = { spec: c.spec, max_examples: mx, positions: this.$("#pp-pos").value, hard };
+    if (this.inkling() && p.positions === "after") {                  // Inkling 2: 答えの中の一致の直後
+      const re = this.$("#pp-pos-re").value;
+      if (!re) { this.status(t("正規表現を入れてください(例 [.!?])"), true); return null; }
+      p.positions = `after:${re}`;
+    }
     if (this.$("#pp-fresh").checked) p.resume = false;
     const fd = this.$("#pp-fromdir").value;
     if (fd) p.from_direction = fd;                                    // 作り済みの方向で流す(方向づくりを飛ばす)
@@ -444,6 +504,10 @@ export class PipelinePanel {
       Object.assign(p, { unit_kinds: this.$("#pp-kinds").value, n_units: nu, verify_top: vt, check_replies: ck, check_tokens: ct,
                          holdout: this.$("#pp-holdout").checked, strength: this.$("#pp-strength").value });
       if (this.isLoop()) p.loop_direction = this.$("#pp-loopdir").value;
+      if (this.inkling()) {                                             // Inkling 2: 質問を分ける確かめは無い。層 0〜5 は指定したときだけ
+        delete p.holdout;
+        if (this.$("#pp-before").checked) p.include_before = true;
+      }
     } else {
       const nh = ints("#pp-nheads");
       if (!nh.length || !nh.every((x) => Number.isInteger(x) && x >= 1)) { this.status(t("ヘッド数は 1 以上の整数をカンマ区切りで(例 6,5,4)"), true); return null; }
@@ -505,6 +569,7 @@ export class PipelinePanel {
       ${c ? `<p><b>${t("代表の合わせたレシピ({m} 個 = {parts})", { m: c.n_heads, parts: byRound || "—" })}</b>${c.chosen_by === "fewest_remaining" ? ` <span class="muted">${t("(足した組に推す組が無いので、合わせた残りが最も少ない組)")}</span>` : ""}: ${t("残り {a} → {b} 問", { a: c.remain_before, b: c.remain_after })} ·
         ${t("A 平均 {a} → {b}", { a: fmt(c.a_mean_before, 2), b: fmt(c.a_mean_after, 2) })} · B Δ ${sgn(c.b_delta, 2)} · ${t("B ⊥ {a} → {b}", { a: fmt(c.b_drift_orth_base, 3), b: fmt(c.b_drift_orth, 3) })}
         <button class="small" id="pp-rf-load" title="${t("元の組と足した組を合わせたユニット(全部の回)で今のレシピを置き換える")}">${t("合わせた組でレシピを置き換える")}</button>
+        ${INK ? `<button class="small" id="pp-rf-chat" title="${t("土台と足した組を合わせたレシピに置き換えて、3 列チャット(レシピ ×−1・無介入・×+1)を開く。このモデルは応答を読んで決めるので、まずここで試す")}">${t("合わせた組で 3 列チャット")}</button>` : ""}
         <button class="small" id="pp-rf-eval" title="${t("合わせた組のレシピを評価の画面へ送る(強さ 0 と 1、ランダムな向きの比べる用 8 本が入る。始める前に変えられる)")}">${t("合わせた組を評価へ送る")}</button></p>`
         : (r.combined_rows || []).length ? `<p class="ng"><b>${r.no_recommend === "replies_break" ? t("推せる行の合わせたレシピは、どれも応答が壊れました。") : t("どの行も、合わせると元の方向・元の目標で良くならない(残りが減らず、組の効きも上がらない)か、悪くなります。")}</b></p>
           <p class="note">${t("道具の基準では、足す行を 1 つに決められませんでした。土台のままが無難ですが、候補の行は下の表に残っていて選べます。")} ${mrNext(r.most_reduced, true)}</p>`
@@ -590,7 +655,9 @@ export class PipelinePanel {
       ${this.refineNote(d)}
       ${(d.reused || []).length ? `<p class="note muted">${t("同じ JSON・同じ設定で作り済みの{w}を使い回しました(作り直すときは「最初から作り直す」に印を付けて流し直す)",
         { w: d.reused.map((x) => (x === "direction" ? t("方向") : x === "causal" ? t("因果の結果") : x)).join(t("と")) })}</p>` : ""}
-      <p class="note">${t("目標: L{L} の A 側の射影の値を {v} まで({src})", { L: (d.causal && (d.causal.score_layers || []).slice(-1)[0]) ?? "—", v: fmt(d.target, 2),
+      <p class="note">${d.inkling ? t("目標: 最後に混ぜた出力の A 側の射影の値を {v} まで({src})", { v: fmt(d.target, 2),
+        src: esc(d.target_from === "settings" ? t("設定") : d.target_from ? t(d.target_from) : "—") })
+        : t("目標: L{L} の A 側の射影の値を {v} まで({src})", { L: (d.causal && (d.causal.score_layers || []).slice(-1)[0]) ?? "—", v: fmt(d.target, 2),
         src: esc(d.target_from === "settings" ? t("設定") : d.target_from ? t(d.target_from) : "—") })}${this.recText(d)}${this.oldRefineNote(d)}${d.refine
         ? `<br><span class="muted">${t("(この目標は、足す組を探したときの新しい方向でのものです。表の合わせたレシピの数と推す行は、元の方向 {dir} の目標 {thr} で決めています)", { dir: esc(d.refine.direction || d.refine.root || d.refine.base), thr: fmt(d.refine.threshold, 2) })}</span>` : ""}</p>
       <div class="pp-actions"><button class="small" id="pp-showdir" title="${t("上の「方向を見る」で、この方向の層ごとの射影の値と分布を見る")}">${t("方向を見る")}</button>
@@ -626,6 +693,13 @@ export class PipelinePanel {
     if (more) more.addEventListener("click", () => { for (const tr of out.querySelectorAll("table.pp-eta tr.pp-more")) tr.classList.remove("hidden"); more.remove(); });
     const table = (d.allocate && d.allocate.table) || [];
     const crow = (key) => combinedRow(d, key);
+    const ink = d.inkling || (d.refine && d.refine.inkling);
+    if (ink) {                                     // Inkling 2: 評価は思考の後の回答で測る(ランダムな向きの比べる用はまだ無い)
+      for (const b of out.querySelectorAll("[data-eval], #pp-rf-eval")) {
+        b.title = t("このレシピを評価の画面へ送る(強さ 0 と 1。Inkling 2 は思考の後の回答で測り、問題を少なめにする。ランダムな向きの比べる用はまだ無い。始める前に変えられる)");
+      }
+    }
+    const evp = (recipe) => ({ recipe, doses: [0, 1], random_controls: ink ? 0 : 8 });   // 評価の画面へ送る設定
     for (const b of out.querySelectorAll("[data-load]")) {
       b.addEventListener("click", () => {
         if (d.refine) {                                                  // 残りから追加の結果: どの行も土台と合わせたレシピだけ
@@ -642,23 +716,32 @@ export class PipelinePanel {
       b.addEventListener("click", () => this.runRefine(d.name, +b.dataset.refine, b));
     }
     const rf = d.refine && d.refine.combined;
-    const rl = $("#pp-rf-load"), re = $("#pp-rf-eval");
+    const rl = $("#pp-rf-load"), re = $("#pp-rf-eval"), rc = $("#pp-rf-chat");
     if (rf && rl) rl.addEventListener("click", () => this.onLoadProj(combinedName(d, rf), rf.units, d.name));
-    if (rf && re) re.addEventListener("click", () => this.onEval({ recipe: rf.recipe, doses: [0, 1], random_controls: 8 }, combinedName(d, rf)));
+    if (rf && rc) rc.addEventListener("click", () => this.onChatProj(combinedName(d, rf), rf.units, d.name));
+    for (const b of out.querySelectorAll("[data-chat]")) {             // 表の行: 土台 + 足した組(残りから追加)か、その組で 3 列チャット
+      b.addEventListener("click", () => {
+        if (d.refine) { const c = crow(b.dataset.chat); if (c) this.onChatProj(combinedName(d, c), c.units, d.name); return; }
+        if (b.dataset.chat === "s1") { const s1 = (d.allocate || {}).s1; if (s1) this.onChatProj(`${d.name}-s1`, s1.units, d.name); return; }
+        const r = table.find((x) => String(x.n_heads) === b.dataset.chat);
+        if (r) this.onChatProj(`${d.name}-n${r.n_heads}`, r.units, d.name);
+      });
+    }
+    if (rf && re) re.addEventListener("click", () => this.onEval(evp(rf.recipe), combinedName(d, rf)));
     for (const b of out.querySelectorAll("[data-eval]")) {
       b.addEventListener("click", () => {
         if (d.refine) {                                                  // 残りから追加の結果: どの行も土台と合わせたレシピだけ
           const c = crow(b.dataset.eval);
-          if (c && c.recipe) this.onEval({ recipe: c.recipe, doses: [0, 1], random_controls: 8 }, combinedName(d, c));
+          if (c && c.recipe) this.onEval(evp(c.recipe), combinedName(d, c));
           return;
         }
         if (b.dataset.eval === "s1") {                                   // 倍率を上げる前の組
           const s1 = (d.allocate || {}).s1;
-          if (s1 && s1.recipe) this.onEval({ recipe: s1.recipe, doses: [0, 1], random_controls: 8 }, `${d.name}-s1`);
+          if (s1 && s1.recipe) this.onEval(evp(s1.recipe), `${d.name}-s1`);
           return;
         }
         const r = table.find((x) => String(x.n_heads) === b.dataset.eval);
-        if (r && r.recipe) this.onEval({ recipe: r.recipe, doses: [0, 1], random_controls: 8 }, `${d.name}-n${r.n_heads}`);
+        if (r && r.recipe) this.onEval(evp(r.recipe), `${d.name}-n${r.n_heads}`);
       });
     }
   }
@@ -775,6 +858,19 @@ export class PipelinePanel {
   // 1. 方向と基準層
   stage1(d) {
     const sc = d.score || {}, dir = d.direction || {}, nr = dir.n_rows || {};
+    if (d.inkling) {                               // Inkling 2: 層ごとの基準は決まっているので、測る点の A と B の平均を並べる
+      const ink = d.inkling, sk = dir.skipped || {};
+      const rows = (sc.layers || []).map((x) => `<tr><td class="l">${esc(inkPoint(x))}</td><td>${fmt(x.A, 2)}</td><td>${fmt(x.B, 2)}</td><td>${fmt(x.A - x.B, 2)}</td></tr>`).join("");
+      const nu = ink.n_questions || {};
+      return `<section class="pp-stage"><h4>${t("1. 方向と測る点")}</h4>
+        ${nu.direction ? `<p class="note">${t("使った質問: 方向 A {da} / B {db}、測る段 A {ma} / B {mb}(対照集合 A {na} / B {nb} から、側ごとに最大 {mx} 問を等間隔に)", {
+          da: nu.direction.A, db: nu.direction.B, ma: nu.measure.A, mb: nu.measure.B, na: nu.total.A, nb: nu.total.B, mx: nu.max_examples ?? "—" })}</p>` : ""}
+        ${noteHTML(t("A と B で同じ質問を読ませ、段ごとに MLP が読む入力の平均の差を方向にします(層 6〜17 は 3 回目の段、繰り返しのゲートの後)。部品の射影の基準はその層の最後の段の方向です。組は「最後に混ぜた出力」で A 側の値を下げるように作ります。"), "muted note")}
+        <p class="note mono">positions ${esc(dir.positions || "—")} · ${t("方向を作った例")} A ${nr.A ?? "—"} / B ${nr.B ?? "—"}${
+          (sk.A || sk.B) ? ` · ${t("答えの始まりが無く読めなかった会話")} A ${sk.A || 0} / B ${sk.B || 0}` : ""}</p>
+        ${ink.position_kind === "last" ? `<p class="note">${t("このモデルは答えの前に必ず思考を書きます。質問の最後のトークンで作った方向は、思考と答えを書く位置では差が小さくなることがあります。答えの口調や書き方を狙うときは「答えの始まり」か「答えのトークン全部」も試してください")}</p>` : ""}
+        <table class="tbl pp-tbl"><tr><th class="l">${t("測る点")}</th><th>A</th><th>B</th><th>A − B</th></tr>${rows}</table></section>`;
+    }
     return `<section class="pp-stage"><h4>${t("1. 方向と基準層")}</h4>
       ${noteHTML(t("A と B で同じ質問を読ませ、層ごとに残差の平均の差を方向にします(質問は全部使う)。cohen_d は、A と B の射影の値(残差 · 方向)がどれだけ離れているか。いちばん離れる層を基準層として記録します。"), "muted note")}
       <p class="note mono">${t("基準層")} <b>L${sc.base_layer ?? "—"}</b> · ${t("cohen_d 最大")} L${sc.best_layer ?? "—"} · positions ${esc(dir.positions || "—")} · ${t("方向を作った例")} A ${nr.A ?? "—"} / B ${nr.B ?? "—"} · ${
@@ -844,6 +940,7 @@ export class PipelinePanel {
       const c = R ? combinedRow(d, key) : null, off = R && !c ? ` disabled` : "";
       const ttl = (x, y) => (R ? (c ? x : t("この行には土台と合わせたレシピがありません")) : y);
       return `<td class="l"><button class="small" data-load="${key}" title="${ttl(t("土台(元の組とそれまでの回の追加)と、この行の足した組を合わせたレシピで、今のレシピを置き換える(足した組は単独では使わない)"), t("この組(proj のユニット)で今のレシピを置き換える"))}"${off}>${R ? t("合わせてレシピを置き換える") : t("レシピを置き換える")}</button>
+          ${INK ? `<button class="small" data-chat="${key}" title="${R ? t("土台とこの行の足した組を合わせたレシピに置き換えて、3 列チャットを開く") : t("この組のレシピに置き換えて、3 列チャットを開く")}"${off}>${t("3 列チャット")}</button>` : ""}
           <button class="small" data-eval="${key}" title="${ttl(t("土台と、この行の足した組を合わせたレシピを評価の画面へ送る(強さ 0 と 1、ランダムな向きの比べる用 8 本が入る。始める前に変えられる)"), t("この組のレシピを評価の画面へ送る(強さ 0 と 1、ランダムな向きの比べる用 8 本が入る。始める前に変えられる)"))}"${r.recipe && !off ? "" : " disabled"}>${R ? t("合わせて評価へ送る") : t("評価へ送る")}</button>
           ${refine ? `<button class="small" data-refine="${key}" title="${R ? t("この行の合わせたレシピ(土台 + この組)を当てても元の目標まで下がらない質問だけで、もう一度足す部品を探す(重ねる)。結果は新しい一括の結果(名前 _r1 …)として出る") : t("この組を当てても目標まで下がらない質問(残り)だけで、組を当てたまま方向を作り直し、足す部品を探す。結果は新しい一括の結果(名前 _r1 …)として出る")}"${(R ? c && c.remain_after > 0 : r.remain > 0) ? "" : " disabled"}>${t("残りから追加")}</button>` : ""}</td>`;
     };

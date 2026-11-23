@@ -94,6 +94,30 @@ def reply_breaks(rows: dict) -> dict:
     return out
 
 
+def refine_proj_spec(u) -> str:
+    """残りから追加の結果に載せる部品の書き方(レシピの欄・UI と同じ L:Hh:sS@方向 など。専門家のニューロンは L:Ee:Nn、Inkling 2)。"""
+    who = {"neuron": f"N{u.neuron}", "attn": "attn", "ffn": "ffn",
+           "expert_neuron": f"E{u.expert}:N{u.neuron}"}.get(u.kind, f"H{u.head}")
+    return f"{u.layer}:{who}:s{float(u.k):.4g}@{u.direction}"
+
+
+def refine_parts(units, rounds, kind_of_layer) -> list[dict]:
+    """残りから追加の土台・足した組の部品の一覧(回の番号つき)。kind_of_layer(L) はヘッドの種類(attn / linear)。"""
+    out = []
+    for u, r_ in zip(units, rounds, strict=True):
+        kind = {"neuron": "neuron", "expert_neuron": "neuron", "attn": "layer_attn", "ffn": "layer_mlp"}.get(u.kind)
+        if kind is None:
+            try:
+                kind = kind_of_layer(u.layer)
+            except (AttributeError, IndexError):
+                kind = "attn"
+        out.append({"spec": refine_proj_spec(u), "layer": int(u.layer),
+                    "head": u.neuron if u.kind in ("neuron", "expert_neuron") else u.head,
+                    **({"expert": int(u.expert)} if u.kind == "expert_neuron" else {}),
+                    "kind": kind, "s": float(u.k), "direction": u.direction, "round": int(r_)})
+    return out
+
+
 class Session:
     def __init__(self, path: str | Path, *, root: str | Path | None = None, n_gpu_layers: int = -1,
                  n_ctx: int = 4096, n_seq_max: int = 8, seed: int = 0, verbose: bool = False,
@@ -208,13 +232,29 @@ class Session:
 
     def info(self, *, load: bool = True) -> dict:
         m = self.meta
+        ink = self.weights.inkling
         meta = {"path": str(m.path), "model_id": m.model_id, "name": m.name, "arch": m.arch, "n_layer": m.n_layer,
                 "n_embd": m.n_embd, "n_ff": m.n_ff, "n_ff_per_layer": m.n_ff_per_layer, "n_vocab": m.n_vocab,
                 "n_expert": m.n_expert, "has_post_ffn_norm": m.has_post_ffn_norm,
                 "ffn_down_scale": {str(k): v for k, v in m.ffn_down_scale.items()} if m.ffn_down_scale else None,
                 "tied_output": m.tied_output, "has_chat_template": bool(m.chat_template),
                 "ffn_down_qtype": m.ffn_down_qtype, "file_size": m.file_size,
-                "cvec_supported": m.arch not in NO_CVEC, "is_split": self.weights.gguf.is_split, "hc_streams": int(self.weights.field(f"{m.arch}.hyper_connection.count", 0) or 0)}
+                "cvec_supported": m.arch not in NO_CVEC and ink is None, "is_split": self.weights.gguf.is_split, "hc_streams": int(self.weights.field(f"{m.arch}.hyper_connection.count", 0) or 0)}
+        if ink is not None:                            # Inkling 2(inkling.py): 層の並びと段の対応。中を扱う機能は止まる
+            from .inkling import expert_tensors
+            meta["inkling"] = {**ink.to_dict(), "experts": expert_tensors(self.weights._tensors, ink.n_stored),
+                               "expert_used": int(self.weights.field(f"{m.arch}.expert_used_count", 0) or 0),
+                               "expert_width": int(self.weights.field(f"{m.arch}.expert_feed_forward_length", 0) or 0),
+                               "expert_weights_scale": self.weights.field(f"{m.arch}.expert_weights_scale"),
+                               "n_head": self.weights.field(f"{m.arch}.attention.head_count"),
+                               "n_head_kv": self.weights.field(f"{m.arch}.attention.head_count_kv"),
+                               "head_dim": int(self.weights.field(f"{m.arch}.attention.key_length", 0) or 0),
+                               "final_logit_softcapping": self.weights.field(f"{m.arch}.final_logit_softcapping")}
+            meta["internals_supported"] = False
+        from .chat import effort_choices                 # チャットテンプレートが reasoning_effort を使うなら、その名前(UI のチャットの欄)
+        eff = effort_choices(m.chat_template)
+        if eff is not None:
+            meta["reasoning_effort_choices"] = eff
         llama = None
         if load:
             try:
@@ -223,11 +263,17 @@ class Session:
                 if e.loop is not None:                 # 同じ層を 2 回実行するモデル: この llama.cpp で何ができるか
                     llama["loop"] = {"cvec_inner": e.loop_cvec_reaches(), "per_visit_names": e.loop_runtime_names(),
                                      "edits": e.loop_edits, **e.loop_graph(), "inner_resid": e.loop_inner_resid()}
-                if e.n_layer != m.n_layer:
+                if ink is not None:                    # llama.cpp の n_layer は実行順の段の数(保存されている層 + 繰り返しの分)
+                    if e.n_layer != ink.n_steps:
+                        self.warn(f"llama.cpp 的 n_layer {e.n_layer} 与按 GGUF 的重复次数计算出的段数 {ink.n_steps} 不一致"
+                                  "（请确认 llama.cpp 的版本）")
+                elif e.n_layer != m.n_layer:
                     self.warn(f"llama.cpp 的 n_layer {e.n_layer} 与 block_count {m.n_layer} 不一致（例如 MTP 层）")
             except Exception as ex:  # noqa: BLE001
                 llama = {"ok": False, "error": str(ex)}
         mode, reason, checked = bias_support(m.arch)
+        if ink is not None:
+            mode, reason = None, "Inkling 2 尚不支持改写内部的功能（docs/inkling2.md）"
         rp = self.store.resid_path(m.model_id)
         acts = sorted(int(p.stem.split("_L")[1]) for p in self.store.stats_dir(m.model_id).glob("act_L*.npz"))
         from .ablate import writer_info
@@ -236,7 +282,7 @@ class Session:
         speed = {**sp.to_dict(), "cpu_layers": m.n_layer - sp.gpu_layers,
                  "decode_tok_s": 1000.0 / sp.step1, "large": is_large(self)}
         aw = self.weights.check_arch()
-        ds = self.dose_spread()
+        ds = self.dose_spread() if ink is None else None
         if ds and ds.get("warn"):
             aw = [*aw, f"此模型中残差的大小集中在少数维度上（去掉最大的 {ds['top']} 个成分后，残差大小的中位数"
                        f"约为 1/{ds['median']:.1f}）。因此强度（rel）1 相当于去掉偏斜后大小的约 {ds['median']:.1f} 倍"
@@ -244,8 +290,8 @@ class Session:
         return {"meta": meta, "arch_warnings": aw, "llama_cpp": llama,
                 "bake": {"supported": mode is not None, "mode": mode, "reason": reason, "checked_llama_cpp": checked},
                 "stats": {"resid": str(rp) if rp.exists() else None, "act_layers": acts, "dose_spread": ds},
-                "residual_writers": writer_info(self.weights), "speed": speed,
-                "workflow": recommended_workflow(self) if speed["large"] else None}
+                "residual_writers": writer_info(self.weights) if ink is None else None, "speed": speed,
+                "workflow": recommended_workflow(self) if speed["large"] and ink is None else None}
 
     # --- stats ----------------------------------------------------------------------------------
 
@@ -368,6 +414,9 @@ class Session:
         elif units and not path:                               # その場で作るレシピは、いまの当て方を記録する(記録の無い扱いにしない)
             r.proj_correction = self.proj_correction_label(None)
         r.validate()
+        if self.weights.inkling is not None:                   # Inkling 2: 射影の部品だけ(inkling_pipeline.py)
+            self._check_inkling_recipe(r)
+            return r.scaled(scale) if scale != 1.0 else r
         if r.ablate is not None:
             self.direction_path(r.ablate.direction)              # 方向が無ければここで返す
         if r.model_id and r.model_id != self.meta.model_id:
@@ -544,6 +593,18 @@ class Session:
                   self.store.reverse_dir(self.meta.model_id) / f"{name}.directions.npz"):
             if q.exists():
                 return q
+        others = self.store.direction_elsewhere(str(name), self.meta.model_id, model_name=getattr(self.meta, "name", None),
+                                                arch=getattr(self.meta, "arch", None))
+        if others:                                   # 同じモデルの別のファイル(別の量子化など)で作った方向
+            o, here = others[0], str(self.meta.path)
+            from .inkling import ARCHS
+            how = (f"gne -m {o['path']} headproj export --recipe <配方> --bake --into {here} --out <GGUF>"
+                   if self.meta.arch in ARCHS else f"gne -m {o['path']} …（相同命令）")
+            raise GneError("FILE_NOT_FOUND",
+                           f"方向 {name} 不在该模型文件（{Path(here).name}）的存放位置。它是在同一模型的另一个文件 "
+                           f"{o['path']} 上创建的方向（gne 按模型文件分别保存方向）",
+                           (f"-m 请指定创建配方（方向）的模型；若要烘焙到其他量化，请把该文件传给 --into: {how}"
+                            if self.meta.arch in ARCHS else f"-m 请指定创建配方（方向）的模型: {how}"))
         raise GneError("FILE_NOT_FOUND", f"方向 {name} 不存在", "请用 gne direction --contrast <对照集> 创建")
 
     def direction_set(self, name: str):
@@ -657,7 +718,22 @@ class Session:
                 return self._lora_for(dataclasses.replace(recipe, loop_edits=mode))
         return self._lora_for(recipe)
 
+    def _check_inkling_recipe(self, r: Recipe) -> None:
+        """Inkling 2 のレシピ: 方向成分の射影(ヘッド・attention 全体・MLP 全体・専門家のニューロン)だけを、Inkling 2 の形の方向で。"""
+        from .headproj import proj_heads
+        from .inkling_pipeline import check_unit, require_inkling_direction
+        other = [u.label() for u in r.units if u.mode != "proj"]
+        if other or r.ablate is not None:
+            raise GneError("ARCH_UNSUPPORTED", "Inkling 2 只能应用方向分量投影配方（L:Hh、L:attn、L:ffn、L:Ee:Nn 的 sS@方向）"
+                           f"（已阻止的组件：{', '.join(other[:4]) or 'ablate'}）", "请使用 gne heads pipeline 创建的配方")
+        for p in proj_heads(r):
+            check_unit(self, p)
+            require_inkling_direction(self.direction_set(p.direction))
+
     def _lora_for(self, recipe: Recipe) -> list[tuple[str, float]] | None:
+        if self.weights.inkling is not None:                   # Inkling 2: 射影の LoRA だけ(inkling_pipeline.export_lora)
+            self._check_inkling_recipe(recipe)
+            return [(str(self.proj_lora(recipe)), 1.0)] if any(u.k for u in recipe.proj_units) else None
         out = []
         lora_units = [u for u in recipe.gain_units if u.kind != "expert"]   # 専門家全体の gain はパッチ(patches_for)
         if lora_units:
@@ -750,6 +826,19 @@ class Session:
         ヘッド・s・方向の中身(作り直したら LoRA も作り直す)・direction_layer で決まる。"""
         from .headproj import ProjBuilder, export_proj_lora, proj_cache_key, proj_heads
         heads = [p for p in proj_heads(recipe) if p.s]
+        if self.weights.inkling is not None:                   # Inkling 2: 短い畳み込みの倍率で直した射影(inkling_pipeline.py)
+            import hashlib
+            from .inkling_pipeline import export_lora
+            key = hashlib.sha256(json.dumps([p.spec() for p in heads] + [
+                hashlib.sha256(Path(self.direction_set(d).path).read_bytes()).hexdigest() for d in sorted({p.direction for p in heads})]
+            ).encode()).hexdigest()[:16]
+            path = self.store.heads_dir(self.meta.model_id) / f"proj-ink-{key}.lora.gguf"
+            if not path.exists():
+                tmp = path.with_suffix(".part")
+                export_lora(self, heads, tmp, self.direction_set)
+                tmp.replace(path)
+            self.engine.allow_lora_trial = True
+            return path
         corr = self.proj_correction_for(recipe)
         for msg in self.proj_notes(heads, corr, recipe.direction_layer):   # 補正の有無ごとの知らせ(使うたびに)
             self._warn_once(msg)
@@ -1256,6 +1345,10 @@ class Session:
     def bake(self, recipe: Recipe | list[str], dst: str | Path, *, verify: bool = False,
              verify_prompt: str = "Who are you?", n_tokens: int = 32) -> dict:
         recipe = self._as_recipe(recipe)
+        if self.weights.inkling is not None:
+            raise GneError("ARCH_UNSUPPORTED", "Inkling 2 的配方（方向分量投影）烘焙应使用 gne headproj export --bake"
+                           "（gne bake 用于烘焙 control vector 的 add 单元，Inkling 2 不可用）",
+                           "gne headproj export --recipe <配方> --bake --out <GGUF>")
         self._no_nw(recipe, bake=True)
         self._warn_when(recipe, "bake")
         if not recipe.add_units:
@@ -1933,14 +2026,16 @@ class Session:
 
     # --- eval(§6.14)---------------------------------------------------------------------------
 
-    def eval(self, recipe: Recipe | list[str], *, doses=(0, 0.25, 0.5, 0.75, 1.0), suite: str | Path | None = None,
+    def eval(self, recipe: Recipe | list[str], *, doses=None, suite: str | Path | None = None,
              when: str | None = None, lora_when: str = "all", judge_model: str | Path | None = None, judge_target: str | None = None,
              name: str | None = None, random_controls: int = 0, reactivity: str | Path | None = None,
              head_controls: int = 0, control_pool: str = "before", direction_metrics: bool = True,
              dir_max_examples: int | None = 64, keyed_contrast: str | Path | None = None, keyed_metrics: bool = True,
              keyed_examples: int | None = 8, keyed_match: bool = True, keyed_pseudo: int = 8,
-             keyed_subset: str | None = None) -> dict:
+             keyed_subset: str | None = None, items: str | None = None, reasoning_tokens: int | None = None) -> dict:
         """测量配方在各倍率下的副作用（能力、ppl、语言混入）与性格变化量，并保存到 <root>/evals/<model_id>/<name>.json。
+        doses を省くと 0,0.25,0.5,0.75,1(Inkling 2 は 0,1)。Inkling 2 では、返事を読む指標を思考の後の回答で測り(思考の上限
+        reasoning_tokens、既定 512)、問題を items(exact,format,mix,persona の数、既定 8,4,4,4、all で全部)に間引く(evalx)。
         random_controls > 0 时，每个倍率也测量同量级的随机对照配方（行中的 ctrl・ctrl_novelty_p95 等）。
         reactivity（对照集 YAML）还会测量反应性（有/无触发词的差异），并与 head_controls 个随机注意力头比较。
         方向を使うレシピ(proj など)では方向の指標(射影の値の下がり方・ずれ・判定の一致率)も測る。direction_metrics=False で
@@ -1950,12 +2045,23 @@ class Session:
         どちらも無ければ結果の keyed は skipped)、keyed_examples は会話の組ごとに読む数(None か 0 で全部)、keyed_pseudo は
         比較用の鍵の本数、keyed_subset は読む例(even / odd / all、省くと鍵の作成と反対側)、keyed_match=False で方式の比較の
         大きさ合わせを省く、keyed_metrics=False で測らない。"""
-        from .evalx import Judge, evaluate
+        from .evalx import INK_DOSES, Judge, evaluate
         recipe = self._as_recipe(recipe)
         if not recipe.units and recipe.ablate is None:
             raise GneError("BAD_RECIPE", "没有单元")
         if (judge_model is None) != (judge_target is None):
             raise GneError("BAD_ARGS", "请同时指定 --judge-model 与 --judge-target")
+        ink = getattr(getattr(self, "weights", None), "inkling", None) is not None
+        if doses is None:
+            doses = INK_DOSES if ink else (0, 0.25, 0.5, 0.75, 1.0)
+        if not ink and (items is not None or reasoning_tokens is not None):
+            self.warn("问题数（items）与思考上限（reasoning_tokens）仅在 Inkling 2 中使用")
+        if judge_model is not None:                      # 採点するモデルが思考を書くモデルなら、短い返事で数字を読めない
+            from .gguf_fast import FastGGUF
+            from .inkling import ARCHS
+            if FastGGUF(judge_model).get("general.architecture") in ARCHS:
+                raise GneError("BAD_ARGS", "用作评分的模型（--judge-model）是 Inkling 2。它会在回复前先写思考，因此不能用于"
+                                           "根据简短回复读取数字的评分", "请指定不会写思考的模型")
         keyed_subset = keyed_subset or None
         if keyed_subset is not None and keyed_subset not in ("even", "odd", "all"):
             raise GneError("BAD_ARGS", f"keyed_subset 必须是 even / odd / all 之一（{keyed_subset!r}）")
@@ -1977,7 +2083,7 @@ class Session:
                          dir_max_examples=dir_max_examples, keyed_contrast=keyed_contrast,
                          keyed_metrics=bool(keyed_metrics), keyed_examples=keyed_examples or None,
                          keyed_match=bool(keyed_match), keyed_pseudo=keyed_pseudo, keyed_subset=keyed_subset,
-                         progress=self.progress)
+                         progress=self.progress, **({"items": items, "reasoning": reasoning_tokens} if ink else {}))
             d.pop("_baseline", None)
         finally:
             if judge is not None:
@@ -2008,6 +2114,9 @@ class Session:
         能力、ppl、混入由 eval 测量，目标行为的残留程度由方向对照集的判定（validate.match）测量。"""
         from .direction import behavior, load_contrast, top_writer_neurons
         from .steer import AblateSpec, Unit
+        if self.weights.inkling is not None:
+            raise GneError("ARCH_UNSUPPORTED", "Inkling 2 尚不支持消去比较（--compare-ablation）（目前还不能对该模型施加"
+                                               "神经元的 gain 与方向消去）", "请用普通的 gne eval 测量")
         t0 = time.perf_counter()
         ds = self.direction_set(direction)
         _, meta = self.ablation_vector(direction, from_layer=from_layer)
@@ -2061,6 +2170,9 @@ class Session:
         from .evalx import evaluate
         from .headproj import proj_heads
         from .steer import AblateSpec, Unit
+        if self.weights.inkling is not None:
+            raise GneError("ARCH_UNSUPPORTED", "Inkling 2 尚不支持方式比较（--compare-methods）（目前还不能对该模型施加"
+                                               "要比较的方式所需的 gain 与方向消去）", "请用普通的 gne eval 测量")
         t0 = time.perf_counter()
         recipe = self._as_recipe(recipe)
         heads = proj_heads(recipe)
@@ -2555,6 +2667,11 @@ class Session:
         spec = dict(spec)
         spec.pop("about", None)                    # テンプレート(configs/pipeline/)の説明。対照集合には入れない
         spec_pipe = spec.pop("pipeline", None) or {}
+        ink_before = None
+        if self.weights.inkling is not None:       # Inkling 2: 層 0〜5 も候補に入れる設定(このモデルだけ)
+            spec_pipe = dict(spec_pipe)
+            ink_before = over.pop("include_before", None)
+            ink_before = spec_pipe.pop("include_before", None) if ink_before is None else ink_before
         given = {**{k: v for k, v in spec_pipe.items() if v is not None}, **{k: v for k, v in over.items() if v is not None}}
         pipe = {**self.PIPELINE_DEFAULTS, **self.PIPELINE_WRITES, **spec_pipe,
                 **{k: v for k, v in over.items() if v is not None}}
@@ -2566,6 +2683,11 @@ class Session:
             raise GneError("BAD_ARGS", f"rank 可为 causal（逐层停用注意力头进行测量，以前的默认值）或 writes（按写入量对全部部件排序）"
                                        f"（{pipe['rank']!r}）")
         rank_given = "rank" in given
+        if self.weights.inkling is not None:       # Inkling 2: 段ごとの MLP の入力で流す(inkling_pipeline.py)
+            from .inkling_pipeline import pipeline as _ink_pipeline
+            if ink_before:
+                given["include_before"] = True
+            return _ink_pipeline(self, spec, pipe, given, t0)
         rank_note = self._rank_fallback(pipe, rank_given)
         writes = pipe["rank"] == "writes"
         if writes:
@@ -2922,6 +3044,10 @@ class Session:
             row = {}
             for side in "AB":
                 outs = _generate(self, [(m, max_tokens) for m in conv[side]], *combine(ivs[side], vecs, lora), "all", lambda k: None)
+                if self.weights.inkling is not None:           # Inkling 2: 思考の欄を除いた答えだけを数える(思考の途中で切れたら空)
+                    from .inkling import ReplyMarks, answer_part
+                    mk = ReplyMarks(self.engine)
+                    outs = [{**o, "text": answer_part(mk.render(self.engine, o["token_ids"]))} for o in outs]
                 fin = [o for o in outs if o["finish"] in ("eog", "stop", "eos")]
                 row[side] = {"n": len(outs), "finished": len(fin),
                              "match_finished": sum(bool(rx.search(o["text"] or "")) for o in fin) if rx else None,
@@ -3093,8 +3219,13 @@ class Session:
         X = int(X) if X is not None and int(X) != S else None
         Ls = sorted({S} | ({X} if X is not None else set()))
         self.engine.free_steer()
-        sc = Scorer(self, ds, cs, layers=Ls, positions=pos)          # A 側は間引かずに全部の質問
-        scb = Scorer(self, ds, cs, layers=Ls, positions=pos, max_examples=ral.get("max_examples") or 64)
+        if self.weights.inkling is not None:       # Inkling 2: 段ごとの MLP の入力と最後に混ぜた出力で測る(元の一括と同じ位置・同じ返事)
+            from .inkling_pipeline import InkScorer
+            sc = InkScorer(self, ds, cs, layers=Ls, positions=pos)
+            scb = InkScorer(self, ds, cs, layers=Ls, positions=pos, max_examples=ral.get("max_examples") or 64)
+        else:
+            sc = Scorer(self, ds, cs, layers=Ls, positions=pos)          # A 側は間引かずに全部の質問
+            scb = Scorer(self, ds, cs, layers=Ls, positions=pos, max_examples=ral.get("max_examples") or 64)
 
         def measure(rec):
             lora = self.lora_for(rec) if rec is not None else None
@@ -3184,7 +3315,11 @@ class Session:
             pipe["target"] = st["target"]
         rk = rank or st_prev.get("rank") or st.get("rank") or "causal"
         rank_note = None
-        if rank is None and rk == "writes":                             # 前の回が writes でも、出力のあとに正規化があるモデルでは止めて選ぶ
+        if self.weights.inkling is not None:       # Inkling 2: 書き込みの量で選ぶ流れだけ。層 0〜5 の設定は元の一括のまま
+            rk = "writes"
+            if st.get("include_before"):
+                pipe["include_before"] = True
+        elif rank is None and rk == "writes":                             # 前の回が writes でも、出力のあとに正規化があるモデルでは止めて選ぶ
             probe = {"rank": "writes"}
             rank_note = self._rank_fallback(probe, False)
             if rank_note:
@@ -3218,22 +3353,10 @@ class Session:
                 **({"validate": raw["validate"]} if raw.get("validate") else {}), "pipeline": pipe}
         p = self.heads_pipeline(spec, resume=resume)
 
-        def proj_spec(u) -> str:                    # レシピの欄・UI の部品の書き方(L:Hh:sS@方向 など)
-            who = {"neuron": f"N{u.neuron}", "attn": "attn", "ffn": "ffn"}.get(u.kind, f"H{u.head}")
-            return f"{u.layer}:{who}:s{float(u.k):.4g}@{u.direction}"
+        proj_spec = refine_proj_spec
 
         def parts_of(units, rounds) -> list[dict]:
-            out_ = []
-            for u, r_ in zip(units, rounds, strict=True):
-                kind = {"neuron": "neuron", "attn": "layer_attn", "ffn": "layer_mlp"}.get(u.kind)
-                if kind is None:
-                    try:
-                        kind = kind_of_layer(self, u.layer)
-                    except (AttributeError, IndexError):
-                        kind = "attn"
-                out_.append({"spec": proj_spec(u), "layer": int(u.layer), "head": u.neuron if u.kind == "neuron" else u.head,
-                             "kind": kind, "s": float(u.k), "direction": u.direction, "round": int(r_)})
-            return out_
+            return refine_parts(units, rounds, lambda L: kind_of_layer(self, L))
 
         plan_ = getattr(self.weights, "loop", None)
         shared_ = plan_ is not None and not getattr(self.weights, "per_visit_names", False)
@@ -3252,11 +3375,12 @@ class Session:
                         out_.append({"base": b_["spec"], "added": a_["spec"], "stored": int(plan_.stored(a_["layer"]))})
             return out_
 
-        def dups_of(parts) -> list[dict]:           # 同じ部品(層・種類・番号)が 2 つ以上の方向で入っている
+        def dups_of(parts) -> list[dict]:           # 同じ部品(層・種類・番号、専門家のニューロンは専門家も)が 2 つ以上の方向で入っている
             g: dict[tuple, list[dict]] = {}
             for q in parts:
-                g.setdefault((q["layer"], q["kind"], q["head"]), []).append(q)
-            return [{"layer": k_[0], "kind": k_[1], "head": k_[2], "rounds": [q["round"] for q in v], "s": [q["s"] for q in v],
+                g.setdefault((q["layer"], q["kind"], q["head"], q.get("expert")), []).append(q)
+            return [{"layer": k_[0], "kind": k_[1], "head": k_[2], **({"expert": k_[3]} if k_[3] is not None else {}),
+                     "rounds": [q["round"] for q in v], "s": [q["s"] for q in v],
                      "directions": [q["direction"] for q in v]} for k_, v in g.items() if len(v) > 1]
         alloc = p["allocate"]
         rows_new = [(str(r["n_heads"]), int(r["n_heads"]), r) for r in alloc["table"] if not r.get("skipped") and r.get("recipe")]
@@ -3348,11 +3472,20 @@ class Session:
                                       for r in alloc["table"]]},
                "combined": comb, "combined_rows": comb_rows, "check": check, "no_recommend": why_none, "most_reduced": most_reduced,
                "updated": time.strftime("%Y-%m-%dT%H:%M:%S"), "seconds": time.perf_counter() - t0}
+        if self.weights.inkling is not None:       # Inkling 2: 測る点と、返事を読む位置ではどの返事を使ったか
+            from .inkling_pipeline import REPLY_KINDS, parse_positions
+            reply = parse_positions(pos)[0] in REPLY_KINDS
+            out["inkling"] = {"positions": pos, "score_label": "最终混合输出",
+                              "replies_note": ("剩余数量与表格数值和原始批量一样，是在改写前模型的回复上测得的。寻找添加组件时创建的"
+                                               "新方向与测量，是在应用基础配方后的模型所写回复上完成的（与其他模型中用配方构造侧时的"
+                                               "回复位置方向相同）") if reply else None}
         (hd / f"{out_name}.refine.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
         pd = json.loads(Path(p["path"]).read_text(encoding="utf-8"))      # 一括の結果にも、どの組の残りから作ったかを書く
         pd["refine"] = {k_: out[k_] for k_ in ("base", "root", "round", "chain", "direction", "n_heads", "base_units", "base_parts",
                                                "base_measure", "none_measure", "threshold", "score_layer", "loop_exit", "units_by_round",
                                                "remaining", "combined", "combined_rows", "check", "no_recommend", "most_reduced")}
+        if out.get("inkling"):
+            pd["refine"]["inkling"] = out["inkling"]
         Path(p["path"]).write_text(json.dumps(pd, ensure_ascii=False, indent=1), encoding="utf-8")
         out["path"] = str(hd / f"{out_name}.refine.json")
         return out
@@ -3422,6 +3555,9 @@ class Session:
     def fieldtest(self, model: str | Path | None = None, **kw) -> dict:
         """实际使用测试（gne/fieldtest.py）：按真实用法（llama-server、开启思考）测量长任务、工具调用、问题集和 perplexity，
         并与 against 文件比较。结果保存在 <root>/fieldtest/<name>.json，生成的文本保存在 <name>.replies.json。"""
+        if self.weights.inkling is not None:            # Inkling 2: 思考の扱いを確かめていない(inkling.py)
+            from .inkling import refuse
+            raise refuse(self.weights.inkling, "实际使用测试（fieldtest）")
         from .fieldtest import fieldtest as run
         return run(self, model, **kw)
 
@@ -3776,7 +3912,8 @@ class Session:
     def headproj_export(self, recipe: Recipe | list[str], out: str | Path, *, bake: bool = False, requant: str | None = None,
                         via_f16: bool = False, imatrix: str | None = None, llama_quantize: str | None = None,
                         verify: bool = False, contrast: str | Path | None = None, strip_meta: bool = False,
-                        into: str | Path | None = None, lora_f16: bool = False, name: str | None = None) -> dict:
+                        into: str | Path | None = None, lora_f16: bool = False, name: str | None = None,
+                        dry_run: bool = False) -> dict:
         """CHANGE-06 E: proj のユニット(と gain)を LoRA(既定)か、残差に書き込む重み行列だけ量子化し直した GGUF に書き出す
         (gne gain と同じ経路)。鍵つきの書き込み(keyed、CHANGE-07)だけのレシピと、proj・keyed(・gain)を混ぜたレシピも受ける。
         requant を省くと q8_0、keyed を含むなら auto(テンソルごと: 元が Q8_0 なら Q8_0 のまま、それ以外は F16。Q8_0 のままでは
@@ -3785,6 +3922,14 @@ class Session:
         verify なら焼き込み版と LoRA 版を V26 の 4 項目で比べる(keyed だけなら keyed の方向で測る)。
         name は LoRA の名前の欄(general.name。省くと「<元のモデルの名前> gain <レシピの名前>」、strip_meta では "adapter")。"""
         recipe = self._as_recipe(recipe)
+        if self.weights.inkling is not None:             # Inkling 2: 射影の LoRA か焼き込み(inkling_pipeline.py)
+            if via_f16 or imatrix or llama_quantize:
+                raise GneError("ARCH_UNSUPPORTED", "Inkling 2 的烘焙尚不能使用 llama-quantize 恢复原类型",
+                               "改写后张量的类型可从 auto（默认）、keep、q8_0、f16 中选择")
+            return self._inkling_export(recipe, Path(out) if out is not None else None, bake=bake, requant=requant, verify=verify,
+                                        strip_meta=strip_meta, into=into, dry_run=dry_run)
+        if dry_run:
+            raise GneError("BAD_ARGS", "dry_run 仅用于 Inkling 2 的烘焙")
         self._no_nw(recipe, bake=bake)                   # nw は焼き込めない(LoRA には入る)
         if recipe.proj_units:                            # 出力のあとに正規化がある層の射影: 補正の有無ごとの知らせ(v0.9.0)
             from .headproj import proj_heads
@@ -3826,6 +3971,47 @@ class Session:
             if not bake:
                 raise GneError("BAD_ARGS", "--verify 需要与 --bake 一起使用（比较烧录版与 LoRA 版）")
             d["verify"] = self.check_proj_bake(recipe, Path(d["path"]), contrast=contrast)
+        return d
+
+    def _inkling_export(self, recipe: Recipe, out: Path | None, *, bake: bool, requant: str | None, verify: bool,
+                        strip_meta: bool = False, into: str | Path | None = None, dry_run: bool = False) -> dict:
+        """Inkling 2 のレシピの書き出し: LoRA(既定)か焼き込み(型は auto・keep・q8_0・f16)。into は同じモデルの別の量子化
+        (方向と部品はこのモデル、消す量は焼き込む先の重みから)。dry_run は書かずに、書き換えるテンソルと大きさ・残り方だけ。
+        焼き込みではモデルを GPU に載せない(いま載っていれば、焼き込んだ GGUF が収まるかの目安に空きを測る)。"""
+        from .headproj import proj_heads
+        from .inkling_pipeline import bake_recipe, export_lora
+        self._check_inkling_recipe(recipe)
+        heads = [p for p in proj_heads(recipe) if p.s]
+        if verify:
+            raise GneError("ARCH_UNSUPPORTED", "Inkling 2 无法在同一次处理中比较烘焙与 LoRA（--verify）"
+                           "（两个模型无法同时装入 VRAM）",
+                           "请分两次比较：gne inkling chips-bake-check --mode lora，以及用烘焙后的 GGUF 运行 --mode baked（docs/inkling2.md）")
+        if dry_run and not bake:
+            raise GneError("BAD_ARGS", "--dry-run 仅用于烘焙（--bake）")
+        if into is not None and not bake:
+            raise GneError("BAD_ARGS", "--into 仅用于烘焙（--bake）")
+        if out is None and not dry_run:
+            raise GneError("BAD_ARGS", "请指定输出目标（--out）")
+        if out is not None:
+            out.parent.mkdir(parents=True, exist_ok=True)
+        if not bake:
+            if requant not in (None, "q8_0", "auto"):
+                raise GneError("BAD_ARGS", "--requant 仅用于烘焙（--bake）")
+            r = export_lora(self, heads, out, self.direction_set, strip_meta=strip_meta)
+            return {"kind": "lora", "path": str(out), "bytes": r.get("bytes", out.stat().st_size), "recipe": recipe.to_dict()}
+        rq = "auto" if requant is None else requant
+        if rq not in ("auto", "q8_0", "f16", "keep"):
+            raise GneError("BAD_ARGS", f"Inkling 2 烘焙的 --requant 可取 auto（默认。按原类型、原大小写入，仅对编辑无法保留的"
+                                       f"张量使用 Q8_0）/ keep / q8_0 / f16（{rq!r}）")
+        from .inkling_pipeline import gpu_free_mb, target_weights
+        tw = target_weights(self, into) if into is not None else None
+        if tw is self.weights:
+            tw = None
+        free = None
+        if tw is None and self._engine is not None:     # いまのモデルが GPU に載っているときだけ(焼き込みのために載せない)
+            free = gpu_free_mb()
+        d = bake_recipe(self, heads, out, requant=rq, vram_free_mb=free, strip_meta=strip_meta, target=tw, dry_run=dry_run)
+        d.update(kind="bake", requant=rq, recipe=recipe.to_dict(), vram_free_mb=free)
         return d
 
     # --- 鍵つきの書き込み(CHANGE-07)--------------------------------------------------------------------

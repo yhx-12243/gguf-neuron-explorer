@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
@@ -209,6 +210,7 @@ class Engine:
         self.n_threads = n_threads or int(os.environ.get("GNE_THREADS") or 0) or max(1, (os.cpu_count() or 2) // 2)
         self.n_gpu_layers = n_gpu_layers
         self.chat_template = self.meta_str("tokenizer.chat_template")
+        self.template_vars: dict = {}             # チャットテンプレートに渡す変数(gne chat --reasoning-effort など。既定は渡さない)
         self.arch = self.meta_str("general.architecture") or ""
         self.hc_streams = int(self.meta_str(f"{self.arch}.hyper_connection.count") or 0)   # 残差の本数(0 = 1 本)
         self.cvec_supported = self.arch not in NO_CVEC
@@ -222,14 +224,23 @@ class Engine:
         # 重みの書き換え(LoRA)の当て方: shared = 両方の回に当てる(既定。元の llama.cpp ではいつもこれ)。
         # 2 回目の層に別の名前がある llama.cpp では、LoRA の 1 回目の層のテンソルを 2 回目の名前にも写して読み込む
         self.loop_edits = "shared"
+        # Inkling 2(inkling.py): 読み込みと生成だけ。中間のテンソルの捕捉・control vector・LoRA は止める。
+        # テンソルの名前を調べるだけ(gne probe --list-names)は allow_names を立てたときだけ通す
+        self.inkling = None
+        self.allow_names = False
+        self.allow_lora_trial = False             # gne inkling chips-trial(試し)だけが立てる。ほかの処理の LoRA は止めたまま
         if self.arch:
             from .gguf_fast import FastGGUF
+            from .inkling import plan_of as inkling_plan_of
             from .loop import plan_of
             g = FastGGUF(self.path)
             self.loop = plan_of(g.get, self.arch)
             if self.loop is not None:
                 rec = g.get(f"{self.arch}.attention.recurrent_layers")
                 self.loop_full = frozenset(i for i, x in enumerate(rec or []) if not x)
+            self.inkling = inkling_plan_of(g.get, self.arch)
+            if self.inkling is not None:
+                self.cvec_supported = False
         self._steer: _Ctx | None = None
         self._probe: _Ctx | None = None
         self._probe_logits_all = False
@@ -282,6 +293,12 @@ class Engine:
         if logits_all:
             p.n_outputs_max_per_seq = 0   # 既定 1(各 seq 最終位置だけ)。0 = n_outputs_max
         if capture is not None:
+            if self.inkling is not None:
+                # 読むだけの Inkling 用の処理(inkling_read.py が inkling_ok を立てる)と名前の一覧だけを通す。名前は実行順の段に読み替える
+                if not (getattr(capture, "inkling_ok", False) or getattr(capture, "names_only", False)):
+                    from .inkling import refuse
+                    raise refuse(self.inkling, "读取中间张量的处理（捕获残差、头、神经元、专家的值）")
+                capture.inkling = self.inkling
             capture.hc_streams = self.hc_streams
             if self.loop is not None and capture.loop is None and not getattr(capture, "raw_names", False):
                 capture.loop, capture.loop_d, capture.loop_full = self.loop, self.n_embd, self.loop_full
@@ -368,7 +385,17 @@ class Engine:
         return render_template(tpl, messages, enable_thinking=enable_thinking,
                                add_generation_prompt=add_generation_prompt,
                                bos_token=self.token_text(C.llama_vocab_bos(self.vocab)),
-                               eos_token=self.token_text(C.llama_vocab_eos(self.vocab)))
+                               eos_token=self.token_text(C.llama_vocab_eos(self.vocab)), **self.template_vars)
+
+    @contextlib.contextmanager
+    def with_template_vars(self, **kw):
+        """この中だけ、チャットテンプレートに変数を渡す(None の値は渡さない。例: reasoning_effort)。抜けると元に戻す。"""
+        prev = self.template_vars
+        self.template_vars = {**prev, **{k: v for k, v in kw.items() if v is not None}}
+        try:
+            yield
+        finally:
+            self.template_vars = prev
 
     def tokenize(self, text: str, *, add_special: bool = False, parse_special: bool = True) -> list[int]:
         b = text.encode("utf-8")
@@ -490,6 +517,9 @@ class Engine:
 
         常に全層分 (n_layer-1)*n_embd のゼロ埋めバッファを渡す(§5.3 の古いデータ対策)。
         layer_range を渡すと il_start/il_end をその範囲に固定する(§10 4(a))。"""
+        if vectors and self.inkling is not None:
+            from .inkling import refuse
+            raise refuse(self.inkling, "control vector（向残差添加方向的推力）")
         if vectors and not self.cvec_supported:
             raise GneError("ARCH_UNSUPPORTED", f"{self.arch} 的图不读取 control vector。即使添加也不会生效，因此已停止。"
                            "gain、投影（proj）和 ablate 可通过 LoRA 工作")
@@ -586,6 +616,9 @@ class Engine:
 
     def lora(self, path: str | Path):
         """LoRA アダプタ GGUF を読み込む(同じファイルは 1 回だけ)。"""
+        if self.inkling is not None and not self.allow_lora_trial:
+            from .inkling import refuse
+            raise refuse(self.inkling, "LoRA（改写权重）")
         key = str(Path(path).resolve())
         a = self._loras.get(key)
         if a is None:
@@ -844,8 +877,16 @@ class Engine:
 
     def list_names(self, ids: list[int], layer: int | None = None) -> set[str]:
         """cb_eval で観測できるテンソル名(probe ctx で 1 回 prefill)。layer を渡すとその層の名前だけ。"""
-        ctx = self._probe if self._probe is not None and self._probe.n_ctx >= len(ids) else \
-            self.probe_ctx(Capture(), need=len(ids))       # 既存の probe ctx があれば(長さが足りれば)作り直さずに使う
+        if self.inkling is not None and not self.allow_names:
+            # Inkling 2: 名前を調べた後に中間のテンソルを読む処理ばかりなので、ここで止める(gne probe --list-names だけが allow_names を立てる)
+            from .inkling import refuse
+            raise refuse(self.inkling, "读取中间张量的处理（捕获残差、头、神经元、专家的值）")
+        if self._probe is not None and self._probe.n_ctx >= len(ids):
+            ctx = self._probe                              # 既存の probe ctx があれば(長さが足りれば)作り直さずに使う
+        else:
+            cap = Capture()
+            cap.names_only = True                          # 名前だけを見る(値は読まない。Inkling 2 でも使える、inkling.py)
+            ctx = self.probe_ctx(cap, need=len(ids))
         cap = ctx.capture
         prev = cap._wanted
         cap.set_wanted(lambda n: False)
