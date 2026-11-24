@@ -1018,6 +1018,66 @@ def bake_bias_gguf(weights, vectors: dict[int, np.ndarray], src: str | Path, dst
     return report
 
 
+# 足したユニットの数(候補の表の値)は、その部品だけを当てて測ったもの(レシピの欄・CLI・画面で同じ文、v0.10.1)
+ADD_NOTE = ("候选表中的数值是在单独应用该单元时测得的。与其他单元一起使用时作用方式会改变，"
+            "请确认回复并调整强度")
+_DIRECTED = ("proj", "keyed", "nw")
+
+
+# 強さを省いた射影のユニット(L:Hh・L:Nn・L:Ee:Nn・L:attn・L:ffn に @NAME だけ)。gne recipe-add とレシピの欄の「ユニットを足す」だけが
+# 受け付け、強さ 1 で足す(ほかのコマンドの --unit は今までどおり :sS が要る)
+_PROJ_NO_S_RE = re.compile(r"^(\d+):((?:[Hh]\d+)|(?:N\d+)|(?:E\d+:N\d+)|attn|ffn)(@[\w.\-]+)?$", re.I)
+WEAK_NOTE = "1 是初始值，往往弱到不会体现在回复中。请提高强度，并在 3 列聊天（CLI 中为 gne chat --recipe）中确认"
+
+
+def default_proj_strength(spec: str) -> tuple[str, bool]:
+    """強さ(:sS)を省いた射影のユニットに :s1 を入れる(v0.10.1)。戻り値は (書き方, 省いていたか)。ほかの書き方はそのまま。"""
+    m = _PROJ_NO_S_RE.match(str(spec).strip())
+    if not m:
+        return str(spec).strip(), False
+    return f"{m.group(1)}:{m.group(2)}:s1{m.group(3) or ''}", True
+
+
+def unit_identity(u: Unit, default_direction: str | None = None, default_key: str | None = None) -> tuple:
+    """同じユニットかを決める鍵(レシピに 2 度入れない判定、v0.10.1)。層・種類・mode・番号(ヘッド・ニューロン・専門家・組の相手)と、
+    方向・鍵(省いたものはレシピの既定で埋める)。強さ(dose・k)は含めない。同じ部品でも方向が違えば別のユニット。"""
+    d = u.direction or (default_direction if u.mode in _DIRECTED else None)
+    k = u.key or (default_key if u.mode in ("keyed", "nw") else None)
+    return (u.layer, u.kind, u.mode, u.head, u.neuron, u.expert, u.seed, u.pair, d, k, u.key2, u.seek)
+
+
+def add_units(recipe: Recipe, units: list[Unit], *, replace: bool = False) -> tuple[Recipe, list[dict]]:
+    """recipe にユニットを足したレシピ(元は変えない、v0.10.1)。同じユニット(unit_identity)がもうあれば、replace なら
+    その行を新しい強さで置き換え(並びはそのまま)、そうでなければ GneError。方向を省いた proj・keyed・nw のユニットはレシピの
+    既定の方向を使い(省いたまま書く)、既定も無ければ止める。戻り値は (新しいレシピ, [{label, action: added | replaced}])。"""
+    import dataclasses
+    dd, dk = recipe.default_direction, recipe.default_key
+    out = [dataclasses.replace(u) for u in recipe.units]
+    done = []
+    for u in units:
+        if u.mode in _DIRECTED and not (u.direction or dd):
+            raise GneError("BAD_RECIPE", f"{u.label()}：没有方向",
+                           "请在单元末尾添加 @方向名称，或加入具有默认方向（default_direction）的配方")
+        if u.mode in ("keyed", "nw") and not (u.key or dk):
+            raise GneError("BAD_RECIPE", f"{u.label()}：没有键",
+                           "请在单元中添加 #键名称，或加入具有默认键（default_key）的配方")
+        key = unit_identity(u, dd, dk)
+        i = next((j for j, x in enumerate(out) if unit_identity(x, dd, dk) == key), None)
+        if i is not None and not replace:
+            raise GneError("BAD_RECIPE", f"{u.label()} 已在配方中（{out[i].label()}）",
+                           "若要修改强度，请加上 --replace（会替换该行的强度）")
+        if i is not None:
+            was = out[i].label()
+            out[i] = dataclasses.replace(u)
+            done.append({"label": u.label(), "action": "replaced", "was": was})
+        else:
+            out.append(dataclasses.replace(u))
+            done.append({"label": u.label(), "action": "added"})
+    r = recipe.like(out)
+    r.validate()
+    return r, done
+
+
 def combine_recipes(recipes: list[Recipe], name: str | None = None) -> Recipe:
     """複数のレシピのユニットを 1 つにまとめる。方向を省いた proj・keyed のユニットには元のレシピの既定の方向を、
     鍵を省いた keyed のユニットには既定の鍵を書き込むので、別の方向・鍵で作った組を重ねられる

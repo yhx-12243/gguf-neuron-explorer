@@ -2946,6 +2946,45 @@ def recipe_combine(recipes: list[Path] = typer.Argument(..., exists=True, help="
           + (f"、键 {', '.join(keys)}" if keys else "") + ")")
 
 
+@app.command("recipe-add")
+def recipe_add(recipe: Path = typer.Option(..., "--recipe", exists=True, help="要加入单元的配方（YAML）"),
+               unit: list[str] = typer.Option(..., "--unit", help="要加入的单元（可重复使用 --unit 指定多个）。例如 14:H19:s4@NAME、9:attn:s1@NAME、"
+                                                                 "12:N345:s2@NAME、17:E25:N389:s4@NAME（Inkling 2）。省略 @NAME 时使用配方的默认方向。"
+                                                                 "省略投影的 :sS 时强度为 1（初始值，往往较弱）"),
+               out: Optional[Path] = typer.Option(None, "--out", "-o", help="输出的配方（默认改写 --recipe 指定的文件）"),
+               replace: bool = typer.Option(False, "--replace", help="若同一单元（同一部件、同一方向）已存在，则替换该行的强度"
+                                                                     "（默认停止）"),
+               name: Optional[str] = typer.Option(None, "--name", help="配方名称（默认沿用原名称）")):
+    """レシピにユニットを 1 つずつ足す(CHiPS の候補の表から、組に入らなかった部品を手で足すときなど)。UI のレシピの欄の
+    「ユニットを足す」と CHiPS の結果の「レシピに足す」と同じ。書き方は --unit と同じ。同じ部品でも方向が違えば別のユニット(LoRA は
+    方向ごとの行)。モデルは読まないので、書き方・重複・方向の有無だけを確かめる(層・番号の範囲などは当てるときに確かめる)。"""
+    from .steer import ADD_NOTE, WEAK_NOTE, GneError, Recipe, add_units, default_proj_strength, parse_unit
+    try:
+        r = Recipe.load(recipe)
+        filled = [default_proj_strength(x) for x in unit]          # 強さを省いた射影のユニットは強さ 1
+        us = [parse_unit(x) for x, _ in filled]
+        r2, done = add_units(r, us, replace=replace)
+    except GneError as e:
+        raise typer.BadParameter(e.message + (f"（{e.hint}）" if e.hint else ""), param_hint="--unit") from e
+    dst = out or recipe
+    r2 = r2.like(r2.units, name=name or (out.stem if out else r.name))
+    try:
+        r2.save(dst)
+    except GneError as e:
+        raise typer.BadParameter(e.message, param_hint="--out") from e
+    for x, (_, weak) in zip(done, filled, strict=True):
+        print(f"  {'已加入' if x['action'] == 'added' else '已替换强度'}：{x['label']}"
+              + (f"（原为 {x['was']}）" if x["action"] == "replaced" else ""))
+        if weak:
+            print(f"    由于省略了强度，已按 1 加入。{WEAK_NOTE}")
+    dirs = sorted({u.direction or r2.default_direction for u in r2.units if u.mode in ("proj", "keyed") and (u.direction or r2.default_direction)})
+    print(f"{dst}（{len(r2.units)} 个单元" + (f"，方向 {', '.join(dirs)}" if dirs else "") + "）")
+    print(ADD_NOTE + "（可用 gne chat --recipe 试用，并用 gne recipe-scale 乘入整体强度）")
+    if r.proj_correction is None and (r.proj_units or r.ablate):                    # v0.9.0: 記録の無い古いレシピ(recipe-scale と同じ)
+        print("原始配方中没有投影校正的记录，因此已按带校正（proj_correction: postnorm）写出。对于输出之后有归一化的"
+              "模型，作用方式与之前的版本不同。若要使用与以前相同的作用方式，请将写出的配方的 proj_correction 设为 none")
+
+
 @app.command("recipe-scale")
 def recipe_scale(recipe: Path = typer.Argument(..., exists=True, help="要乘以倍率的配方"),
                  scale: float = typer.Option(..., "--scale", help="作用于整个配方的倍率（与聊天的强度、评估的倍率含义相同。不可为 0）"),
